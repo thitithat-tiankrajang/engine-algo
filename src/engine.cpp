@@ -659,10 +659,13 @@ std::string handleRequest(const std::string& requestJson) {
     if (sim.bestIndex >= 0) {
       const Move& chosen = candidates[sim.bestIndex];
       // Consider exchanging instead only when everything on the board is weak.
+      // Compare on the same STATIC baseline as the greedy path — the sim value
+      // is a margin net of the opponent's reply and would make any exchange
+      // look attractive on an open board.
       if (req.exchangeAllowed && chosen.score <= g_leave.exchangeConsiderBar) {
         Move ex = bestExchange(req);
         const float exEq = staticEquity(req.board, req.rack, ex);
-        if (exEq > sim.bestValue) {
+        if (exEq > staticEquity(req.board, req.rack, chosen)) {
           return respond(ex, exEq, "sim", false, 0, false, stats, msSince(start),
                          static_cast<int>(candidates.size()), sim.samplesUsed, rootMoves);
         }
