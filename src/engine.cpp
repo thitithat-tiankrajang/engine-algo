@@ -107,56 +107,22 @@ bool parseRequest(const std::string& text, Request& req, std::string& error) {
   return true;
 }
 
-// ── difficulty configuration (BIAS POINTS for M5 tuning) ─────────────────────
+// ── engine configuration (BIAS POINTS for M5 tuning) ─────────────────────────
+//
+// One model, one strength: the strongest the resources allow. Budgets are
+// generous (RAM stays bounded by dedup + a capped TT, so only time grows). The
+// `difficulty` field is ignored; a single configuration is always used.
 
 struct Config {
-  bool useLeave = true;        // static equity vs raw score
-  int pickFromTop = 1;         // easy picks randomly among the best N
-  int simTopK = 0;             // 0 = no simulation
-  int simSamples = 0;
-  bool endgameExact = false;
-  long long endgameNodeBudget = 0;
-  int endgameBeamFallback = 0;  // beam width for the approximate retry
-  double defaultBudgetMs = 800;
-  // Wall-clock ceiling for root move generation. Generation is premium-ordered
-  // and RAM-bounded (dedup), so hitting this ceiling loses only off-premium
-  // long-tail moves, never the board's best plays. A blank-heavy position can
-  // legitimately want tens of seconds to enumerate fully.
-  double genBudgetMs = 500;
+  int simTopK = 60;                       // placement candidates carried into sim
+  int simSamples = 160;                   // opponent-rack scenarios per candidate
+  long long endgameNodeBudget = 80'000'000;
+  int endgameBeamFallback = 32;           // beam width for the approximate retry
+  double defaultBudgetMs = 100'000;       // overall think ceiling (RAM-safe)
+  double genBudgetMs = 40'000;            // wall-clock ceiling for root generation
 };
 
-Config configFor(const std::string& difficulty) {
-  Config c;
-  if (difficulty == "easy") {
-    c.useLeave = false;
-    c.pickFromTop = 5;
-    c.defaultBudgetMs = 300;
-    c.genBudgetMs = 400;
-  } else if (difficulty == "hard") {
-    c.simTopK = 20;
-    c.simSamples = 30;
-    c.endgameExact = true;
-    c.endgameNodeBudget = 3'000'000;
-    c.endgameBeamFallback = 16;
-    c.defaultBudgetMs = 12'000;
-    c.genBudgetMs = 6'000;
-  } else if (difficulty == "max") {
-    c.simTopK = 40;
-    c.simSamples = 80;
-    c.endgameExact = true;
-    c.endgameNodeBudget = 40'000'000;
-    c.endgameBeamFallback = 24;
-    c.defaultBudgetMs = 110'000;   // stay under the 2-minute user ceiling
-    c.genBudgetMs = 45'000;
-  } else {  // normal
-    c.endgameExact = true;
-    c.endgameNodeBudget = 1'000'000;
-    c.endgameBeamFallback = 12;
-    c.defaultBudgetMs = 2'000;
-    c.genBudgetMs = 1'200;
-  }
-  return c;
-}
+Config configFor(const std::string& /*difficulty*/) { return Config{}; }
 
 // ── exchange candidates ──────────────────────────────────────────────────────
 
@@ -253,10 +219,24 @@ SimResult simulate(const Request& req, const std::vector<Move>& candidates, int 
   std::vector<float> myLeaveAfter(candidates.size());
   Board board = req.board;
 
+  // Per-candidate value base (everything except the opponent's reply, which is
+  // sampled below). Placement, exchange and pass are all scored on one scale so
+  // the sim can decide between "play this" and "swap tiles / pass" directly.
   for (size_t i = 0; i < candidates.size(); i++) {
-    TileCounts after = req.rack;
-    for (const Placement& p : candidates[i].placements) after.sub(p.kind);
-    myLeaveAfter[i] = leaveValue(after, ctx);
+    const Move& c = candidates[i];
+    if (c.type == MoveType::Exchange) {
+      TileCounts after = req.rack;
+      for (uint8_t k : c.exchangeKinds) after.sub(k);
+      myLeaveAfter[i] = leaveValue(after, ctx) +
+                        ctx.freshTileValue * static_cast<float>(c.exchangeKinds.size()) -
+                        g_leave.exchangeTempoCost;
+    } else if (c.type == MoveType::Pass) {
+      myLeaveAfter[i] = leaveValue(req.rack, ctx) - 4.0f;  // BIAS: pass tempo cost
+    } else {
+      TileCounts after = req.rack;
+      for (const Placement& p : c.placements) after.sub(p.kind);
+      myLeaveAfter[i] = leaveValue(after, ctx);
+    }
   }
 
   // Sample-major with common random numbers: every candidate is scored against
@@ -640,7 +620,7 @@ std::string handleRequest(const std::string& requestJson) {
   const int rootMoves = static_cast<int>(moves.size());
 
   // ── endgame: bag empty means the opponent rack is fully known ──────────────
-  if (cfg.endgameExact && req.bagCount == 0 && req.unseen.total == req.oppRackCount &&
+  if (req.bagCount == 0 && req.unseen.total == req.oppRackCount &&
       req.oppRackCount > 0 && !moves.empty()) {
     EndgameSolver solver(req, req.unseen, zobrist());
     auto res = solver.solveRoot(req.noScoreStreak, cfg.endgameNodeBudget, INT32_MAX,
@@ -659,90 +639,60 @@ std::string handleRequest(const std::string& requestJson) {
     // fall through to the normal path when nothing was found at all
   }
 
-  // ── no placement available: exchange or pass ───────────────────────────────
-  if (moves.empty()) {
-    if (req.exchangeAllowed && req.rack.total > 0) {
-      Move ex = bestExchange(req, ctx);
-      if (!ex.exchangeKinds.empty()) {
-        return respond(ex, staticEquity(req.board, req.rack, ex, ctx), "greedy", false, 0, false,
-                       stats, msSince(start), 0, 0, rootMoves);
-      }
-    }
-    Move pass;
-    return respond(pass, staticEquity(req.board, req.rack, pass, ctx), "greedy", false, 0, false,
-                   stats, msSince(start), 0, 0, rootMoves);
-  }
-
-  // ── static ranking ─────────────────────────────────────────────────────────
+  // ── build one candidate set: placements + exchange + pass ──────────────────
+  // Exchange and pass compete on the SAME 2-ply footing as placements, so the
+  // bot swaps tiles whenever keeping a playable rack (judged by leave value)
+  // beats a weak placement — rather than "play whatever is legal". There is no
+  // score gate; the simulation decides.
   std::vector<std::pair<float, size_t>> ranked;
   ranked.reserve(moves.size());
-  for (size_t i = 0; i < moves.size(); i++) {
-    const float eq = cfg.useLeave ? staticEquity(req.board, req.rack, moves[i], ctx)
-                                  : static_cast<float>(moves[i].score);
-    ranked.push_back({eq, i});
-  }
+  for (size_t i = 0; i < moves.size(); i++)
+    ranked.push_back({staticEquity(req.board, req.rack, moves[i], ctx), i});
   std::sort(ranked.begin(), ranked.end(),
             [](const auto& a, const auto& b) { return a.first > b.first; });
 
-  // easy: random pick among the top few
-  if (cfg.pickFromTop > 1) {
-    const int n = std::min<int>(cfg.pickFromTop, static_cast<int>(ranked.size()));
-    const auto& pick = ranked[rng() % n];
-    return respond(moves[pick.second], pick.first, "greedy", false, 0, false, stats,
-                   msSince(start), 0, 0, rootMoves);
-  }
-
-  // ── simulation (hard / max) ────────────────────────────────────────────────
-  if (cfg.simTopK > 0 && req.oppRackCount > 0) {
+  std::vector<Move> candidates;
+  if (req.oppRackCount > 0) {
     const int k = std::min<int>(cfg.simTopK, static_cast<int>(ranked.size()));
-    std::vector<Move> candidates;
-    candidates.reserve(k + 1);
-    bool topScoreIncluded = false;
-    size_t topScoreIdx = 0;
-    for (size_t i = 0; i < moves.size(); i++)
-      if (moves[i].score > moves[topScoreIdx].score) topScoreIdx = i;
-    for (int i = 0; i < k; i++) {
-      candidates.push_back(moves[ranked[i].second]);
-      if (ranked[i].second == topScoreIdx) topScoreIncluded = true;
+    candidates.reserve(k + 3);
+    if (!moves.empty()) {
+      size_t topScoreIdx = 0;
+      for (size_t i = 0; i < moves.size(); i++)
+        if (moves[i].score > moves[topScoreIdx].score) topScoreIdx = i;
+      bool topIncluded = false;
+      for (int i = 0; i < k; i++) {
+        candidates.push_back(moves[ranked[i].second]);
+        if (ranked[i].second == topScoreIdx) topIncluded = true;
+      }
+      if (!topIncluded) candidates.push_back(moves[topScoreIdx]);  // always simulate the top scorer
     }
-    // Guarantee the highest-scoring move is always simulated, even if its
-    // static equity ranked it just outside the top-K.
-    if (!topScoreIncluded) candidates.push_back(moves[topScoreIdx]);
+    if (req.exchangeAllowed && req.rack.total > 0) {
+      Move ex = bestExchange(req, ctx);
+      if (!ex.exchangeKinds.empty()) candidates.push_back(ex);
+    }
+    candidates.push_back(Move{});  // pass (MoveType::Pass by default)
 
     const SimResult sim =
         simulate(req, candidates, cfg.simSamples, budgetMs * 0.9, start, rng, stats, ctx);
     if (sim.bestIndex >= 0) {
       const Move& chosen = candidates[sim.bestIndex];
-      // Consider exchanging instead only when everything on the board is weak.
-      // Compare on the same STATIC baseline as the greedy path — the sim value
-      // is a margin net of the opponent's reply and would make any exchange
-      // look attractive on an open board.
-      if (req.exchangeAllowed && chosen.score <= g_leave.exchangeConsiderBar) {
-        Move ex = bestExchange(req, ctx);
-        const float exEq = staticEquity(req.board, req.rack, ex, ctx);
-        if (!ex.exchangeKinds.empty() &&
-            exEq > staticEquity(req.board, req.rack, chosen, ctx)) {
-          return respond(ex, exEq, "sim", false, 0, false, stats, msSince(start),
-                         static_cast<int>(candidates.size()), sim.samplesUsed, rootMoves);
-        }
-      }
       return respond(chosen, sim.bestValue, "sim", false, 0, false, stats, msSince(start),
                      static_cast<int>(candidates.size()), sim.samplesUsed, rootMoves);
     }
   }
 
-  // ── greedy (normal, or fallback) ───────────────────────────────────────────
-  const auto& top = ranked.front();
-  const Move& chosen = moves[top.second];
-  if (req.exchangeAllowed && chosen.score <= g_leave.exchangeConsiderBar && cfg.useLeave) {
+  // ── fallback (opponent rack unknown/empty): static equity, exchange included ─
+  float bestEq = ranked.empty() ? -1e9f : ranked.front().first;
+  Move chosen = ranked.empty() ? Move{} : moves[ranked.front().second];
+  if (req.exchangeAllowed && req.rack.total > 0) {
     Move ex = bestExchange(req, ctx);
     const float exEq = staticEquity(req.board, req.rack, ex, ctx);
-    if (!ex.exchangeKinds.empty() && exEq > top.first) {
-      return respond(ex, exEq, "greedy", false, 0, false, stats, msSince(start), 0, 0, rootMoves);
+    if (!ex.exchangeKinds.empty() && exEq > bestEq) {
+      bestEq = exEq;
+      chosen = ex;
     }
   }
-  return respond(chosen, top.first, "greedy", false, 0, false, stats, msSince(start), 0, 0,
-                 rootMoves);
+  return respond(chosen, bestEq, "greedy", false, 0, false, stats, msSince(start), 0, 0, rootMoves);
 }
 
 }  // namespace amath
