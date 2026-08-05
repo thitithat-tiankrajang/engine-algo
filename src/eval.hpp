@@ -56,10 +56,20 @@ struct LeaveWeights {
   // Convex burden for hoarding heavy (10–20) tiles, per extra beyond the first.
   float heavyBurden = 0.6f;
 
+  // ── structural playability ──────────────────────────────────────────────
+  // An A-Math equation needs operators and an '='. A number-rich, operator-poor
+  // rack plays badly; a rack of numbers with no operator at all is nearly dead.
+  float operatorRatio = 0.45f;      // desired operators+equals per number tile
+  float operatorStarvation = 1.3f;  // penalty per operator short of that
+  float noOperatorPenalty = 5.0f;   // flat penalty: ≥2 numbers and zero operators
+  // Heavy numbers (10–20) cannot touch another number, so each one demands an
+  // operator/'=' to flank it — needing operator supply beyond light numbers.
+  float heavyFlankPenalty = 1.8f;   // penalty per heavy beyond the operator+equals supply
+
   // Penalty per duplicate copy beyond the first of the same kind.
   float duplicatePenalty = 0.6f;
   // Deviation from ~60% digits costs per tile.
-  float balancePenalty = 0.45f;
+  float balancePenalty = 0.35f;
 
   // Static premium exposure created for the opponent by our placements.
   float exposeEx3 = 3.0f;

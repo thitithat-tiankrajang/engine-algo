@@ -85,9 +85,31 @@ float leaveValue(const TileCounts& rack, const BoardContext& ctx) {
 
   // '=' is only useful where there is room to build; its upside scales with
   // mobility, but an over-supply is dead weight regardless of the board.
-  float eq = g_leave.equalsSchedule[std::min<int>(rack.n[K_EQUALS], RACK_SIZE)];
+  const int eqCount = rack.n[K_EQUALS];
+  float eq = g_leave.equalsSchedule[std::min<int>(eqCount, RACK_SIZE)];
   if (eq > 0.0f) eq *= std::clamp(0.5f + 0.6f * ctx.mobility, 0.4f, 1.3f);
   v += eq;
+
+  // ── structural playability: can these tiles actually form equations? ──────
+  const int operators = rack.n[K_ADD] + rack.n[K_SUB] + rack.n[K_MUL] + rack.n[K_DIV] +
+                        rack.n[K_PM] + rack.n[K_MD];
+  const int flankSupply = operators + eqCount;  // tiles that can sit beside a number
+
+  // Operators are the scarce structural ingredient; being short of them (relative
+  // to the number tiles held) makes the rack hard to play. Eased a little on an
+  // open board, where single tiles can be tacked onto existing equations.
+  const float wantedOps = digits * g_leave.operatorRatio;
+  if (flankSupply < wantedOps) {
+    const float ease = std::clamp(1.2f - 0.3f * ctx.mobility, 0.6f, 1.2f);
+    v -= g_leave.operatorStarvation * (wantedOps - flankSupply) * ease;
+  }
+  // A rack of numbers with no operator at all can barely move.
+  if (operators == 0 && digits >= 2) v -= g_leave.noOperatorPenalty;
+
+  // Heavy numbers can't touch other numbers, so each one needs an operator/'='
+  // to flank it. Holding more heavies than the flank supply is a real handicap —
+  // this is why an all-heavy, no-operator leave is much worse than it looks.
+  if (heavy > flankSupply) v -= g_leave.heavyFlankPenalty * (heavy - flankSupply);
 
   if (rack.total > 0) {
     const float idealDigits = rack.total * 0.6f;
