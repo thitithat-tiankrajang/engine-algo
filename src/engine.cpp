@@ -126,24 +126,20 @@ Config configFor(const std::string& /*difficulty*/) { return Config{}; }
 
 // ── exchange candidates ──────────────────────────────────────────────────────
 
-// Choose which tiles to swap by what the rack actually NEEDS, judged against
-// the live board (mobility, phase) and the real unseen pool — not by fixed
-// per-tile constants. Greedily removes the tile whose removal most improves the
-// rack toward a strong leave, then draws fresh from the pool. Score situation
-// tilts the appetite: when ahead, resist dumping many; when behind, fish harder.
-Move bestExchange(const Request& req, const BoardContext& ctx) {
-  Move best;
-  best.type = MoveType::Exchange;
-
-  const int drawable = std::min({req.rack.total, req.bagCount, 6});
-  if (drawable <= 0) return best;
+// Enumerate exchange candidates — one per swap size (1..maxDrawable). For each
+// size we keep the tiles that make the strongest *kept* leave (greedy: drop the
+// tile whose removal most improves the kept rack). The actual value of each
+// candidate — including what the bag is likely to give back — is decided later
+// by the simulation, which draws real replacement tiles from the unseen pool.
+// Emitting every size lets "swap 5 to fish" compete fairly with "swap 2".
+std::vector<Move> enumerateExchanges(const Request& req, const BoardContext& ctx) {
+  std::vector<Move> out;
+  const int drawable = std::min({req.rack.total, req.bagCount, 7});
+  if (drawable <= 0) return out;
 
   TileCounts working = req.rack;
   std::vector<uint8_t> removed;
-  float bestVal = -1e9f;
-
   for (int step = 1; step <= drawable; step++) {
-    // Pick the tile whose removal yields the best remaining leave.
     int bestKind = -1;
     float bestLeaveAfter = -1e9f;
     for (uint8_t k = 0; k < KIND_COUNT; k++) {
@@ -159,19 +155,12 @@ Move bestExchange(const Request& req, const BoardContext& ctx) {
     if (bestKind < 0) break;
     working.sub(static_cast<uint8_t>(bestKind));
     removed.push_back(static_cast<uint8_t>(bestKind));
-
-    // Value of exchanging this many: remaining leave + expected fresh draws,
-    // minus the tempo cost, adjusted for the score situation.
-    float val = bestLeaveAfter + ctx.freshTileValue * step - g_leave.exchangeTempoCost;
-    if (ctx.scoreDiff > 0) val -= g_leave.leadDumpPenalty * step;      // ahead: keep it tight
-    else if (ctx.scoreDiff < 0) val += g_leave.trailFishBonus * step;  // behind: fish
-
-    if (val > bestVal) {
-      bestVal = val;
-      best.exchangeKinds = removed;
-    }
+    Move m;
+    m.type = MoveType::Exchange;
+    m.exchangeKinds = removed;
+    out.push_back(m);
   }
-  return best;
+  return out;
 }
 
 // ── opponent rack sampling ───────────────────────────────────────────────────
@@ -216,20 +205,20 @@ SimResult simulate(const Request& req, const std::vector<Move>& candidates, int 
   const std::vector<TileCounts> racks = sampleOpponentRacks(req, samples, rng);
   std::vector<double> accum(candidates.size(), 0.0);
   std::vector<int> seen(candidates.size(), 0);
-  std::vector<float> myLeaveAfter(candidates.size());
+  std::vector<float> myLeaveAfter(candidates.size(), 0.0f);
+  // For exchange candidates, the kept rack; its value is completed per sample by
+  // drawing real replacement tiles from the unseen pool (bag fishing).
+  std::vector<TileCounts> keptRack(candidates.size());
   Board board = req.board;
 
-  // Per-candidate value base (everything except the opponent's reply, which is
-  // sampled below). Placement, exchange and pass are all scored on one scale so
-  // the sim can decide between "play this" and "swap tiles / pass" directly.
+  // Per-candidate value base for the moves whose value does NOT depend on what
+  // the bag gives back (placement, pass). Exchange is handled inside the sample
+  // loop so it can draw actual tiles from the pool.
   for (size_t i = 0; i < candidates.size(); i++) {
     const Move& c = candidates[i];
     if (c.type == MoveType::Exchange) {
-      TileCounts after = req.rack;
-      for (uint8_t k : c.exchangeKinds) after.sub(k);
-      myLeaveAfter[i] = leaveValue(after, ctx) +
-                        ctx.freshTileValue * static_cast<float>(c.exchangeKinds.size()) -
-                        g_leave.exchangeTempoCost;
+      keptRack[i] = req.rack;
+      for (uint8_t k : c.exchangeKinds) keptRack[i].sub(k);
     } else if (c.type == MoveType::Pass) {
       myLeaveAfter[i] = leaveValue(req.rack, ctx) - 4.0f;  // BIAS: pass tempo cost
     } else {
@@ -240,14 +229,23 @@ SimResult simulate(const Request& req, const std::vector<Move>& candidates, int 
   }
 
   // Sample-major with common random numbers: every candidate is scored against
-  // the SAME opponent racks, so the comparison stays fair and low-variance even
-  // when the budget stops us early. A sample is committed only when every
-  // candidate has finished it; a mid-sample timeout discards the partial row so
-  // all retained means rest on identical sample sets. The opponent's best reply
-  // is estimated with a fast, premium-ordered, node-bounded generation.
+  // the SAME opponent racks (and, for exchanges, the SAME drawn replacements),
+  // so the comparison stays fair even when the budget stops us early. A sample
+  // is committed only when every candidate has finished it.
   int done = 0;
   std::vector<double> rowVal(candidates.size(), 0.0);
+  std::vector<uint8_t> drawPool;  // shuffled per sample; exchanges draw its prefix
   for (int s = 0; s < static_cast<int>(racks.size()); s++) {
+    // Tiles that could be drawn on an exchange this sample = unseen pool minus
+    // the opponent's sampled rack (the same physical tiles can't be in both).
+    drawPool.clear();
+    for (uint8_t k = 0; k < KIND_COUNT; k++) {
+      int avail = req.unseen.n[k] - racks[s].n[k];
+      for (int j = 0; j < avail; j++) drawPool.push_back(k);
+    }
+    std::mt19937 drawRng(req.seed * 2654435761u + static_cast<uint32_t>(s) + 1u);
+    std::shuffle(drawPool.begin(), drawPool.end(), drawRng);
+
     bool rowComplete = true;
     for (size_t i = 0; i < candidates.size(); i++) {
       if (msSince(start) > budgetMs && done >= 3) {
@@ -255,7 +253,7 @@ SimResult simulate(const Request& req, const std::vector<Move>& candidates, int 
         break;
       }
       const Move& cand = candidates[i];
-      applyPlacements(board, cand.placements);
+      applyPlacements(board, cand.placements);  // no-op for exchange / pass
 
       std::vector<Move> replies;
       GenStats replyStats;
@@ -270,7 +268,23 @@ SimResult simulate(const Request& req, const std::vector<Move>& candidates, int 
         const float v = staticEquity(board, racks[s], reply, ctx);
         if (v > oppBest) oppBest = v;
       }
-      rowVal[i] = (cand.score + myLeaveAfter[i]) - oppBest;
+
+      float myVal;
+      if (cand.type == MoveType::Exchange) {
+        // Draw real replacement tiles and value the resulting full rack — this
+        // is what makes fishing (swapping several tiles for what the bag holds)
+        // worthwhile when the kept tiles alone are weak.
+        TileCounts newRack = keptRack[i];
+        const int count = static_cast<int>(cand.exchangeKinds.size());
+        for (int d = 0; d < count && d < static_cast<int>(drawPool.size()); d++)
+          newRack.add(drawPool[d]);
+        myVal = leaveValue(newRack, ctx) - g_leave.exchangeTempoCost;
+        if (ctx.scoreDiff > 0) myVal -= g_leave.leadDumpPenalty;      // ahead: keep it tight
+        else if (ctx.scoreDiff < 0) myVal += g_leave.trailFishBonus;  // behind: fish
+      } else {
+        myVal = cand.score + myLeaveAfter[i];
+      }
+      rowVal[i] = myVal - oppBest;
 
       undoPlacements(board, cand.placements);
     }
@@ -667,8 +681,8 @@ std::string handleRequest(const std::string& requestJson) {
       if (!topIncluded) candidates.push_back(moves[topScoreIdx]);  // always simulate the top scorer
     }
     if (req.exchangeAllowed && req.rack.total > 0) {
-      Move ex = bestExchange(req, ctx);
-      if (!ex.exchangeKinds.empty()) candidates.push_back(ex);
+      // One candidate per swap size, so the sim can pick how many to fish for.
+      for (Move& ex : enumerateExchanges(req, ctx)) candidates.push_back(std::move(ex));
     }
     candidates.push_back(Move{});  // pass (MoveType::Pass by default)
 
@@ -685,11 +699,12 @@ std::string handleRequest(const std::string& requestJson) {
   float bestEq = ranked.empty() ? -1e9f : ranked.front().first;
   Move chosen = ranked.empty() ? Move{} : moves[ranked.front().second];
   if (req.exchangeAllowed && req.rack.total > 0) {
-    Move ex = bestExchange(req, ctx);
-    const float exEq = staticEquity(req.board, req.rack, ex, ctx);
-    if (!ex.exchangeKinds.empty() && exEq > bestEq) {
-      bestEq = exEq;
-      chosen = ex;
+    for (const Move& ex : enumerateExchanges(req, ctx)) {
+      const float exEq = staticEquity(req.board, req.rack, ex, ctx);
+      if (exEq > bestEq) {
+        bestEq = exEq;
+        chosen = ex;
+      }
     }
   }
   return respond(chosen, bestEq, "greedy", false, 0, false, stats, msSince(start), 0, 0, rootMoves);
