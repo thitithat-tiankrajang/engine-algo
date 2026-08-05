@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <random>
 #include <unordered_map>
 
@@ -193,6 +194,23 @@ void undoPlacements(Board& board, const std::vector<Placement>& ps) {
 
 // ── 2-ply simulation under hidden information ────────────────────────────────
 
+// Best immediate score a rack could make on a board — our next-turn scoring
+// power, including the bingo bonus for an 8-tile play. Node-bounded so it stays
+// cheap inside the sim.
+int bestPlaceScore(const Board& board, const TileCounts& rack) {
+  if (rack.total == 0) return 0;
+  std::vector<Move> mv;
+  GenStats gs;
+  gs.nodeLimit = 150'000;
+  GenOptions o;
+  o.dedup = true;
+  o.premiumOrder = true;
+  generatePlaceMoves(board, rack, mv, &gs, o);
+  int best = 0;
+  for (const Move& m : mv) best = std::max(best, m.score);
+  return best;
+}
+
 struct SimResult {
   int bestIndex = -1;
   float bestValue = -1e9f;
@@ -204,27 +222,35 @@ SimResult simulate(const Request& req, const std::vector<Move>& candidates, int 
                    GenStats& stats, const BoardContext& ctx) {
   const std::vector<TileCounts> racks = sampleOpponentRacks(req, samples, rng);
   std::vector<double> accum(candidates.size(), 0.0);
+  std::vector<double> accumSq(candidates.size(), 0.0);
   std::vector<int> seen(candidates.size(), 0);
   std::vector<float> myLeaveAfter(candidates.size(), 0.0f);
   // For exchange candidates, the kept rack; its value is completed per sample by
   // drawing real replacement tiles from the unseen pool (bag fishing).
   std::vector<TileCounts> keptRack(candidates.size());
   Board board = req.board;
+  const float beta = g_leave.nextTurnPotentialWeight;
 
   // Per-candidate value base for the moves whose value does NOT depend on what
-  // the bag gives back (placement, pass). Exchange is handled inside the sample
-  // loop so it can draw actual tiles from the pool.
+  // the bag gives back (placement, pass). Each includes a discounted look at how
+  // much the resulting rack could score NEXT turn, so a placement that keeps
+  // scoring power (or sets up a big follow-up) is preferred. Exchange is handled
+  // inside the sample loop so it can draw actual tiles from the pool.
   for (size_t i = 0; i < candidates.size(); i++) {
     const Move& c = candidates[i];
     if (c.type == MoveType::Exchange) {
       keptRack[i] = req.rack;
       for (uint8_t k : c.exchangeKinds) keptRack[i].sub(k);
     } else if (c.type == MoveType::Pass) {
-      myLeaveAfter[i] = leaveValue(req.rack, ctx) - 4.0f;  // BIAS: pass tempo cost
+      myLeaveAfter[i] =
+          leaveValue(req.rack, ctx) - 4.0f + beta * bestPlaceScore(req.board, req.rack);
     } else {
       TileCounts after = req.rack;
       for (const Placement& p : c.placements) after.sub(p.kind);
-      myLeaveAfter[i] = leaveValue(after, ctx);
+      applyPlacements(board, c.placements);
+      const int potential = bestPlaceScore(board, after);
+      undoPlacements(board, c.placements);
+      myLeaveAfter[i] = leaveValue(after, ctx) + beta * potential;
     }
   }
 
@@ -271,14 +297,15 @@ SimResult simulate(const Request& req, const std::vector<Move>& candidates, int 
 
       float myVal;
       if (cand.type == MoveType::Exchange) {
-        // Draw real replacement tiles and value the resulting full rack — this
-        // is what makes fishing (swapping several tiles for what the bag holds)
-        // worthwhile when the kept tiles alone are weak.
+        // Draw real replacement tiles and value the resulting full rack — both
+        // its leave and how much it could SCORE next turn (bingo potential).
+        // This is what makes fishing worthwhile, e.g. swapping for a bingo.
         TileCounts newRack = keptRack[i];
         const int count = static_cast<int>(cand.exchangeKinds.size());
         for (int d = 0; d < count && d < static_cast<int>(drawPool.size()); d++)
           newRack.add(drawPool[d]);
-        myVal = leaveValue(newRack, ctx) - g_leave.exchangeTempoCost;
+        myVal = leaveValue(newRack, ctx) + beta * bestPlaceScore(board, newRack) -
+                g_leave.exchangeTempoCost;
         if (ctx.scoreDiff > 0) myVal -= g_leave.leadDumpPenalty;      // ahead: keep it tight
         else if (ctx.scoreDiff < 0) myVal += g_leave.trailFishBonus;  // behind: fish
       } else {
@@ -291,6 +318,7 @@ SimResult simulate(const Request& req, const std::vector<Move>& candidates, int 
     if (!rowComplete) break;
     for (size_t i = 0; i < candidates.size(); i++) {
       accum[i] += rowVal[i];
+      accumSq[i] += rowVal[i] * rowVal[i];
       seen[i]++;
     }
     done = s + 1;
@@ -308,13 +336,20 @@ SimResult simulate(const Request& req, const std::vector<Move>& candidates, int 
     if (elapsed > budgetMs && done >= 3) break;
   }
 
-  // Every retained candidate saw the same `done` samples → means are directly
-  // comparable.
+  // Rank by mean − λ·stddev: a move that is usually good but occasionally lets
+  // the opponent punish it hard (a high-variance downside, like opening a ×9) is
+  // discounted for that risk. λ rises with our lead — protect a winning position,
+  // gamble when behind. Every retained candidate saw the same `done` samples.
+  const float lambda =
+      std::max(0.0f, g_leave.riskAversionBase + g_leave.riskAversionLeadPer50 *
+                                                    (ctx.scoreDiff / 50.0f));
   SimResult res;
   res.samplesUsed = done;
   for (size_t i = 0; i < candidates.size(); i++) {
     if (seen[i] == 0) continue;
-    const float v = static_cast<float>(accum[i] / seen[i]);
+    const double mean = accum[i] / seen[i];
+    const double var = std::max(0.0, accumSq[i] / seen[i] - mean * mean);
+    const float v = static_cast<float>(mean - lambda * std::sqrt(var));
     if (v > res.bestValue) {
       res.bestValue = v;
       res.bestIndex = static_cast<int>(i);

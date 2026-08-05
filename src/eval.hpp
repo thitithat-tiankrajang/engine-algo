@@ -81,6 +81,20 @@ struct LeaveWeights {
   float leadDumpPenalty = 0.6f;      // when ahead, discourage dumping many tiles
   float trailFishBonus = 0.4f;       // when behind, encourage fishing
   float exchangeTempoCost = 2.0f;    // a turn spent exchanging scores nothing
+
+  // Look one more ply ahead on our own side: how much the resulting rack could
+  // score next turn (the actual best move it can make on the resulting board).
+  // This is what lets the bot exchange to set up a bingo, and prefer placements
+  // whose leave keeps real scoring power — discounted because the opponent moves
+  // in between and the draw is uncertain.
+  float nextTurnPotentialWeight = 0.35f;
+
+  // Risk aversion: candidates are ranked by mean − λ·stddev of their sampled
+  // value, so a move that is usually fine but occasionally lets the opponent
+  // punish it hard (e.g. opening a ×9 double word square) is penalized for that
+  // downside. λ grows when we are ahead (protect a lead) and shrinks when behind.
+  float riskAversionBase = 0.18f;
+  float riskAversionLeadPer50 = 0.22f;  // extra λ per 50 points of lead
 };
 
 extern LeaveWeights g_leave;
