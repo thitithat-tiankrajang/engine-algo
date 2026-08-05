@@ -118,6 +118,11 @@ struct Config {
   long long endgameNodeBudget = 0;
   int endgameBeamFallback = 0;  // beam width for the approximate retry
   double defaultBudgetMs = 800;
+  // Wall-clock ceiling for root move generation. Generation is premium-ordered
+  // and RAM-bounded (dedup), so hitting this ceiling loses only off-premium
+  // long-tail moves, never the board's best plays. A blank-heavy position can
+  // legitimately want tens of seconds to enumerate fully.
+  double genBudgetMs = 500;
 };
 
 Config configFor(const std::string& difficulty) {
@@ -126,54 +131,78 @@ Config configFor(const std::string& difficulty) {
     c.useLeave = false;
     c.pickFromTop = 5;
     c.defaultBudgetMs = 300;
+    c.genBudgetMs = 400;
   } else if (difficulty == "hard") {
-    c.simTopK = 16;
-    c.simSamples = 24;
+    c.simTopK = 20;
+    c.simSamples = 30;
     c.endgameExact = true;
     c.endgameNodeBudget = 3'000'000;
     c.endgameBeamFallback = 16;
-    c.defaultBudgetMs = 3500;
+    c.defaultBudgetMs = 12'000;
+    c.genBudgetMs = 6'000;
   } else if (difficulty == "max") {
-    c.simTopK = 32;
-    c.simSamples = 56;
+    c.simTopK = 40;
+    c.simSamples = 80;
     c.endgameExact = true;
-    c.endgameNodeBudget = 12'000'000;
+    c.endgameNodeBudget = 40'000'000;
     c.endgameBeamFallback = 24;
-    c.defaultBudgetMs = 8000;
+    c.defaultBudgetMs = 110'000;   // stay under the 2-minute user ceiling
+    c.genBudgetMs = 45'000;
   } else {  // normal
     c.endgameExact = true;
     c.endgameNodeBudget = 1'000'000;
     c.endgameBeamFallback = 12;
-    c.defaultBudgetMs = 900;
+    c.defaultBudgetMs = 2'000;
+    c.genBudgetMs = 1'200;
   }
   return c;
 }
 
 // ── exchange candidates ──────────────────────────────────────────────────────
 
-Move bestExchange(const Request& req) {
-  // Dump the k lowest-leave-value tiles, k = 1..6, and keep the best k by
-  // (leave of remainder + fresh-tile estimate).
-  std::vector<uint8_t> tiles;
-  for (uint8_t k = 0; k < KIND_COUNT; k++) {
-    for (int i = 0; i < req.rack.n[k]; i++) tiles.push_back(k);
-  }
-  std::sort(tiles.begin(), tiles.end(), [](uint8_t a, uint8_t b) {
-    return g_leave.kindValue[a] < g_leave.kindValue[b];
-  });
-
+// Choose which tiles to swap by what the rack actually NEEDS, judged against
+// the live board (mobility, phase) and the real unseen pool — not by fixed
+// per-tile constants. Greedily removes the tile whose removal most improves the
+// rack toward a strong leave, then draws fresh from the pool. Score situation
+// tilts the appetite: when ahead, resist dumping many; when behind, fish harder.
+Move bestExchange(const Request& req, const BoardContext& ctx) {
   Move best;
   best.type = MoveType::Exchange;
+
+  const int drawable = std::min({req.rack.total, req.bagCount, 6});
+  if (drawable <= 0) return best;
+
+  TileCounts working = req.rack;
+  std::vector<uint8_t> removed;
   float bestVal = -1e9f;
-  const int maxK = std::min<int>(6, static_cast<int>(tiles.size()));
-  for (int k = 1; k <= maxK; k++) {
-    Move m;
-    m.type = MoveType::Exchange;
-    m.exchangeKinds.assign(tiles.begin(), tiles.begin() + k);
-    const float v = staticEquity(req.board, req.rack, m);
-    if (v > bestVal) {
-      bestVal = v;
-      best = m;
+
+  for (int step = 1; step <= drawable; step++) {
+    // Pick the tile whose removal yields the best remaining leave.
+    int bestKind = -1;
+    float bestLeaveAfter = -1e9f;
+    for (uint8_t k = 0; k < KIND_COUNT; k++) {
+      if (working.n[k] == 0) continue;
+      working.sub(k);
+      const float leaveAfter = leaveValue(working, ctx);
+      working.add(k);
+      if (leaveAfter > bestLeaveAfter) {
+        bestLeaveAfter = leaveAfter;
+        bestKind = k;
+      }
+    }
+    if (bestKind < 0) break;
+    working.sub(static_cast<uint8_t>(bestKind));
+    removed.push_back(static_cast<uint8_t>(bestKind));
+
+    // Value of exchanging this many: remaining leave + expected fresh draws,
+    // minus the tempo cost, adjusted for the score situation.
+    float val = bestLeaveAfter + ctx.freshTileValue * step - g_leave.exchangeTempoCost;
+    if (ctx.scoreDiff > 0) val -= g_leave.leadDumpPenalty * step;      // ahead: keep it tight
+    else if (ctx.scoreDiff < 0) val += g_leave.trailFishBonus * step;  // behind: fish
+
+    if (val > bestVal) {
+      bestVal = val;
+      best.exchangeKinds = removed;
     }
   }
   return best;
@@ -217,24 +246,27 @@ struct SimResult {
 
 SimResult simulate(const Request& req, const std::vector<Move>& candidates, int samples,
                    double budgetMs, Clock::time_point start, std::mt19937& rng,
-                   GenStats& stats) {
+                   GenStats& stats, const BoardContext& ctx) {
   const std::vector<TileCounts> racks = sampleOpponentRacks(req, samples, rng);
   std::vector<double> accum(candidates.size(), 0.0);
+  std::vector<int> seen(candidates.size(), 0);
   std::vector<float> myLeaveAfter(candidates.size());
   Board board = req.board;
 
   for (size_t i = 0; i < candidates.size(); i++) {
     TileCounts after = req.rack;
     for (const Placement& p : candidates[i].placements) after.sub(p.kind);
-    myLeaveAfter[i] = leaveValue(after);
+    myLeaveAfter[i] = leaveValue(after, ctx);
   }
 
+  // Sample-major with common random numbers: every candidate is scored against
+  // the SAME opponent racks, so the comparison stays fair and low-variance even
+  // when the budget stops us early. A sample is committed only when every
+  // candidate has finished it; a mid-sample timeout discards the partial row so
+  // all retained means rest on identical sample sets. The opponent's best reply
+  // is estimated with a fast, premium-ordered, node-bounded generation.
   int done = 0;
-  // Sample-major order: every candidate sees the same opponent racks, so the
-  // comparison is fair even when we stop early (common random numbers). A
-  // sample is committed only when every candidate finished it; a mid-sample
-  // timeout discards the partial row to preserve that fairness.
-  std::vector<double> row(candidates.size(), 0.0);
+  std::vector<double> rowVal(candidates.size(), 0.0);
   for (int s = 0; s < static_cast<int>(racks.size()); s++) {
     bool rowComplete = true;
     for (size_t i = 0; i < candidates.size(); i++) {
@@ -247,47 +279,48 @@ SimResult simulate(const Request& req, const std::vector<Move>& candidates, int 
 
       std::vector<Move> replies;
       GenStats replyStats;
-      replyStats.nodeLimit = 250'000;  // bound pathological rack/board combos
-      generatePlaceMoves(board, racks[s], replies, &replyStats);
+      replyStats.nodeLimit = 200'000;  // fast: keeps the sample count high
+      GenOptions replyOpts;
+      replyOpts.dedup = true;          // bound RAM against blank-heavy opp racks
+      replyOpts.premiumOrder = true;   // best reply found first, before the cap
+      generatePlaceMoves(board, racks[s], replies, &replyStats, replyOpts);
       stats.nodesVisited += replyStats.nodesVisited;
-      float oppBest = leaveValue(racks[s]) - 4.0f;  // opponent passes
+      float oppBest = leaveValue(racks[s], ctx) - 4.0f;  // opponent passes
       for (const Move& reply : replies) {
-        const float v = staticEquity(board, racks[s], reply);
+        const float v = staticEquity(board, racks[s], reply, ctx);
         if (v > oppBest) oppBest = v;
       }
-      row[i] = (cand.score + myLeaveAfter[i]) - oppBest;
+      rowVal[i] = (cand.score + myLeaveAfter[i]) - oppBest;
 
       undoPlacements(board, cand.placements);
     }
     if (!rowComplete) break;
-    for (size_t i = 0; i < candidates.size(); i++) accum[i] += row[i];
+    for (size_t i = 0; i < candidates.size(); i++) {
+      accum[i] += rowVal[i];
+      seen[i]++;
+    }
     done = s + 1;
 
     const double elapsed = msSince(start);
-    const double perSample = elapsed / done;
-    // The wait can never exceed the remaining budget, so cap the ETA there.
-    const double eta = std::min(perSample * (racks.size() - done),
+    const double eta = std::min(elapsed / done * (racks.size() - done),
                                 std::max(0.0, budgetMs - elapsed));
     int bestScore = 0;
-    {
-      double bestAcc = -1e18;
-      for (size_t i = 0; i < candidates.size(); i++) {
-        if (accum[i] > bestAcc) {
-          bestAcc = accum[i];
-          bestScore = candidates[i].score;
-        }
-      }
-    }
+    double bestAcc = -1e18;
+    for (size_t i = 0; i < candidates.size(); i++)
+      if (accum[i] > bestAcc) { bestAcc = accum[i]; bestScore = candidates[i].score; }
     report("sim", 100.0 * done / racks.size(), elapsed, eta, bestScore,
-           "candidates=" + std::to_string(candidates.size()) +
-               " samples=" + std::to_string(done) + "/" + std::to_string(racks.size()));
-    if (elapsed > budgetMs && done >= 3) break;  // keep at least a few samples
+           "candidates=" + std::to_string(candidates.size()) + " samples=" +
+               std::to_string(done) + "/" + std::to_string(racks.size()));
+    if (elapsed > budgetMs && done >= 3) break;
   }
 
+  // Every retained candidate saw the same `done` samples → means are directly
+  // comparable.
   SimResult res;
   res.samplesUsed = done;
   for (size_t i = 0; i < candidates.size(); i++) {
-    const float v = static_cast<float>(accum[i] / std::max(1, done));
+    if (seen[i] == 0) continue;
+    const float v = static_cast<float>(accum[i] / seen[i]);
     if (v > res.bestValue) {
       res.bestValue = v;
       res.bestIndex = static_cast<int>(i);
@@ -587,13 +620,23 @@ std::string handleRequest(const std::string& requestJson) {
   const double budgetMs = req.budgetMs > 0 ? req.budgetMs : cfg.defaultBudgetMs;
   std::mt19937 rng(req.seed);
 
+  // Judge tiles against the live board: openness, the real unseen pool, phase
+  // and the score situation.
+  const BoardContext ctx = makeContext(req.board, req.unseen, req.bagCount,
+                                       static_cast<float>(req.myScore - req.oppScore));
+
   report("movegen", 0, 0, 0, 0, "");
 
+  // Root generation: premium-ordered (so a spent budget never silently drops
+  // the board's best plays), dedup'd (RAM bounded by geometry, not by blanks),
+  // time-bounded. Endgame generation below stays complete for exactness.
   GenStats stats;
-  stats.nodeLimit = 6'000'000;  // safety net for pathological blank-heavy racks
   std::vector<Move> moves;
-  generatePlaceMoves(req.board, req.rack, moves, &stats);
-  stats.nodeLimit = 0;
+  GenOptions genOpts;
+  genOpts.budgetMs = cfg.genBudgetMs;
+  genOpts.dedup = true;
+  genOpts.premiumOrder = true;
+  generatePlaceMoves(req.board, req.rack, moves, &stats, genOpts);
   const int rootMoves = static_cast<int>(moves.size());
 
   // ── endgame: bag empty means the opponent rack is fully known ──────────────
@@ -619,20 +662,22 @@ std::string handleRequest(const std::string& requestJson) {
   // ── no placement available: exchange or pass ───────────────────────────────
   if (moves.empty()) {
     if (req.exchangeAllowed && req.rack.total > 0) {
-      Move ex = bestExchange(req);
-      return respond(ex, staticEquity(req.board, req.rack, ex), "greedy", false, 0, false, stats,
-                     msSince(start), 0, 0, rootMoves);
+      Move ex = bestExchange(req, ctx);
+      if (!ex.exchangeKinds.empty()) {
+        return respond(ex, staticEquity(req.board, req.rack, ex, ctx), "greedy", false, 0, false,
+                       stats, msSince(start), 0, 0, rootMoves);
+      }
     }
     Move pass;
-    return respond(pass, staticEquity(req.board, req.rack, pass), "greedy", false, 0, false, stats,
-                   msSince(start), 0, 0, rootMoves);
+    return respond(pass, staticEquity(req.board, req.rack, pass, ctx), "greedy", false, 0, false,
+                   stats, msSince(start), 0, 0, rootMoves);
   }
 
   // ── static ranking ─────────────────────────────────────────────────────────
   std::vector<std::pair<float, size_t>> ranked;
   ranked.reserve(moves.size());
   for (size_t i = 0; i < moves.size(); i++) {
-    const float eq = cfg.useLeave ? staticEquity(req.board, req.rack, moves[i])
+    const float eq = cfg.useLeave ? staticEquity(req.board, req.rack, moves[i], ctx)
                                   : static_cast<float>(moves[i].score);
     ranked.push_back({eq, i});
   }
@@ -651,11 +696,21 @@ std::string handleRequest(const std::string& requestJson) {
   if (cfg.simTopK > 0 && req.oppRackCount > 0) {
     const int k = std::min<int>(cfg.simTopK, static_cast<int>(ranked.size()));
     std::vector<Move> candidates;
-    candidates.reserve(k);
-    for (int i = 0; i < k; i++) candidates.push_back(moves[ranked[i].second]);
+    candidates.reserve(k + 1);
+    bool topScoreIncluded = false;
+    size_t topScoreIdx = 0;
+    for (size_t i = 0; i < moves.size(); i++)
+      if (moves[i].score > moves[topScoreIdx].score) topScoreIdx = i;
+    for (int i = 0; i < k; i++) {
+      candidates.push_back(moves[ranked[i].second]);
+      if (ranked[i].second == topScoreIdx) topScoreIncluded = true;
+    }
+    // Guarantee the highest-scoring move is always simulated, even if its
+    // static equity ranked it just outside the top-K.
+    if (!topScoreIncluded) candidates.push_back(moves[topScoreIdx]);
 
     const SimResult sim =
-        simulate(req, candidates, cfg.simSamples, budgetMs * 0.9, start, rng, stats);
+        simulate(req, candidates, cfg.simSamples, budgetMs * 0.9, start, rng, stats, ctx);
     if (sim.bestIndex >= 0) {
       const Move& chosen = candidates[sim.bestIndex];
       // Consider exchanging instead only when everything on the board is weak.
@@ -663,9 +718,10 @@ std::string handleRequest(const std::string& requestJson) {
       // is a margin net of the opponent's reply and would make any exchange
       // look attractive on an open board.
       if (req.exchangeAllowed && chosen.score <= g_leave.exchangeConsiderBar) {
-        Move ex = bestExchange(req);
-        const float exEq = staticEquity(req.board, req.rack, ex);
-        if (exEq > staticEquity(req.board, req.rack, chosen)) {
+        Move ex = bestExchange(req, ctx);
+        const float exEq = staticEquity(req.board, req.rack, ex, ctx);
+        if (!ex.exchangeKinds.empty() &&
+            exEq > staticEquity(req.board, req.rack, chosen, ctx)) {
           return respond(ex, exEq, "sim", false, 0, false, stats, msSince(start),
                          static_cast<int>(candidates.size()), sim.samplesUsed, rootMoves);
         }
@@ -679,9 +735,9 @@ std::string handleRequest(const std::string& requestJson) {
   const auto& top = ranked.front();
   const Move& chosen = moves[top.second];
   if (req.exchangeAllowed && chosen.score <= g_leave.exchangeConsiderBar && cfg.useLeave) {
-    Move ex = bestExchange(req);
-    const float exEq = staticEquity(req.board, req.rack, ex);
-    if (exEq > top.first) {
+    Move ex = bestExchange(req, ctx);
+    const float exEq = staticEquity(req.board, req.rack, ex, ctx);
+    if (!ex.exchangeKinds.empty() && exEq > top.first) {
       return respond(ex, exEq, "greedy", false, 0, false, stats, msSince(start), 0, 0, rootMoves);
     }
   }

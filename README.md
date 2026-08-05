@@ -65,8 +65,36 @@ valid/invalid verdict and score from both implementations.
 Plays full games under real EQ-Lab rules (draw-to-8, exchange with delayed
 tile return, rack-out and no-score-streak endings) and validates every move.
 
+## Move generation (bounded & fair)
+
+`generatePlaceMoves` defaults to complete, board-order enumeration (used by the
+endgame solver and every test). The midgame decision path passes `GenOptions`:
+
+- **`premiumOrder`** — anchors near premium squares are explored first, so a
+  spent time budget never silently drops the board's best plays. (This fixed a
+  real bug where blank-heavy racks let a 6M-node cap truncate the right side of
+  the board, hiding a 148-point play behind a 64-point one.)
+- **`dedup`** — collapses blank/choice *assignment* variants of the same
+  physical placement, keeping the best-scoring one (leave and defense depend
+  only on cells + kinds, not the assigned token). Bounds stored moves by board
+  geometry, independent of blank count → RAM stays in single-digit MB even with
+  four blanks in hand.
+- **`budgetMs`** — wall-clock budget split evenly across both directions;
+  device-independent (a slower device generates less of the long tail, never a
+  biased region). The `test_engine` completeness + dedup checks guard both.
+
 ## Tuning (M5)
 
-All hand-set weights are marked as **BIAS POINTS** in `src/eval.hpp` and the
-difficulty table in `src/engine.cpp` (`configFor`). The self-play harness in
-`src/selfplay.hpp` is the intended evaluation loop for tuning them.
+All hand-set weights are marked as **BIAS POINTS** in `src/eval.hpp`
+(`LeaveWeights` + the `BoardContext`-driven leave model) and the difficulty
+table in `src/engine.cpp` (`configFor`). Notable ones:
+
+- `kindValue[]`, `equalsSchedule[]` — per-tile and per-`=` leave values.
+- `zeroMulDivSynergy`, `zeroNoMulDivPenalty` — 0 plays well with ×÷, poorly with +−.
+- `heavyBurden` — convex penalty for hoarding 10–20 tiles, eased by board openness.
+- `leadDumpPenalty`, `trailFishBonus`, `exchangeTempoCost` — exchange appetite by
+  score situation.
+- `configFor()` search budgets: `simTopK`, `simSamples`, `genBudgetMs`,
+  `defaultBudgetMs`, `endgameNodeBudget`.
+
+The self-play harness in `src/selfplay.hpp` is the intended evaluation loop.

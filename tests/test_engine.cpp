@@ -5,8 +5,11 @@
 //     the same score, and no duplicates are produced
 //  4. movegen completeness — matches a brute-force reference enumerator on
 //     random positions with small racks
+#include <algorithm>
+#include <array>
 #include <cassert>
 #include <cstdio>
+#include <map>
 #include <random>
 #include <set>
 #include <sstream>
@@ -53,6 +56,21 @@ static std::string moveSignature(const Move& m) {
   for (const Placement& p : m.placements) {
     std::ostringstream ss;
     ss << int(p.row) << "," << int(p.col) << "," << int(p.kind) << "," << int(p.token);
+    parts.push_back(ss.str());
+  }
+  std::sort(parts.begin(), parts.end());
+  std::string sig;
+  for (const auto& s : parts) sig += s + ";";
+  return sig;
+}
+
+// Footprint = cells + physical kinds, ignoring the assigned token. This is the
+// granularity dedup collapses to.
+static std::string footprintSignature(const Move& m) {
+  std::vector<std::string> parts;
+  for (const Placement& p : m.placements) {
+    std::ostringstream ss;
+    ss << int(p.row) << "," << int(p.col) << "," << int(p.kind);
     parts.push_back(ss.str());
   }
   std::sort(parts.begin(), parts.end());
@@ -280,18 +298,24 @@ static void testMovegen() {
       }
     }
 
-    // Completeness on this final position with a small rack (subset of the
-    // real rack, sized 2..4 to keep brute force tractable).
-    for (int sub = 2; sub <= 4; sub++) {
+    // Completeness on this final position across several small racks. Every
+    // rack deliberately mixes special tiles (blank ?, choice +/- and x//,
+    // equals =) with digits, because those are the tiles whose enumeration is
+    // hardest and most likely to hide a movegen gap. Brute force stays
+    // tractable at sizes 3..4.
+    // Digit kinds are their own value (0..20); specials are named.
+    static const std::array<std::vector<uint8_t>, 6> RACK_TEMPLATES = {{
+        {K_BLANK, 1, K_EQUALS},          // blank + digit + equals
+        {K_BLANK, K_BLANK, 5},           // two blanks
+        {K_PM, 2, K_EQUALS},             // choice +/- + digit + equals
+        {K_MD, 3, 6, K_EQUALS},          // choice x/÷ + digits + equals
+        {K_BLANK, K_PM, 4, K_EQUALS},    // blank + choice + digit + equals
+        {1, 2, 3, K_EQUALS},             // plain digits baseline
+    }};
+
+    for (const auto& templ : RACK_TEMPLATES) {
       TileCounts small;
-      int taken = 0;
-      for (uint8_t k = 0; k < KIND_COUNT && taken < sub; k++) {
-        for (int i = 0; i < rack.n[k] && taken < sub; i++) {
-          small.add(k);
-          taken++;
-        }
-      }
-      if (small.total == 0) continue;
+      for (uint8_t k : templ) small.add(k);
 
       std::vector<Move> moves;
       generatePlaceMoves(board, small, moves, nullptr);
@@ -302,14 +326,32 @@ static void testMovegen() {
       bruteForce(board, small, refSet);
 
       if (genSet != refSet) {
-        std::printf("  seed=%u sub=%d COMPLETENESS MISMATCH gen=%zu ref=%zu\n", seed, sub,
-                    genSet.size(), refSet.size());
-        for (const auto& e : refSet) {
+        std::printf("  seed=%u COMPLETENESS MISMATCH gen=%zu ref=%zu\n", seed, genSet.size(),
+                    refSet.size());
+        for (const auto& e : refSet)
           if (!genSet.count(e)) std::printf("    missing: %s score=%d\n", e.first.c_str(), e.second);
-        }
-        for (const auto& e : genSet) {
+        for (const auto& e : genSet)
           if (!refSet.count(e)) std::printf("    extra:   %s score=%d\n", e.first.c_str(), e.second);
-        }
+        CHECK(false);
+      }
+
+      // Dedup mode must keep exactly the best score per (cells, kinds)
+      // footprint — the max score over all assignment variants. Ground truth is
+      // the complete `moves` set (already verified against brute force above).
+      std::map<std::string, int> bestByFootprint;
+      for (const Move& m : moves) {
+        auto it = bestByFootprint.find(footprintSignature(m));
+        if (it == bestByFootprint.end() || m.score > it->second)
+          bestByFootprint[footprintSignature(m)] = m.score;
+      }
+      std::vector<Move> deduped;
+      GenOptions opts; opts.dedup = true;
+      generatePlaceMoves(board, small, deduped, nullptr, opts);
+      std::map<std::string, int> dedupSet;
+      for (const Move& m : deduped) dedupSet[footprintSignature(m)] = m.score;
+      if (dedupSet != bestByFootprint) {
+        std::printf("  seed=%u DEDUP MISMATCH deduped=%zu expected=%zu\n", seed, dedupSet.size(),
+                    bestByFootprint.size());
         CHECK(false);
       }
     }

@@ -1,10 +1,16 @@
 #include "movegen.hpp"
 
+#include <algorithm>
 #include <array>
+#include <chrono>
+#include <cstdint>
+#include <unordered_map>
 
 namespace amath {
 
 namespace {
+
+using Clock = std::chrono::steady_clock;
 
 constexpr uint32_t ALL_TOKENS = (1u << ASSIGNED_COUNT) - 1;
 
@@ -27,15 +33,39 @@ inline void premiumOf(int row, int col, int& tileMult, int& eqMult) {
   }
 }
 
+// Rough value ranking of a premium square, used only to order anchors so the
+// budget is spent on promising regions first.
+inline int premiumWeight(int idx) {
+  switch (PREMIUM[idx]) {
+    case EX3: return 27;
+    case EX2: return 8;
+    case PX3: return 5;
+    case PX2: return 3;
+    default: return 1;
+  }
+}
+
 struct Generator {
   const Board& board;
   TileCounts rack;
   std::vector<Move>& out;
   GenStats* stats;
+  GenOptions opts;
 
   // Main direction of the current pass.
   int dr = 0, dc = 1;
   bool isHorizontalPass = true;
+
+  // Deadline handling (per pass). `aborted` latches once the budget is spent so
+  // the DFS unwinds cheaply without repeatedly reading the clock.
+  Clock::time_point deadline{};
+  bool hasDeadline = false;
+  bool aborted = false;
+  long long nodeCheckCounter = 0;
+
+  // Dedup: map a canonical (cells + kinds) footprint to its index in `out`,
+  // keeping the highest-scoring assignment. Bounds RAM regardless of blanks.
+  std::unordered_map<std::string, size_t> dedupIndex;
 
   std::array<CrossInfo, BOARD_CELLS> cross{};
 
@@ -57,8 +87,19 @@ struct Generator {
 
   bool connected() const { return runHasExisting || crossPlacedCount > 0; }
 
-  Generator(const Board& b, const TileCounts& r, std::vector<Move>& o, GenStats* s)
-      : board(b), rack(r), out(o), stats(s) {}
+  Generator(const Board& b, const TileCounts& r, std::vector<Move>& o, GenStats* s,
+            const GenOptions& o2)
+      : board(b), rack(r), out(o), stats(s), opts(o2) {}
+
+  // Check the pass deadline every so often; latch `aborted` when it passes.
+  bool budgetExpired() {
+    if (!hasDeadline || aborted) return aborted;
+    if ((++nodeCheckCounter & 0x3FF) == 0 && Clock::now() >= deadline) {
+      aborted = true;
+      if (stats) stats->truncated = true;
+    }
+    return aborted;
+  }
 
   void computeCross(int pdr, int pdc) {
     for (int row = 0; row < BOARD_SIZE; row++) {
@@ -166,10 +207,43 @@ struct Generator {
       return;
     }
 
+    const int finalScore = score + (placedCount >= RACK_SIZE ? BINGO_BONUS : 0);
+
+    if (opts.dedup) {
+      // Canonical key: cells (sorted) + their physical kinds. Collapses only
+      // blank/choice ASSIGNMENT variants, preserving leave and defense.
+      std::array<std::pair<int, uint8_t>, RACK_SIZE> tmp;
+      for (int i = 0; i < placedCount; i++) {
+        tmp[i] = {Board::idx(placed[i].row, placed[i].col), placed[i].kind};
+      }
+      std::sort(tmp.begin(), tmp.begin() + placedCount);
+      std::string key;
+      key.reserve(placedCount * 3);
+      for (int i = 0; i < placedCount; i++) {
+        key.push_back(static_cast<char>(tmp[i].first & 0xFF));
+        key.push_back(static_cast<char>((tmp[i].first >> 8) & 0xFF));
+        key.push_back(static_cast<char>(tmp[i].second));
+      }
+      auto it = dedupIndex.find(key);
+      if (it == dedupIndex.end()) {
+        dedupIndex.emplace(std::move(key), out.size());
+        Move mv;
+        mv.type = MoveType::Place;
+        mv.placements = placed;
+        mv.score = finalScore;
+        out.push_back(std::move(mv));
+        if (stats) stats->movesEmitted++;
+      } else if (finalScore > out[it->second].score) {
+        out[it->second].placements = placed;
+        out[it->second].score = finalScore;
+      }
+      return;
+    }
+
     Move mv;
     mv.type = MoveType::Place;
     mv.placements = placed;
-    mv.score = score + (placedCount >= RACK_SIZE ? BINGO_BONUS : 0);
+    mv.score = finalScore;
     out.push_back(std::move(mv));
     if (stats) stats->movesEmitted++;
   }
@@ -203,13 +277,16 @@ struct Generator {
 
   // DFS: place the next new tile at (row, col), which must be an empty cell.
   void extend(int row, int col) {
+    if (aborted) return;
     if (stats) {
       stats->nodesVisited++;
       if (stats->nodeLimit > 0 && stats->nodesVisited > stats->nodeLimit) {
         stats->truncated = true;
+        aborted = true;
         return;
       }
     }
+    if (budgetExpired()) return;
 
     // Prune: the run must be able to reach the existing structure (or the
     // center star on the first move) with the tiles we still hold.
@@ -322,12 +399,37 @@ struct Generator {
     extend(row, col);
   }
 
-  void runPass(bool horizontal) {
+  // Priority of a start cell = the best premium reachable within this pass's
+  // forward direction using the tiles in hand (only empty cells can earn a
+  // premium, since premiums apply to newly placed tiles).
+  int anchorPriority(int row, int col) const {
+    int best = 0;
+    int placeable = rack.total;
+    int r = row, c = col;
+    while (inBounds(r, c) && placeable > 0) {
+      if (!board.at(r, c).occupied()) {
+        best = std::max(best, premiumWeight(Board::idx(r, c)));
+        placeable--;
+      }
+      r += dr;
+      c += dc;
+    }
+    return best;
+  }
+
+  void runPass(bool horizontal, double passBudgetMs) {
     isHorizontalPass = horizontal;
     dr = horizontal ? 0 : 1;
     dc = horizontal ? 1 : 0;
     computeCross(horizontal ? 1 : 0, horizontal ? 0 : 1);
     computeContact();
+
+    aborted = false;
+    hasDeadline = passBudgetMs > 0;
+    if (hasDeadline) {
+      deadline = Clock::now() + std::chrono::duration_cast<Clock::duration>(
+                                    std::chrono::duration<double, std::milli>(passBudgetMs));
+    }
 
     if (board.empty()) {
       // First move: only the center line can cover the star.
@@ -338,10 +440,28 @@ struct Generator {
       }
       return;
     }
+
+    // Build the anchor list (every empty cell is a potential start).
+    std::vector<int> anchors;
+    anchors.reserve(BOARD_CELLS);
     for (int row = 0; row < BOARD_SIZE; row++) {
       for (int col = 0; col < BOARD_SIZE; col++) {
-        startAt(row, col);
+        if (!board.at(row, col).occupied()) anchors.push_back(Board::idx(row, col));
       }
+    }
+
+    if (opts.premiumOrder) {
+      // Highest-value regions first, so a spent budget never silently drops the
+      // board's most valuable moves.
+      std::stable_sort(anchors.begin(), anchors.end(), [this](int a, int b) {
+        return anchorPriority(a / BOARD_SIZE, a % BOARD_SIZE) >
+               anchorPriority(b / BOARD_SIZE, b % BOARD_SIZE);
+      });
+    }
+
+    for (int idx : anchors) {
+      if (aborted) break;
+      startAt(idx / BOARD_SIZE, idx % BOARD_SIZE);
     }
   }
 };
@@ -349,10 +469,13 @@ struct Generator {
 }  // namespace
 
 void generatePlaceMoves(const Board& board, const TileCounts& rack, std::vector<Move>& out,
-                        GenStats* stats) {
-  Generator gen(board, rack, out, stats);
-  gen.runPass(true);
-  gen.runPass(false);
+                        GenStats* stats, const GenOptions& opts) {
+  Generator gen(board, rack, out, stats, opts);
+  // Split the budget evenly so both directions are always explored; a vertical
+  // best move must never be starved by a slow horizontal pass.
+  const double passBudget = opts.budgetMs > 0 ? opts.budgetMs / 2.0 : 0.0;
+  gen.runPass(true, passBudget);
+  gen.runPass(false, passBudget);
 }
 
 }  // namespace amath

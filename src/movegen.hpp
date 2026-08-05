@@ -26,15 +26,42 @@ namespace amath {
 struct GenStats {
   long long nodesVisited = 0;
   int movesEmitted = 0;
-  // When nodeLimit > 0, generation stops after visiting that many DFS nodes
-  // (truncated is set). Bounded, slightly incomplete enumeration is used for
-  // opponent-reply estimates inside the simulation solver.
+  // When nodeLimit > 0, generation stops after visiting that many DFS nodes.
   long long nodeLimit = 0;
+  // Set when generation stopped early (node limit or time budget). A truncated
+  // run is still safe to use, but is not guaranteed complete.
   bool truncated = false;
 };
 
-// Enumerates every legal Place move for `rack` on `board`.
+// Options controlling how much work generation does and how it is bounded.
+//
+// Defaults reproduce exact, complete, board-order enumeration — every existing
+// caller (endgame solver, tests, brute-force checks) relies on that and must
+// pass no options. The midgame decision path opts into the bounded, RAM-safe,
+// fairness-ordered mode.
+struct GenOptions {
+  // Wall-clock budget in milliseconds (0 = unlimited). Split evenly across the
+  // horizontal and vertical passes so both directions are always explored.
+  double budgetMs = 0;
+
+  // Collapse blank/choice-assignment variants of the same physical placement,
+  // keeping the highest-scoring one. Leave value depends only on which tile
+  // KINDS are spent (a placed blank is spent regardless of its assigned token)
+  // and defense only on which CELLS are used, so the best-scoring realization
+  // of a given (cells, kinds) footprint is also its best-equity realization.
+  // This bounds stored moves by board geometry, independent of blank count.
+  // MUST stay off for the exact endgame, where a blank's assigned token lands
+  // on the board and changes future play.
+  bool dedup = false;
+
+  // Explore anchors near high-premium squares first, so that if the budget is
+  // exhausted the most valuable moves have already been found (no silent,
+  // position-order-biased loss of the board's right/bottom).
+  bool premiumOrder = false;
+};
+
+// Enumerates legal Place moves for `rack` on `board`.
 void generatePlaceMoves(const Board& board, const TileCounts& rack, std::vector<Move>& out,
-                        GenStats* stats = nullptr);
+                        GenStats* stats = nullptr, const GenOptions& opts = {});
 
 }  // namespace amath
