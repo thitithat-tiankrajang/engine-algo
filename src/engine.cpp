@@ -805,7 +805,12 @@ struct HiddenBagSolver {
       }
       if (aborted) return 0;
       if (consider(v)) {
-        if (useTT) tt[idx] = TTSlot{key, best, 1, true};  // fail-high → lower bound
+        // Cutoff bound is side-dependent: side 0 maximises, so a cutoff is a
+        // fail-HIGH → lower bound (flag 1); side 1 minimises, so a cutoff is a
+        // fail-LOW → upper bound (flag 2). Storing flag 1 unconditionally (the
+        // previous behaviour) mislabels every min-node cutoff and can hand back
+        // a too-high value on a later probe. Matches the pass-branch store below.
+        if (useTT) tt[idx] = TTSlot{key, best, static_cast<uint8_t>(side == 0 ? 1 : 2), true};
         return best;
       }
     }
@@ -1210,27 +1215,21 @@ std::string handleRequest(const std::string& requestJson) {
   if (endgameEligible && req.bagCount <= cfg.endgameExactBagMax) {
     const HiddenResult hr = solveHiddenEndgame(req, cfg.endgameNodeBudget, egBudget * 0.92,
                                                cfg.endgameMaxAssignments);
+    // PROVEN: the exact solver finished. This is the only path that returns a
+    // move through the "endgame" channel, and it is always endgameSolved=true.
     if (hr.found && hr.solved) {
       json::ValuePtr report = buildEndgameReport(hr.rootVals, hr.move);
       return respond(hr.move, static_cast<float>(hr.value), "endgame", true, hr.value, true, stats,
                      msSince(start), 0, 0, rootMoves, report);
     }
 
-    // The exact solver could not finish this position in budget. For a fully
-    // known rack (bag==0) fall back to the pre-existing negamax as a best-effort
-    // play (it is fast via its TT but has a rare soundness bug — see
-    // amath-endgame-solvers notes, so it is NOT trusted for a claimed proof).
-    if (req.bagCount == 0 && !moves.empty()) {
-      EndgameSolver solver(req, req.unseen, zobrist());
-      auto res = solver.solveRoot(req.noScoreStreak, cfg.endgameNodeBudget,
-                                  cfg.endgameBeamFallback, egBudget * 0.06);
-      if (res.found) {
-        json::ValuePtr report = buildEndgameReport(solver.rootMoveValues, res.move);
-        return respond(res.move, static_cast<float>(res.value), "endgame", false, res.value, true,
-                       stats, msSince(start), 0, 0, rootMoves, report);
-      }
-    }
-    // else: fall through to the sampling search below
+    // INCOMPLETE: the exact proof did not finish within budget. We do NOT fall
+    // back to an approximate endgame move (the old beam-limited EndgameSolver is
+    // removed): a beam result is not a proof, and returning it through the
+    // "endgame" channel would mislabel an approximation as exact. Instead the
+    // request falls through to the sampling search below, whose move is labelled
+    // solver="sim" (never "endgame"), so a non-proven move is never presented as
+    // exact. The endgame solver's contract is therefore PROVEN or INCOMPLETE only.
   }
 
   // ── build one candidate set: placements + exchange + pass ──────────────────
