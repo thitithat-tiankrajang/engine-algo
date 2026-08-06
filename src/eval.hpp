@@ -62,8 +62,8 @@ struct LeaveWeights {
   // ── structural playability ──────────────────────────────────────────────
   // An A-Math equation needs operators and an '='. A number-rich, operator-poor
   // rack plays badly; a rack of numbers with no operator at all is nearly dead.
-  float operatorRatio = 0.37f;      // desired operators+equals per number tile
-  float operatorStarvation = 5.5f;  // penalty per operator short of that
+  float operatorRatio = 0.45f;      // desired operators+equals per number tile
+  float operatorStarvation = 7.0f;  // penalty per operator short of that
   float noOperatorPenalty = 10.0f;   // flat penalty: ≥2 numbers and zero operators
   // Heavy numbers (10–20) cannot touch another number, so each one demands an
   // operator/'=' to flank it — needing operator supply beyond light numbers.
