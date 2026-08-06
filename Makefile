@@ -16,6 +16,11 @@ test-bot: build $(SRC) $(HDR) tests/test_bot.cpp
 	$(CXX) $(CXXFLAGS) -o build/test_bot tests/test_bot.cpp $(SRC)
 	./build/test_bot
 
+# Phase 2: incremental board state — make/unmake vs full-rebuild equality + bench.
+test-inc: build $(SRC) $(HDR) tests/test_inc_board.cpp
+	$(CXX) $(CXXFLAGS) -o build/test_inc_board tests/test_inc_board.cpp $(SRC)
+	./build/test_inc_board
+
 cli: build $(SRC) $(HDR) src/cli.cpp
 	$(CXX) $(CXXFLAGS) -o build/amath_cli src/cli.cpp $(SRC)
 
@@ -29,4 +34,4 @@ wasm: build $(SRC) $(HDR) src/wasm_api.cpp
 		-s EXPORTED_RUNTIME_METHODS=UTF8ToString,stringToUTF8,lengthBytesUTF8 \
 		-s STACK_SIZE=4MB
 
-.PHONY: build test test-bot cli wasm
+.PHONY: build test test-bot test-inc cli wasm
