@@ -16,6 +16,7 @@
 //    pass skips them) so no move is ever produced twice.
 #pragma once
 
+#include <functional>
 #include <vector>
 
 #include "board.hpp"
@@ -24,6 +25,12 @@
 namespace amath {
 
 struct IncrementalBoard;  // src/inc_board.hpp — optional maintained cross/contact state
+
+// Streaming emit callback (Phase 4): invoked once per legal move with its final
+// score and its placement buffer. The buffer is transient — copy out anything
+// that must outlive the call. The callback must NOT leave the board mutated when
+// it returns (it may make/unmake around a recursive search, but must restore).
+using MoveSink = std::function<void(int score, const std::vector<Placement>& placements)>;
 
 struct GenStats {
   long long nodesVisited = 0;
@@ -71,5 +78,12 @@ struct GenOptions {
 void generatePlaceMoves(const Board& board, const TileCounts& rack, std::vector<Move>& out,
                         GenStats* stats = nullptr, const GenOptions& opts = {},
                         const IncrementalBoard* inc = nullptr);
+
+// Streaming form: deliver each legal move to `sink` instead of a vector. Same
+// order/validity/scoring as generatePlaceMoves; no dedup (use the vector form
+// for that). Lets the search consume moves without materializing the list.
+void generatePlaceMovesStream(const Board& board, const TileCounts& rack, const MoveSink& sink,
+                              GenStats* stats = nullptr, const GenOptions& opts = {},
+                              const IncrementalBoard* inc = nullptr);
 
 }  // namespace amath

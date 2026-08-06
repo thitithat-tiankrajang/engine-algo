@@ -763,15 +763,6 @@ struct HiddenBagSolver {
 
     TileCounts& mover = side == 0 ? ai : opp;
 
-    std::vector<Move> moves;
-    GenStats gs;
-    gs.nodeLimit = 2'000'000;
-    generatePlaceMoves(incb.board, mover, moves, &gs, GenOptions{}, &incb);
-    if (gs.truncated) {
-      aborted = true;
-      return 0;
-    }
-
     int best = side == 0 ? -INF : INF;
     // Fold an option value into `best` with alpha-beta; returns true on cutoff.
     auto consider = [&](int v) -> bool {
@@ -785,13 +776,23 @@ struct HiddenBagSolver {
       return alpha >= beta;
     };
 
-    for (const Move& m : moves) {
-      for (const Placement& p : m.placements) {
+    // Phase 4: consume moves as the generator streams them, in the same board
+    // order as before — no move list is built. `cut` latches on a beta-cutoff so
+    // later moves are ignored WITHOUT stopping generation, which keeps the 2M
+    // movegen-truncation behaviour byte-identical to the vector form. The sink
+    // makes/unmakes around the recursive search, so the board is restored before
+    // control returns to the generator's DFS.
+    bool cut = false;
+    GenStats gs;
+    gs.nodeLimit = 2'000'000;
+    MoveSink sink = [&](int mscore, const std::vector<Placement>& pls) {
+      if (cut || aborted) return;
+      for (const Placement& p : pls) {
         boardHash ^= zob->cell[Board::idx(p.row, p.col)][p.kind][p.token];
         mover.sub(p.kind);
       }
-      incb.makeMove(m.placements);  // updates board + cross/contact/anchors incrementally
-      const int sd = side == 0 ? m.score : -m.score;
+      incb.makeMove(pls);  // updates board + cross/contact/anchors incrementally
+      const int sd = side == 0 ? mscore : -mscore;
       int v;
       if (mover.total == 0 && bag.total == 0) {
         const int oppRemain = side == 0 ? opp.points() : ai.points();
@@ -801,22 +802,26 @@ struct HiddenBagSolver {
         // Child window is shifted by the immediate delta sd (v = sd + child).
         v = sd + drawWorst(draw, side, ai, opp, bag, 1 - side, alpha - sd, beta - sd);
       }
-      incb.undoMove(m.placements);
-      for (const Placement& p : m.placements) {
+      incb.undoMove(pls);
+      for (const Placement& p : pls) {
         boardHash ^= zob->cell[Board::idx(p.row, p.col)][p.kind][p.token];
         mover.add(p.kind);
       }
-      if (aborted) return 0;
+      if (aborted) return;
       if (consider(v)) {
-        // Cutoff bound is side-dependent: side 0 maximises, so a cutoff is a
-        // fail-HIGH → lower bound (flag 1); side 1 minimises, so a cutoff is a
-        // fail-LOW → upper bound (flag 2). Storing flag 1 unconditionally (the
-        // previous behaviour) mislabels every min-node cutoff and can hand back
-        // a too-high value on a later probe. Matches the pass-branch store below.
+        // Cutoff bound is side-dependent: side 0 maximises → fail-HIGH (lower
+        // bound, flag 1); side 1 minimises → fail-LOW (upper bound, flag 2).
         if (useTT) tt[idx] = TTSlot{key, best, static_cast<uint8_t>(side == 0 ? 1 : 2), true};
-        return best;
+        cut = true;
       }
+    };
+    generatePlaceMovesStream(incb.board, mover, sink, &gs, GenOptions{}, &incb);
+    if (gs.truncated) {
+      aborted = true;
+      return 0;
     }
+    if (aborted) return 0;
+    if (cut) return best;
 
     // Pass is always available (a no-score turn; sd = 0, window unchanged).
     int pv;

@@ -51,7 +51,10 @@ inline int premiumWeight(int idx) {
 struct Generator {
   const Board& board;
   TileCounts rack;
-  std::vector<Move>& out;
+  // Exactly one emit destination is active: `out` materializes a move list
+  // (classic / dedup path), `sink` streams each move to the caller (Phase 4).
+  std::vector<Move>* out = nullptr;
+  const MoveSink* sink = nullptr;
   GenStats* stats;
   GenOptions opts;
   // When set, cross-check/contact state is taken from this maintained board
@@ -94,9 +97,9 @@ struct Generator {
 
   bool connected() const { return runHasExisting || crossPlacedCount > 0; }
 
-  Generator(const Board& b, const TileCounts& r, std::vector<Move>& o, GenStats* s,
-            const GenOptions& o2, const IncrementalBoard* inc_)
-      : board(b), rack(r), out(o), stats(s), opts(o2), inc(inc_) {}
+  Generator(const Board& b, const TileCounts& r, std::vector<Move>* o, const MoveSink* sk,
+            GenStats* s, const GenOptions& o2, const IncrementalBoard* inc_)
+      : board(b), rack(r), out(o), sink(sk), stats(s), opts(o2), inc(inc_) {}
 
   // Load cross-check + contact state for this pass. Without a maintained board
   // this recomputes from scratch (original behavior). With one, release builds
@@ -248,6 +251,15 @@ struct Generator {
 
     const int finalScore = score + (placedCount >= RACK_SIZE ? BINGO_BONUS : 0);
 
+    // Streaming path (Phase 4): hand the move straight to the caller — no Move
+    // object, no vector, no dedup. `placed` is the live placement buffer; the
+    // sink must consume it before returning (it may not outlive this call).
+    if (sink) {
+      (*sink)(finalScore, placed);
+      if (stats) stats->movesEmitted++;
+      return;
+    }
+
     if (opts.dedup) {
       // Canonical key: cells (sorted) + their physical kinds. Collapses only
       // blank/choice ASSIGNMENT variants, preserving leave and defense.
@@ -265,16 +277,16 @@ struct Generator {
       }
       auto it = dedupIndex.find(key);
       if (it == dedupIndex.end()) {
-        dedupIndex.emplace(std::move(key), out.size());
+        dedupIndex.emplace(std::move(key), out->size());
         Move mv;
         mv.type = MoveType::Place;
         mv.placements = placed;
         mv.score = finalScore;
-        out.push_back(std::move(mv));
+        out->push_back(std::move(mv));
         if (stats) stats->movesEmitted++;
-      } else if (finalScore > out[it->second].score) {
-        out[it->second].placements = placed;
-        out[it->second].score = finalScore;
+      } else if (finalScore > (*out)[it->second].score) {
+        (*out)[it->second].placements = placed;
+        (*out)[it->second].score = finalScore;
       }
       return;
     }
@@ -283,7 +295,7 @@ struct Generator {
     mv.type = MoveType::Place;
     mv.placements = placed;
     mv.score = finalScore;
-    out.push_back(std::move(mv));
+    out->push_back(std::move(mv));
     if (stats) stats->movesEmitted++;
   }
 
@@ -508,9 +520,22 @@ struct Generator {
 
 void generatePlaceMoves(const Board& board, const TileCounts& rack, std::vector<Move>& out,
                         GenStats* stats, const GenOptions& opts, const IncrementalBoard* inc) {
-  Generator gen(board, rack, out, stats, opts, inc);
+  Generator gen(board, rack, &out, nullptr, stats, opts, inc);
   // Split the budget evenly so both directions are always explored; a vertical
   // best move must never be starved by a slow horizontal pass.
+  const double passBudget = opts.budgetMs > 0 ? opts.budgetMs / 2.0 : 0.0;
+  gen.runPass(true, passBudget);
+  gen.runPass(false, passBudget);
+}
+
+// Streaming variant (Phase 4): each legal move is delivered to `sink` as it is
+// found — no move list is materialized. Same enumeration order and same
+// validity/scoring as the vector form; dedup is not offered (it requires
+// buffering, i.e. the vector form). The `placements` handed to the sink are a
+// transient buffer: consume them within the call.
+void generatePlaceMovesStream(const Board& board, const TileCounts& rack, const MoveSink& sink,
+                              GenStats* stats, const GenOptions& opts, const IncrementalBoard* inc) {
+  Generator gen(board, rack, nullptr, &sink, stats, opts, inc);
   const double passBudget = opts.budgetMs > 0 ? opts.budgetMs / 2.0 : 0.0;
   gen.runPass(true, passBudget);
   gen.runPass(false, passBudget);
