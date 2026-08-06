@@ -37,3 +37,8 @@ wasm: build $(SRC) $(HDR) src/wasm_api.cpp
 		-s STACK_SIZE=4MB
 
 .PHONY: build test test-bot test-inc cli wasm
+
+deploy-ui: wasm
+	cp build/amath_engine.mjs ../EQ-Lab/src/bot/amath_engine.mjs
+
+.PHONY: build test test-bot test-inc cli wasm deploy-ui

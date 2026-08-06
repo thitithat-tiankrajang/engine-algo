@@ -35,59 +35,62 @@ struct LeaveWeights {
   //  digits 1–3 are flexible glue; heavy tiles carry scoring upside but are
   //  hard to place; choice tiles and blanks are the most flexible in the game.
   float kindValue[KIND_COUNT] = {
-      // 0     1     2     3     4     5     6     7     8     9
-      0.3f, 1.2f, 1.2f, 1.0f, 0.8f, 0.8f, 0.7f, 0.6f, 0.7f, 0.6f,
-      // 10    11    12    13    14    15    16    17    18    19    20
-      0.0f, -0.2f, 0.0f, 0.3f, -0.1f, -0.1f, -0.1f, 0.3f, -0.1f, 0.4f, 0.1f,
-      // +     -     ×     ÷
-      0.9f, 0.7f, 1.1f, 0.5f,
-      // +/-   x/÷   =     ?
-      1.4f, 1.6f, 0.0f, 4.5f};  // '=' handled by the schedule below
+      //0     1     2     3     4     5     6     7     8     9
+        0.8f, 1.4f, 1.4f, 1.2f, 1.0f, 0.3f, 0.8f, 0.6f, 0.8f, 0.7f,
+
+      //10    11      12    13    14      15      16      17    18      19    20
+        -0.3f, 0.2f,  0.3f, 2.5f, -0.2f,  -0.2f,  -0.2f,  2.5f, -0.2f,  3.2f, -0.3f,
+
+      //+     -     ×     ÷
+        0.9f, 1.5f, 1.2f, 0.6f,
+
+      //+/-   ×/÷   =     ?
+        2.0f, 1.8f, 0.0f, 10.0f};  // '=' handled by the schedule below
 
   // Value of holding N '=' tiles: first is near-essential, a second is
   // insurance, a third+ clogs the rack.
-  float equalsSchedule[RACK_SIZE + 1] = {0.0f, 2.6f, 3.2f, 2.6f, 1.4f, 0.0f, -1.6f, -3.2f, -4.8f};
+  float equalsSchedule[RACK_SIZE + 1] = {1.5f, 3.0f, 0.5f, -3.0f, -7.0f, -11.0f, -15.0f, -20.0f, -25.0f};
 
   // 0 combines with × and ÷: bonus per (0, mul/div-tile) pairing held.
-  float zeroMulDivSynergy = 0.8f;
+  float zeroMulDivSynergy = 1.2f;
   // 0 with no × / ÷ in hand is awkward.
-  float zeroNoMulDivPenalty = 0.5f;
+  float zeroNoMulDivPenalty = 1.2f;
 
   // Convex burden for hoarding heavy (10–20) tiles, per extra beyond the first.
-  float heavyBurden = 0.6f;
+  float heavyBurden = 3.0f;
 
   // ── structural playability ──────────────────────────────────────────────
   // An A-Math equation needs operators and an '='. A number-rich, operator-poor
   // rack plays badly; a rack of numbers with no operator at all is nearly dead.
-  float operatorRatio = 0.45f;      // desired operators+equals per number tile
-  float operatorStarvation = 1.3f;  // penalty per operator short of that
-  float noOperatorPenalty = 5.0f;   // flat penalty: ≥2 numbers and zero operators
+  float operatorRatio = 0.37f;      // desired operators+equals per number tile
+  float operatorStarvation = 5.5f;  // penalty per operator short of that
+  float noOperatorPenalty = 10.0f;   // flat penalty: ≥2 numbers and zero operators
   // Heavy numbers (10–20) cannot touch another number, so each one demands an
   // operator/'=' to flank it — needing operator supply beyond light numbers.
-  float heavyFlankPenalty = 1.8f;   // penalty per heavy beyond the operator+equals supply
+  float heavyFlankPenalty = 6.0f;   // penalty per heavy beyond the operator+equals supply
 
   // Penalty per duplicate copy beyond the first of the same kind.
-  float duplicatePenalty = 0.6f;
+  float duplicatePenalty = 1.0f;
   // Deviation from ~60% digits costs per tile.
-  float balancePenalty = 0.35f;
+  float balancePenalty = 1.2f;
 
   // Static premium exposure created for the opponent by our placements.
-  float exposeEx3 = 3.0f;
-  float exposeEx2 = 1.5f;
-  float exposePx3 = 0.8f;
+  float exposeEx3 = 4.0f;
+  float exposeEx2 = 2.0f;
+  float exposePx3 = 1.2f;
 
   // Exchange policy.
   float exchangeConsiderBar = 6.0f;  // only weigh exchanging when best score ≤ this
   float leadDumpPenalty = 0.6f;      // when ahead, discourage dumping many tiles
   float trailFishBonus = 0.4f;       // when behind, encourage fishing
-  float exchangeTempoCost = 2.0f;    // a turn spent exchanging scores nothing
+  float exchangeTempoCost = 1.0f;    // a turn spent exchanging scores nothing
 
   // Look one more ply ahead on our own side: how much the resulting rack could
   // score next turn (the actual best move it can make on the resulting board).
   // This is what lets the bot exchange to set up a bingo, and prefer placements
   // whose leave keeps real scoring power — discounted because the opponent moves
   // in between and the draw is uncertain.
-  float nextTurnPotentialWeight = 0.35f;
+  float nextTurnPotentialWeight = 0.60f;
 
   // Risk aversion: candidates are ranked by mean − λ·stddev of their sampled
   // value, so a move that is usually fine but occasionally lets the opponent
