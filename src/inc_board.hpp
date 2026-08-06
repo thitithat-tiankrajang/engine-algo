@@ -182,21 +182,29 @@ struct IncrementalBoard {
       else board.remove(p.row, p.col);
     }
     // 2) refresh cross masks on affected columns (crossV) and rows (crossH),
-    //    recording which rows/cols saw a change so contact can follow.
+    //    recording which rows/cols saw a change so contact can follow. Each
+    //    affected column/row is recomputed AT MOST ONCE even when a move places
+    //    several tiles in it (all tiles are already down by step 1, so one pass
+    //    captures them all).
     std::array<bool, BOARD_SIZE> touchRowH{};  // contactHpass rows to refresh
     std::array<bool, BOARD_SIZE> touchColV{};  // contactVpass cols to refresh
+    std::array<bool, BOARD_SIZE> colDone{}, rowDone{};
     for (const Placement& p : ps) {
-      // crossV lives in this cell's column.
-      for (int row = 0; row < BOARD_SIZE; row++) {
-        const int idx = Board::idx(row, p.col);
-        const XCross nv = board.at(row, p.col).occupied() ? XCross{} : crossCell(row, p.col, 1, 0);
-        if (nv != crossV[idx]) { crossV[idx] = nv; touchRowH[row] = true; }
+      if (!colDone[p.col]) {  // crossV lives in this cell's column
+        colDone[p.col] = true;
+        for (int row = 0; row < BOARD_SIZE; row++) {
+          const int idx = Board::idx(row, p.col);
+          const XCross nv = board.at(row, p.col).occupied() ? XCross{} : crossCell(row, p.col, 1, 0);
+          if (nv != crossV[idx]) { crossV[idx] = nv; touchRowH[row] = true; }
+        }
       }
-      // crossH lives in this cell's row.
-      for (int col = 0; col < BOARD_SIZE; col++) {
-        const int idx = Board::idx(p.row, col);
-        const XCross nh = board.at(p.row, col).occupied() ? XCross{} : crossCell(p.row, col, 0, 1);
-        if (nh != crossH[idx]) { crossH[idx] = nh; touchColV[col] = true; }
+      if (!rowDone[p.row]) {  // crossH lives in this cell's row
+        rowDone[p.row] = true;
+        for (int col = 0; col < BOARD_SIZE; col++) {
+          const int idx = Board::idx(p.row, col);
+          const XCross nh = board.at(p.row, col).occupied() ? XCross{} : crossCell(p.row, col, 0, 1);
+          if (nh != crossH[idx]) { crossH[idx] = nh; touchColV[col] = true; }
+        }
       }
       // occupancy change in this row/col affects contact of that very line too.
       touchRowH[p.row] = true;

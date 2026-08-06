@@ -23,6 +23,8 @@
 
 namespace amath {
 
+struct IncrementalBoard;  // src/inc_board.hpp — optional maintained cross/contact state
+
 struct GenStats {
   long long nodesVisited = 0;
   int movesEmitted = 0;
@@ -61,7 +63,13 @@ struct GenOptions {
 };
 
 // Enumerates legal Place moves for `rack` on `board`.
+//
+// `inc` (optional): a maintained IncrementalBoard whose cross-check/contact state
+// matches `board`. When given, generation reuses that state instead of rebuilding
+// it (Phase 3). Debug builds still recompute and assert equality. `board` and
+// `inc->board` must be the same position; pass nullptr for the classic path.
 void generatePlaceMoves(const Board& board, const TileCounts& rack, std::vector<Move>& out,
-                        GenStats* stats = nullptr, const GenOptions& opts = {});
+                        GenStats* stats = nullptr, const GenOptions& opts = {},
+                        const IncrementalBoard* inc = nullptr);
 
 }  // namespace amath

@@ -8,6 +8,7 @@
 
 #include "board.hpp"
 #include "eval.hpp"
+#include "inc_board.hpp"
 #include "json.hpp"
 #include "movegen.hpp"
 #include "rules.hpp"
@@ -663,7 +664,9 @@ const Zobrist& zobrist() {
 // minimised. The value is AI_total − Opp_total played out to the end, matching
 // the exact bag==0 solver above (which this reduces to when the bag is empty).
 struct HiddenBagSolver {
-  Board board;
+  // Phase 3: the board plus its maintained cross-check / contact / anchor state,
+  // updated via make/unmake so the generator never rebuilds them per node.
+  IncrementalBoard incb;
   long long nodeBudget = 0;
   double budgetMs = 0;
   Clock::time_point start;
@@ -692,7 +695,7 @@ struct HiddenBagSolver {
     boardHash = 0;
     for (int r = 0; r < BOARD_SIZE; r++)
       for (int c = 0; c < BOARD_SIZE; c++) {
-        const Cell& cell = board.at(r, c);
+        const Cell& cell = incb.board.at(r, c);
         if (cell.occupied()) boardHash ^= zob->cell[Board::idx(r, c)][cell.kind][cell.token];
       }
   }
@@ -763,7 +766,7 @@ struct HiddenBagSolver {
     std::vector<Move> moves;
     GenStats gs;
     gs.nodeLimit = 2'000'000;
-    generatePlaceMoves(board, mover, moves, &gs);
+    generatePlaceMoves(incb.board, mover, moves, &gs, GenOptions{}, &incb);
     if (gs.truncated) {
       aborted = true;
       return 0;
@@ -784,10 +787,10 @@ struct HiddenBagSolver {
 
     for (const Move& m : moves) {
       for (const Placement& p : m.placements) {
-        board.place(p.row, p.col, p.kind, p.token);
         boardHash ^= zob->cell[Board::idx(p.row, p.col)][p.kind][p.token];
         mover.sub(p.kind);
       }
+      incb.makeMove(m.placements);  // updates board + cross/contact/anchors incrementally
       const int sd = side == 0 ? m.score : -m.score;
       int v;
       if (mover.total == 0 && bag.total == 0) {
@@ -798,8 +801,8 @@ struct HiddenBagSolver {
         // Child window is shifted by the immediate delta sd (v = sd + child).
         v = sd + drawWorst(draw, side, ai, opp, bag, 1 - side, alpha - sd, beta - sd);
       }
+      incb.undoMove(m.placements);
       for (const Placement& p : m.placements) {
-        board.remove(p.row, p.col);
         boardHash ^= zob->cell[Board::idx(p.row, p.col)][p.kind][p.token];
         mover.add(p.kind);
       }
@@ -902,7 +905,8 @@ HiddenResult solveHiddenEndgame(const Request& req, long long nodeBudget, double
     TileCounts oppRack = req.unseen;
     for (uint8_t k = 0; k < KIND_COUNT; k++) oppRack.sub(k, scenarios[s].n[k]);
     TileCounts bag = scenarios[s];
-    solver.board = req.board;
+    solver.incb.board = req.board;
+    solver.incb.rebuild();  // seed the maintained state for this scenario's root board
     solver.recomputeBoardHash();
 
     // Each AI root move, evaluated against this fixed scenario.
@@ -910,10 +914,10 @@ HiddenResult solveHiddenEndgame(const Request& req, long long nodeBudget, double
       const Move& m = aiMoves[i];
       TileCounts ai = req.rack;
       for (const Placement& p : m.placements) {
-        solver.board.place(p.row, p.col, p.kind, p.token);
         solver.boardHash ^= solver.zob->cell[Board::idx(p.row, p.col)][p.kind][p.token];
         ai.sub(p.kind);
       }
+      solver.incb.makeMove(m.placements);
       TileCounts scenarioBag = bag;
       int v;
       if (ai.total == 0 && scenarioBag.total == 0) {
@@ -924,8 +928,8 @@ HiddenResult solveHiddenEndgame(const Request& req, long long nodeBudget, double
         v = m.score + solver.drawWorst(draw, 0, ai, oppRack, scenarioBag, 1,
                                        -HiddenBagSolver::INF, HiddenBagSolver::INF);
       }
+      solver.incb.undoMove(m.placements);
       for (const Placement& p : m.placements) {
-        solver.board.remove(p.row, p.col);
         solver.boardHash ^= solver.zob->cell[Board::idx(p.row, p.col)][p.kind][p.token];
       }
       if (solver.aborted) return res;  // could not prove — fall back

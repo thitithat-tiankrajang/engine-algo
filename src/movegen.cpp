@@ -2,9 +2,12 @@
 
 #include <algorithm>
 #include <array>
+#include <cassert>
 #include <chrono>
 #include <cstdint>
 #include <unordered_map>
+
+#include "inc_board.hpp"
 
 namespace amath {
 
@@ -51,6 +54,10 @@ struct Generator {
   std::vector<Move>& out;
   GenStats* stats;
   GenOptions opts;
+  // When set, cross-check/contact state is taken from this maintained board
+  // (Phase 3) instead of being rebuilt each call. Debug builds still recompute
+  // and assert equality; release builds skip straight to the maintained state.
+  const IncrementalBoard* inc = nullptr;
 
   // Main direction of the current pass.
   int dr = 0, dc = 1;
@@ -88,8 +95,40 @@ struct Generator {
   bool connected() const { return runHasExisting || crossPlacedCount > 0; }
 
   Generator(const Board& b, const TileCounts& r, std::vector<Move>& o, GenStats* s,
-            const GenOptions& o2)
-      : board(b), rack(r), out(o), stats(s), opts(o2) {}
+            const GenOptions& o2, const IncrementalBoard* inc_)
+      : board(b), rack(r), out(o), stats(s), opts(o2), inc(inc_) {}
+
+  // Load cross-check + contact state for this pass. Without a maintained board
+  // this recomputes from scratch (original behavior). With one, release builds
+  // copy the maintained arrays (O(N), no per-cell revalidation); debug builds
+  // recompute AND assert the maintained state is byte-identical — this is the
+  // Phase 3 correctness gate exercised by every test.
+  void loadCrossContact(bool horizontal) {
+    const int pdr = horizontal ? 1 : 0, pdc = horizontal ? 0 : 1;
+    if (!inc) {
+      computeCross(pdr, pdc);
+      computeContact();
+      return;
+    }
+    const auto& ic = horizontal ? inc->crossV : inc->crossH;
+    const auto& ict = horizontal ? inc->contactHpass : inc->contactVpass;
+#ifdef NDEBUG
+    for (int i = 0; i < BOARD_CELLS; i++) {
+      cross[i].mask = ic[i].mask;
+      cross[i].fixedSum = ic[i].fixedSum;
+      cross[i].has = ic[i].has;
+      emptiesToContact[i] = ict[i];
+    }
+#else
+    computeCross(pdr, pdc);  // ground truth into cross[] / emptiesToContact[]
+    computeContact();
+    for (int i = 0; i < BOARD_CELLS; i++) {
+      assert(cross[i].mask == ic[i].mask && cross[i].fixedSum == ic[i].fixedSum &&
+             cross[i].has == ic[i].has && "maintained crossV/crossH diverged from computeCross");
+      assert(emptiesToContact[i] == ict[i] && "maintained contact diverged from computeContact");
+    }
+#endif
+  }
 
   // Check the pass deadline every so often; latch `aborted` when it passes.
   bool budgetExpired() {
@@ -421,8 +460,7 @@ struct Generator {
     isHorizontalPass = horizontal;
     dr = horizontal ? 0 : 1;
     dc = horizontal ? 1 : 0;
-    computeCross(horizontal ? 1 : 0, horizontal ? 0 : 1);
-    computeContact();
+    loadCrossContact(horizontal);
 
     aborted = false;
     hasDeadline = passBudgetMs > 0;
@@ -469,8 +507,8 @@ struct Generator {
 }  // namespace
 
 void generatePlaceMoves(const Board& board, const TileCounts& rack, std::vector<Move>& out,
-                        GenStats* stats, const GenOptions& opts) {
-  Generator gen(board, rack, out, stats, opts);
+                        GenStats* stats, const GenOptions& opts, const IncrementalBoard* inc) {
+  Generator gen(board, rack, out, stats, opts, inc);
   // Split the budget evenly so both directions are always explored; a vertical
   // best move must never be starved by a slow horizontal pass.
   const double passBudget = opts.budgetMs > 0 ? opts.budgetMs / 2.0 : 0.0;
