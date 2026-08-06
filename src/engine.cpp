@@ -683,14 +683,34 @@ struct HiddenBagSolver {
   struct TTSlot {
     uint64_t key = 0;
     int value = 0;
-    uint8_t flag = 0;  // 0 exact, 1 lower bound, 2 upper bound
+    int16_t bestMove = -1;  // signature of the move that produced `value` (ordering hint)
+    uint8_t flag = 0;       // 0 exact, 1 lower bound, 2 upper bound
     bool used = false;
-  };
+  };  // 16 bytes (bestMove packs into the former padding — no RAM increase)
   const Zobrist* zob = nullptr;
   std::vector<TTSlot> tt;
   uint64_t boardHash = 0;
 
-  void initTT(int bits) { tt.assign(size_t(1) << bits, TTSlot{}); }
+  // ── move-ordering heuristics (Phase 5; performance only) ─────────────────────
+  // A move's ordering signature = first-placed cell × ASSIGNED_COUNT + its token
+  // (pass = -1). Cheap; ordering never affects the proven value, so signature
+  // collisions are harmless.
+  static constexpr int MAXD = 64;
+  int16_t killers[MAXD][2];
+  int32_t history[BOARD_CELLS][ASSIGNED_COUNT];
+  static int moveSig(const std::vector<Placement>& p) {
+    return p.empty() ? -1 : Board::idx(p[0].row, p[0].col) * ASSIGNED_COUNT + p[0].token;
+  }
+  void resetOrdering() {
+    for (auto& kd : killers) { kd[0] = -1; kd[1] = -1; }
+    for (auto& row : history)
+      for (auto& h : row) h = 0;
+  }
+
+  void initTT(int bits) {
+    tt.assign(size_t(1) << bits, TTSlot{});
+    resetOrdering();
+  }
   void recomputeBoardHash() {
     boardHash = 0;
     for (int r = 0; r < BOARD_SIZE; r++)
@@ -718,16 +738,16 @@ struct HiddenBagSolver {
   // tiles come out, then play continues at `nextSide` with a reset streak.
   // alpha/beta prune this min node exactly (values are unaffected).
   int drawWorst(int draw, int moverSide, TileCounts& ai, TileCounts& opp, TileCounts& bag,
-                int nextSide, int alpha, int beta) {
+                int nextSide, int alpha, int beta, int depth) {
     if (aborted) return 0;
-    if (draw == 0) return mm(nextSide, ai, opp, bag, 0, alpha, beta);
+    if (draw == 0) return mm(nextSide, ai, opp, bag, 0, alpha, beta, depth + 1);
     TileCounts& mover = moverSide == 0 ? ai : opp;
     int best = INF;
     for (uint8_t k = 0; k < KIND_COUNT; k++) {
       if (bag.n[k] == 0) continue;
       bag.sub(k);
       mover.add(k);
-      const int v = drawWorst(draw - 1, moverSide, ai, opp, bag, nextSide, alpha, beta);
+      const int v = drawWorst(draw - 1, moverSide, ai, opp, bag, nextSide, alpha, beta, depth);
       mover.sub(k);
       bag.add(k);
       if (aborted) return 0;
@@ -741,7 +761,7 @@ struct HiddenBagSolver {
   // Value from AI's perspective (AI_total − Opp_total to the end). side 0 = AI
   // (max), 1 = opponent (min). alpha/beta are AI-perspective bounds.
   int mm(int side, TileCounts& ai, TileCounts& opp, TileCounts& bag, int streak, int alpha,
-         int beta) {
+         int beta, int depth) {
     if (overBudget()) return 0;
 
     // Memoise once the bag is empty (the deep sub-tree). Transpositions — the
@@ -750,6 +770,7 @@ struct HiddenBagSolver {
     const int alphaOrig = alpha, betaOrig = beta;
     uint64_t key = 0;
     size_t idx = 0;
+    int ttMove = -1;
     if (useTT) {
       key = stateKey(side, ai, opp, streak);
       idx = key & (tt.size() - 1);
@@ -758,12 +779,54 @@ struct HiddenBagSolver {
         if (e.flag == 0) return e.value;                        // exact
         if (e.flag == 1 && e.value >= beta) return e.value;     // lower bound ≥ β
         if (e.flag == 2 && e.value <= alpha) return e.value;    // upper bound ≤ α
+        ttMove = e.bestMove;  // no cutoff — reuse the stored best move for ordering
       }
     }
 
     TileCounts& mover = side == 0 ? ai : opp;
 
+    // Collect the streamed moves so they can be ORDERED (ordering needs the whole
+    // set). The collector does not touch the board, so generation runs to
+    // completion exactly as before — 2M truncation behaviour is unchanged.
+    std::vector<Move> moves;
+    GenStats gs;
+    gs.nodeLimit = 2'000'000;
+    MoveSink collect = [&](int mscore, const std::vector<Placement>& pls) {
+      Move m;
+      m.type = MoveType::Place;
+      m.score = mscore;
+      m.placements = pls;
+      moves.push_back(std::move(m));
+    };
+    generatePlaceMovesStream(incb.board, mover, collect, &gs, GenOptions{}, &incb);
+    if (gs.truncated) {
+      aborted = true;
+      return 0;
+    }
+
+    // ── move ordering (performance only; alpha-beta value is order-invariant) ──
+    // TT move first, then killers, then immediate score, then history. This only
+    // permutes the move list, so proven values are unchanged.
+    const int kd = depth < MAXD ? depth : MAXD - 1;
+    auto isKiller = [&](int s) { return s >= 0 && (s == killers[kd][0] || s == killers[kd][1]); };
+    auto histOf = [&](const Move& m) {
+      return m.placements.empty()
+                 ? 0
+                 : history[Board::idx(m.placements[0].row, m.placements[0].col)]
+                          [m.placements[0].token];
+    };
+    std::sort(moves.begin(), moves.end(), [&](const Move& a, const Move& b) {
+      const int sa = moveSig(a.placements), sb = moveSig(b.placements);
+      const bool ta = (sa == ttMove && sa >= 0), tb = (sb == ttMove && sb >= 0);
+      if (ta != tb) return ta;
+      const bool ka = isKiller(sa), kb = isKiller(sb);
+      if (ka != kb) return ka;
+      if (a.score != b.score) return a.score > b.score;
+      return histOf(a) > histOf(b);
+    });
+
     int best = side == 0 ? -INF : INF;
+    int bestMove = -1;  // signature of the move that currently owns `best`
     // Fold an option value into `best` with alpha-beta; returns true on cutoff.
     auto consider = [&](int v) -> bool {
       if (side == 0) {
@@ -776,23 +839,13 @@ struct HiddenBagSolver {
       return alpha >= beta;
     };
 
-    // Phase 4: consume moves as the generator streams them, in the same board
-    // order as before — no move list is built. `cut` latches on a beta-cutoff so
-    // later moves are ignored WITHOUT stopping generation, which keeps the 2M
-    // movegen-truncation behaviour byte-identical to the vector form. The sink
-    // makes/unmakes around the recursive search, so the board is restored before
-    // control returns to the generator's DFS.
-    bool cut = false;
-    GenStats gs;
-    gs.nodeLimit = 2'000'000;
-    MoveSink sink = [&](int mscore, const std::vector<Placement>& pls) {
-      if (cut || aborted) return;
-      for (const Placement& p : pls) {
+    for (const Move& m : moves) {
+      for (const Placement& p : m.placements) {
         boardHash ^= zob->cell[Board::idx(p.row, p.col)][p.kind][p.token];
         mover.sub(p.kind);
       }
-      incb.makeMove(pls);  // updates board + cross/contact/anchors incrementally
-      const int sd = side == 0 ? mscore : -mscore;
+      incb.makeMove(m.placements);  // updates board + cross/contact/anchors incrementally
+      const int sd = side == 0 ? m.score : -m.score;
       int v;
       if (mover.total == 0 && bag.total == 0) {
         const int oppRemain = side == 0 ? opp.points() : ai.points();
@@ -800,44 +853,56 @@ struct HiddenBagSolver {
       } else {
         const int draw = std::min(RACK_SIZE - mover.total, bag.total);
         // Child window is shifted by the immediate delta sd (v = sd + child).
-        v = sd + drawWorst(draw, side, ai, opp, bag, 1 - side, alpha - sd, beta - sd);
+        v = sd + drawWorst(draw, side, ai, opp, bag, 1 - side, alpha - sd, beta - sd, depth);
       }
-      incb.undoMove(pls);
-      for (const Placement& p : pls) {
+      incb.undoMove(m.placements);
+      for (const Placement& p : m.placements) {
         boardHash ^= zob->cell[Board::idx(p.row, p.col)][p.kind][p.token];
         mover.add(p.kind);
       }
-      if (aborted) return;
-      if (consider(v)) {
+      if (aborted) return 0;
+      const int prev = best;
+      const bool cutoff = consider(v);
+      const int s = moveSig(m.placements);
+      if (best != prev) bestMove = s;
+      if (cutoff) {
         // Cutoff bound is side-dependent: side 0 maximises → fail-HIGH (lower
         // bound, flag 1); side 1 minimises → fail-LOW (upper bound, flag 2).
-        if (useTT) tt[idx] = TTSlot{key, best, static_cast<uint8_t>(side == 0 ? 1 : 2), true};
-        cut = true;
+        if (s >= 0 && killers[kd][0] != s) {
+          killers[kd][1] = killers[kd][0];
+          killers[kd][0] = static_cast<int16_t>(s);
+        }
+        if (!m.placements.empty())
+          history[Board::idx(m.placements[0].row, m.placements[0].col)][m.placements[0].token] +=
+              depth * depth + 1;
+        if (useTT)
+          tt[idx] = TTSlot{key, best, static_cast<int16_t>(s),
+                           static_cast<uint8_t>(side == 0 ? 1 : 2), true};
+        return best;
       }
-    };
-    generatePlaceMovesStream(incb.board, mover, sink, &gs, GenOptions{}, &incb);
-    if (gs.truncated) {
-      aborted = true;
-      return 0;
     }
-    if (aborted) return 0;
-    if (cut) return best;
 
     // Pass is always available (a no-score turn; sd = 0, window unchanged).
     int pv;
     if (streak + 1 >= NO_SCORE_STREAK_LENGTH) {
       pv = opp.points() - ai.points();  // game ends: each side loses its own remainder
     } else {
-      pv = mm(1 - side, ai, opp, bag, streak + 1, alpha, beta);
+      pv = mm(1 - side, ai, opp, bag, streak + 1, alpha, beta, depth + 1);
     }
     if (aborted) return 0;
-    if (consider(pv) && useTT) {
-      tt[idx] = TTSlot{key, best, static_cast<uint8_t>(side == 0 ? 1 : 2), true};
-      return best;
+    {
+      const int prev = best;
+      const bool cutoff = consider(pv);
+      if (best != prev) bestMove = -1;  // pass now owns best
+      if (cutoff && useTT) {
+        tt[idx] = TTSlot{key, best, static_cast<int16_t>(-1),
+                         static_cast<uint8_t>(side == 0 ? 1 : 2), true};
+        return best;
+      }
     }
     if (useTT) {
       const uint8_t flag = best <= alphaOrig ? 2 : (best >= betaOrig ? 1 : 0);
-      tt[idx] = TTSlot{key, best, flag, true};
+      tt[idx] = TTSlot{key, best, static_cast<int16_t>(bestMove), flag, true};
     }
     return best;
   }
@@ -931,7 +996,7 @@ HiddenResult solveHiddenEndgame(const Request& req, long long nodeBudget, double
         const int draw = std::min(RACK_SIZE - ai.total, scenarioBag.total);
         // Full window: each root move needs its exact value for the min-aggregation.
         v = m.score + solver.drawWorst(draw, 0, ai, oppRack, scenarioBag, 1,
-                                       -HiddenBagSolver::INF, HiddenBagSolver::INF);
+                                       -HiddenBagSolver::INF, HiddenBagSolver::INF, 0);
       }
       solver.incb.undoMove(m.placements);
       for (const Placement& p : m.placements) {
@@ -950,7 +1015,7 @@ HiddenResult solveHiddenEndgame(const Request& req, long long nodeBudget, double
         v = oppRack.points() - ai.points();
       } else {
         v = solver.mm(1, ai, oppRack, scenarioBag, req.noScoreStreak + 1, -HiddenBagSolver::INF,
-                      HiddenBagSolver::INF);
+                      HiddenBagSolver::INF, 0);
       }
       if (solver.aborted) return res;
       guaranteed[passIdx] = std::min(guaranteed[passIdx], v);
