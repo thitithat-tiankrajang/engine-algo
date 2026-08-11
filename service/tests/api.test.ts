@@ -1053,10 +1053,19 @@ describe("reconnect + cancel", () => {
     const held = gate();
     const h = harness({
       source: { botSide: "B", botDifficulty: "hard", activeSide: "B", activeSideIsBot: true },
-      engine: async () => {
+      engine: (async (options: {
+        onProgress?: (progress: Record<string, unknown>) => void;
+      }) => {
+        options.onProgress?.({
+          phase: "sim",
+          percent: 50,
+          elapsedMs: 900,
+          etaMs: 900,
+          detail: "samples=2/4",
+        });
         await held.promise;
         return fakeEngineResponse();
-      },
+      }) as unknown as () => Promise<ReturnType<typeof fakeEngineResponse>>,
     });
     const started = h.call("/bot-move", { expectedRevision: 7 }, { Accept: "text/event-stream" });
     const startResp = await started;
@@ -1065,6 +1074,12 @@ describe("reconnect + cancel", () => {
     await tick();
     held.open();
     const [, reconnectEvents] = await Promise.all([collect(startResp), collect(reconnect)]);
+    expect(reconnectEvents).toContainEqual(
+      expect.objectContaining({
+        event: "progress",
+        data: expect.objectContaining({ percent: 50 }),
+      }),
+    );
     expect(reconnectEvents.at(-1)).toMatchObject({ event: "result", data: { revision: 7 } });
     // The bot's reasoning about its own rack never crosses the wire.
     expect(JSON.stringify(reconnectEvents.at(-1)?.data)).not.toContain("oppReply");
