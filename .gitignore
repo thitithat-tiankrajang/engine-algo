@@ -1,4 +1,6 @@
 build/
 *.o
+
+service/node_modules/
+service/dist/
 service/.env.local
-service/node_modulesservice/dist/
