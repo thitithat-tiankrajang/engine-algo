@@ -267,6 +267,38 @@ describe("analysis result", () => {
     }
   });
 
+  it("explains an alternative by what it LOSES on, not by a strength it happens to have", async () => {
+    // The fixture's runner-up scores 6 more points but hands the opponent 10.3
+    // more. Leading with the largest difference in either direction would
+    // describe it purely by the extra points and then say it ranks behind,
+    // which argues the wrong side and reads as a contradiction.
+    const { call } = harness();
+    const body = (await (await call("/analysis", { expectedRevision: 7 })).json()) as {
+      alternatives: Array<{ immediateScore: number; note: string }>;
+    };
+    const higherScoring = body.alternatives.find((entry) => entry.immediateScore === 30);
+    expect(higherScoring).toBeTruthy();
+    // The reason it is not the pick: it concedes more to the opponent.
+    expect(higherScoring?.note).toMatch(/hands the opponent/i);
+    // And its compensating strength is acknowledged, as the concession.
+    expect(higherScoring?.note).toMatch(/though it scores 6 more now/i);
+  });
+
+  it("never claims an alternative is behind without naming a term", async () => {
+    const { call } = harness();
+    const body = (await (await call("/analysis", { expectedRevision: 7 })).json()) as {
+      alternatives: Array<{ note: string }>;
+    };
+    for (const alternative of body.alternatives) {
+      expect(alternative.note.length).toBeGreaterThan(0);
+      // Every note is either a named comparison or an explicit "too close to
+      // separate" — never a bare verdict with no reason attached.
+      expect(alternative.note).toMatch(
+        /scores|rack|next turn|opponent|Close alternative|proven final margin/i,
+      );
+    }
+  });
+
   it("recommends the move the engine itself chose, not a re-ranked one", async () => {
     // The highest immediate score here is the 30-point play, but the engine
     // chose the 24-point one. Analysis must agree with the engine, or it is

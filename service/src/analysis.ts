@@ -199,17 +199,42 @@ function noteFor(
     },
   ];
 
-  const dominant = terms
-    .filter((term) => Number.isFinite(term.gap))
-    .sort((first, second) => Math.abs(second.gap) - Math.abs(first.gap))[0];
+  // The reader is asking "why is this one not the pick?", so the note leads
+  // with the term the candidate LOSES on — the largest positive gap, where the
+  // recommendation is ahead.
+  //
+  // Leading with the largest gap in either direction, which is the obvious
+  // implementation, produces sentences that argue the wrong side: an
+  // alternative whose biggest difference is a strength gets described purely by
+  // that strength and then told it ranks behind, which reads as a
+  // contradiction rather than an explanation.
+  //
+  // Where the candidate is genuinely better on something, that is worth saying
+  // too — it is why the move was tempting — but as the concession, after the
+  // reason it still loses.
+  const usable = terms.filter((term) => Number.isFinite(term.gap));
+  const losses = usable.filter((term) => term.gap >= 0.05).sort((a, b) => b.gap - a.gap);
+  const gains = usable.filter((term) => term.gap <= -0.05).sort((a, b) => a.gap - b.gap);
 
   const total = round(best.value - candidate.value);
-  if (!dominant || Math.abs(dominant.gap) < 0.05) {
+  const capitalize = (text: string) => `${text[0]?.toUpperCase() ?? ""}${text.slice(1)}`;
+
+  const primary = losses[0];
+  if (!primary) {
+    // Nothing measurably worse. Either it is a near-tie, or it trades a real
+    // strength for a spread of small losses too even to name.
+    const strength = gains[0];
+    if (strength && total > 0.05) {
+      return `${capitalize(strength.better)}, but ranks ${total} behind overall once the other terms are counted.`;
+    }
     return `Close alternative, ${total} behind on the engine's overall value.`;
   }
-  const phrase = dominant.gap > 0 ? dominant.worse : dominant.better;
+
+  const concession = gains[0];
   const trailing = total > 0 ? ` Overall it ranks ${total} behind.` : "";
-  return `${phrase[0]?.toUpperCase()}${phrase.slice(1)}.${trailing}`;
+  return concession
+    ? `${capitalize(primary.worse)}, though it ${concession.better}.${trailing}`
+    : `${capitalize(primary.worse)}.${trailing}`;
 }
 
 /** The paragraph at the top: what to play, and the one thing that decided it. */
