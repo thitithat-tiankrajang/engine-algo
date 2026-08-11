@@ -268,6 +268,10 @@ export function createApp(deps: AppDependencies) {
         parallelism: config.cpu.parallelism,
         concurrencySource: config.concurrencySource,
       },
+      retention: {
+        analysisResultTtlMs: config.analysisResultTtlMs,
+        botResultTtlMs: config.botResultTtlMs,
+      },
     }),
   );
 

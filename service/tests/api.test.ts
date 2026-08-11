@@ -901,6 +901,10 @@ describe("health", () => {
     // derived from the host's cores rather than the container's quota, so the
     // evidence is here.
     expect(body.cpu).toMatchObject({ source: "cgroup-v2", parallelism: 8 });
+    expect(body.retention).toEqual({
+      analysisResultTtlMs: 5 * 60 * 1000,
+      botResultTtlMs: 60 * 1000,
+    });
 
     const text = JSON.stringify(body);
     for (const leak of ["user", "game", "token", GAME_ID, "rack", "canonical", "key"]) {
