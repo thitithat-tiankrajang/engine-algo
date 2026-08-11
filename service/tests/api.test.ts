@@ -6,7 +6,7 @@
 import { describe, expect, it, vi } from "vitest";
 
 import { createApp } from "../src/app.js";
-import { EngineFailureError, EngineTimeoutError } from "../src/engineRunner.js";
+import { EngineCancelledError, EngineFailureError, EngineTimeoutError } from "../src/engineRunner.js";
 import { EngineQueue } from "../src/queue.js";
 import { ComputeBudget, ConcurrencyLimit } from "../src/rateLimit.js";
 import { RoomAccessError } from "../src/roomContext.js";
@@ -23,13 +23,21 @@ type Overrides = {
   source?: FakeSourceOptions;
   config?: Record<string, unknown>;
   engine?: () => Promise<ReturnType<typeof fakeEngineResponse>>;
+  /** Share one queue between harnesses, to model two users on one instance. */
+  queue?: EngineQueue;
 };
 
 function harness(overrides: Overrides = {}) {
   const config = baseConfig(overrides.config) as ReturnType<typeof baseConfig> &
     Parameters<typeof createApp>[0]["config"];
   const source = fakeSource(overrides.source);
-  const queue = new EngineQueue({ concurrency: config.concurrency, maxWaiting: config.maxWaiting });
+  const queue =
+    overrides.queue ??
+    new EngineQueue({
+      concurrency: config.concurrency,
+      maxWaiting: config.maxWaiting,
+      maxWaitMs: config.maxQueueWaitMs,
+    });
   const budget = new ComputeBudget({
     perWindow: config.budgetPerWindow,
     windowMs: config.budgetWindowMs,
@@ -531,8 +539,10 @@ describe("streaming", () => {
     const response = await sse(call, "/analysis", { expectedRevision: 7 });
     expect(response.headers.get("Content-Type")).toContain("text/event-stream");
     const events = await collect(response);
-    expect(events.map((entry) => entry.event)).toEqual(["progress", "result"]);
-    expect(events[1]?.data).toMatchObject({ revision: 7 });
+    // No `queued`: a free slot means the search started at once, and saying
+    // otherwise would be a lie the UI would faithfully render.
+    expect(events.map((entry) => entry.event)).toEqual(["running", "progress", "result"]);
+    expect(events.at(-1)?.data).toMatchObject({ revision: 7 });
   });
 
   it("still refuses on turn rules with a real status code, before any stream opens", async () => {
@@ -573,6 +583,360 @@ describe("streaming", () => {
   });
 });
 
+describe("the queue, through the API", () => {
+  const sse = (call: ReturnType<typeof harness>["call"], path: string, body: unknown) =>
+    call(path, body, { Accept: "text/event-stream" });
+
+  async function collect(response: Response): Promise<Array<{ event: string; data: unknown }>> {
+    const text = await response.text();
+    return text
+      .split("\n\n")
+      .map((block) => block.trim())
+      .filter(Boolean)
+      .map((block) => {
+        const event = /^event:\s*(.+)$/m.exec(block)?.[1] ?? "message";
+        const data = /^data:\s*(.+)$/m.exec(block)?.[1] ?? "null";
+        return { event, data: JSON.parse(data) as unknown };
+      });
+  }
+
+  /** A gate the fake engine waits on, so a search can be held mid-flight. */
+  function gate() {
+    let open!: () => void;
+    const promise = new Promise<void>((resolve) => {
+      open = resolve;
+    });
+    return { promise, open };
+  }
+
+  it("tells a waiting caller it is queued, then that it started", async () => {
+    // One CPU, one slot. The second caller must be able to distinguish "the
+    // server has not begun" from "the server is thinking", or the UI can only
+    // draw a spinner that might be dead.
+    const queue = new EngineQueue({ concurrency: 1, maxWaiting: 4, maxWaitMs: 30_000 });
+    const held = gate();
+    let first = true;
+    const occupier = harness({
+      queue,
+      config: { maxAnalysisPerUser: 4 },
+      engine: async () => {
+        if (first) {
+          first = false;
+          await held.promise;
+        }
+        return fakeEngineResponse();
+      },
+    });
+
+    const running = sse(occupier.call, "/analysis", { expectedRevision: 7, level: "quick" });
+    await new Promise((resolve) => setTimeout(resolve, 10));
+
+    const waiter = harness({ queue, config: { maxAnalysisPerUser: 4 }, source: { revision: 7 } });
+    const queuedResponse = await sse(waiter.call, "/analysis", {
+      expectedRevision: 7,
+      level: "deep",
+    });
+    held.open();
+
+    const events = await collect(queuedResponse);
+    const names = events.map((entry) => entry.event);
+    expect(names[0]).toBe("queued");
+    expect(names).toContain("running");
+    expect(names.at(-1)).toBe("result");
+    // `queued` must come before `running`; a UI that saw them the other way
+    // round would show the search going backwards.
+    expect(names.indexOf("queued")).toBeLessThan(names.indexOf("running"));
+    expect(events[0]?.data).toMatchObject({ ahead: 0, position: 1 });
+
+    await collect(await running);
+  });
+
+  it("puts a bot turn ahead of analysis that was already waiting", async () => {
+    const queue = new EngineQueue({ concurrency: 1, maxWaiting: 8, maxWaitMs: 30_000 });
+    const held = gate();
+    const order: string[] = [];
+    let occupied = false;
+
+    const engineFor = (label: string) => async () => {
+      if (!occupied) {
+        occupied = true;
+        order.push("occupier");
+        await held.promise;
+        return fakeEngineResponse();
+      }
+      order.push(label);
+      return fakeEngineResponse();
+    };
+
+    const occupier = harness({ queue, engine: engineFor("occupier") });
+    const running = occupier.call("/analysis", { expectedRevision: 7, level: "quick" });
+    await new Promise((resolve) => setTimeout(resolve, 10));
+
+    const analyst = harness({ queue, engine: engineFor("analysis") });
+    const analysis = analyst.call("/analysis", { expectedRevision: 7, level: "deep" });
+    await new Promise((resolve) => setTimeout(resolve, 10));
+
+    const player = harness({
+      queue,
+      engine: engineFor("bot"),
+      source: { botSide: "B", botDifficulty: "hard", activeSide: "B", activeSideIsBot: true },
+    });
+    const bot = player.call("/bot-move", { expectedRevision: 7 });
+    await new Promise((resolve) => setTimeout(resolve, 10));
+
+    held.open();
+    const [runningResponse, analysisResponse, botResponse] = await Promise.all([
+      running,
+      analysis,
+      bot,
+    ]);
+    expect(runningResponse.status).toBe(200);
+    expect(analysisResponse.status).toBe(200);
+    expect(botResponse.status).toBe(200);
+    // Gameplay ran at the next free slot despite arriving last.
+    expect(order).toEqual(["occupier", "bot", "analysis"]);
+  });
+
+  it("refuses an overflowing queue with a coded 503, never an ambiguous 500", async () => {
+    const queue = new EngineQueue({ concurrency: 1, maxWaiting: 1, maxWaitMs: 30_000 });
+    const held = gate();
+    let first = true;
+    const engine = async () => {
+      if (first) {
+        first = false;
+        await held.promise;
+      }
+      return fakeEngineResponse();
+    };
+
+    const a = harness({ queue, engine });
+    const running = a.call("/analysis", { expectedRevision: 7, level: "quick" });
+    await new Promise((resolve) => setTimeout(resolve, 10));
+
+    const b = harness({ queue, engine });
+    const waiting = b.call("/analysis", { expectedRevision: 7, level: "normal" });
+    await new Promise((resolve) => setTimeout(resolve, 10));
+
+    const c = harness({ queue, engine });
+    const refused = await c.call("/analysis", { expectedRevision: 7, level: "deep" });
+    expect(refused.status).toBe(503);
+    expect(await refused.json()).toMatchObject({ code: "queue_full" });
+    expect(refused.headers.get("Retry-After")).toBeTruthy();
+
+    held.open();
+    await Promise.all([running, waiting]);
+  });
+
+  it("reports a full queue as an error event once a stream is already open", async () => {
+    const queue = new EngineQueue({ concurrency: 1, maxWaiting: 1, maxWaitMs: 30_000 });
+    const held = gate();
+    let first = true;
+    const engine = async () => {
+      if (first) {
+        first = false;
+        await held.promise;
+      }
+      return fakeEngineResponse();
+    };
+    const a = harness({ queue, engine });
+    const running = a.call("/analysis", { expectedRevision: 7, level: "quick" });
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    const b = harness({ queue, engine });
+    const waiting = b.call("/analysis", { expectedRevision: 7, level: "normal" });
+    await new Promise((resolve) => setTimeout(resolve, 10));
+
+    const c = harness({ queue, engine });
+    const events = await collect(
+      await sse(c.call, "/analysis", { expectedRevision: 7, level: "deep" }),
+    );
+    expect(events.at(-1)).toMatchObject({ event: "error", data: { code: "queue_full" } });
+
+    held.open();
+    await Promise.all([running, waiting]);
+  });
+
+  it("refuses to spend a slot on a position the game left while the job waited", async () => {
+    // The case queueing creates. Admitted at revision 7, waits, and by the time
+    // the CPU is free the game is at 8. Spending a minute of a shared engine on
+    // a board that no longer exists is the thing to avoid, so the check happens
+    // BEFORE the process is spawned, not after the answer comes back.
+    const queue = new EngineQueue({ concurrency: 1, maxWaiting: 4, maxWaitMs: 30_000 });
+    const held = gate();
+    const occupier = harness({
+      queue,
+      engine: async () => {
+        await held.promise;
+        return fakeEngineResponse();
+      },
+    });
+    const running = occupier.call("/analysis", { expectedRevision: 7, level: "quick" });
+    await new Promise((resolve) => setTimeout(resolve, 10));
+
+    const waiter = harness({ queue, source: { revision: 7 } });
+    const queued = waiter.call("/analysis", { expectedRevision: 7, level: "deep" });
+    await new Promise((resolve) => setTimeout(resolve, 10));
+
+    // A move lands while the analysis is still in line.
+    waiter.source.advanceTo(8);
+    held.open();
+
+    const response = await queued;
+    expect(response.status).toBe(409);
+    expect(await response.json()).toMatchObject({
+      code: "stale_revision",
+      currentRevision: 8,
+      requestedRevision: 7,
+    });
+    // The engine was never asked about the dead position.
+    expect(waiter.runEngine).not.toHaveBeenCalled();
+    await running;
+  });
+
+  it("refuses a stale queued bot turn rather than playing into a changed board", async () => {
+    const queue = new EngineQueue({ concurrency: 1, maxWaiting: 4, maxWaitMs: 30_000 });
+    const held = gate();
+    const occupier = harness({
+      queue,
+      engine: async () => {
+        await held.promise;
+        return fakeEngineResponse();
+      },
+    });
+    const running = occupier.call("/analysis", { expectedRevision: 7, level: "quick" });
+    await new Promise((resolve) => setTimeout(resolve, 10));
+
+    const player = harness({
+      queue,
+      source: { revision: 7, botSide: "B", botDifficulty: "hard", activeSide: "B" },
+    });
+    const bot = player.call("/bot-move", { expectedRevision: 7 });
+    await new Promise((resolve) => setTimeout(resolve, 10));
+
+    player.source.advanceTo(9);
+    held.open();
+
+    const response = await bot;
+    expect(response.status).toBe(409);
+    expect(await response.json()).toMatchObject({ code: "stale_revision", currentRevision: 9 });
+    expect(player.runEngine).not.toHaveBeenCalled();
+    await running;
+  });
+
+  it("stamps a bot result with the revision it was computed for", async () => {
+    // The client's last line of defence: a result that arrives after the game
+    // moved on is detectable without trusting the timing of anything.
+    const { call } = harness({
+      source: { revision: 12, botSide: "B", botDifficulty: "hard", activeSide: "B" },
+    });
+    const body = (await (await call("/bot-move", { expectedRevision: 12 })).json()) as {
+      revision: number;
+    };
+    expect(body.revision).toBe(12);
+  });
+
+  it("keeps a queued job alive when its only observer disconnects", async () => {
+    // A disconnect is NOT a cancellation. A player who starts an analysis (or
+    // whose bot turn is queued) and then navigates away, closes the tab, or
+    // loses the network has not decided to abandon the computation — they may
+    // return to it. So a lost observer must leave the job exactly where it was,
+    // still in line, still going to run. Capacity is reclaimed by usefulness
+    // (superseded / explicit cancel / timeout), never by a closed connection —
+    // that policy is exercised directly in jobRegistry.test.ts.
+    const queue = new EngineQueue({ concurrency: 1, maxWaiting: 2, maxWaitMs: 30_000 });
+    const held = gate();
+    const occupier = harness({
+      queue,
+      engine: async () => {
+        await held.promise;
+        return fakeEngineResponse();
+      },
+    });
+    const running = occupier.call("/analysis", { expectedRevision: 7, level: "quick" });
+    await new Promise((resolve) => setTimeout(resolve, 10));
+
+    const abandoning = new AbortController();
+    const waiter = harness({ queue });
+    const abandoned = Promise.resolve(
+      waiter.app.request(`/v1/games/${GAME_ID}/analysis`, {
+        method: "POST",
+        headers: { Authorization: "Bearer token-1", "Content-Type": "application/json" },
+        body: JSON.stringify({ expectedRevision: 7, level: "deep" }),
+        signal: abandoning.signal,
+      }),
+    );
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    expect(queue.stats().waiting).toBe(1);
+
+    // The observer goes away.
+    abandoning.abort();
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    // Still in line, and no process spawned for it yet: the disconnect changed
+    // nothing about the job itself.
+    expect(queue.stats().waiting).toBe(1);
+    expect(waiter.runEngine).not.toHaveBeenCalled();
+
+    // When capacity frees, the still-wanted job runs to completion — proof that
+    // the lost connection never killed it.
+    held.open();
+    await running;
+    await abandoned.catch(() => undefined);
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    expect(waiter.runEngine).toHaveBeenCalledTimes(1);
+    expect(queue.stats().waiting).toBe(0);
+  });
+});
+
+describe("health", () => {
+  it("reports the queue state an operator needs and nothing about anybody", async () => {
+    const { app, queue } = harness();
+    const body = (await (await app.request("/health")).json()) as Record<string, unknown>;
+    expect(body.ok).toBe(true);
+    expect(body.queue).toMatchObject({
+      running: 0,
+      waiting: 0,
+      concurrency: queue.stats().concurrency,
+      maxWaiting: queue.stats().maxWaiting,
+    });
+    // The misconfiguration this service is most likely to have is a concurrency
+    // derived from the host's cores rather than the container's quota, so the
+    // evidence is here.
+    expect(body.cpu).toMatchObject({ source: "cgroup-v2", parallelism: 8 });
+
+    const text = JSON.stringify(body);
+    for (const leak of ["user", "game", "token", GAME_ID, "rack", "canonical", "key"]) {
+      expect(text.toLowerCase()).not.toContain(leak.toLowerCase());
+    }
+  });
+
+  it("shows live depth without naming a single job", async () => {
+    const queue = new EngineQueue({ concurrency: 1, maxWaiting: 4, maxWaitMs: 30_000 });
+    let open!: () => void;
+    const held = new Promise<void>((resolve) => {
+      open = resolve;
+    });
+    const busy = harness({
+      queue,
+      engine: async () => {
+        await held;
+        return fakeEngineResponse();
+      },
+    });
+    const running = busy.call("/analysis", { expectedRevision: 7, level: "quick" });
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    const waiter = harness({ queue });
+    const queued = waiter.call("/analysis", { expectedRevision: 7, level: "deep" });
+    await new Promise((resolve) => setTimeout(resolve, 10));
+
+    const body = (await (await busy.app.request("/health")).json()) as {
+      queue: { running: number; waiting: number };
+    };
+    expect(body.queue).toMatchObject({ running: 1, waiting: 1 });
+
+    open();
+    await Promise.all([running, queued]);
+  });
+});
+
 describe("concurrent requests", () => {
   it("shares one engine run between callers asking the identical question", async () => {
     const { call, runEngine } = harness({ config: { maxAnalysisPerUser: 4 } });
@@ -598,5 +962,164 @@ describe("concurrent requests", () => {
       expect(body.recommendation.immediateScore).toBe(first?.recommendation.immediateScore);
       expect(body.revision).toBe(first?.revision);
     }
+  });
+});
+
+// The reconnect surface: a returning player attaching to a job (or its cached
+// result) they already caused. The invariant that matters as much as the feature
+// is that reconnecting is not a loophole — every gate the starting request passes
+// is passed here too, and reconnecting never STARTS work or spends a budget.
+describe("reconnect + cancel", () => {
+  const tick = (ms = 10) => new Promise((resolve) => setTimeout(resolve, ms));
+
+  function gate() {
+    let open!: () => void;
+    const promise = new Promise<void>((resolve) => {
+      open = resolve;
+    });
+    return { promise, open };
+  }
+
+  async function collect(response: Response): Promise<Array<{ event: string; data: unknown }>> {
+    const text = await response.text();
+    return text
+      .split("\n\n")
+      .map((block) => block.trim())
+      .filter(Boolean)
+      .map((block) => {
+        const event = /^event:\s*(.+)$/m.exec(block)?.[1] ?? "message";
+        const data = /^data:\s*(.+)$/m.exec(block)?.[1] ?? "null";
+        return { event, data: JSON.parse(data) as unknown };
+      });
+  }
+
+  const get = (h: ReturnType<typeof harness>, query: string) =>
+    h.app.request(`/v1/games/${GAME_ID}${query}`, {
+      headers: { Authorization: "Bearer token-1" },
+    });
+
+  it("reconnects to a running job and shares one search", async () => {
+    const held = gate();
+    const h = harness({
+      engine: async () => {
+        await held.promise;
+        return fakeEngineResponse();
+      },
+    });
+    // Start the analysis (streaming), leave it running.
+    const started = h.call("/analysis", { expectedRevision: 7, level: "quick" }, {
+      Accept: "text/event-stream",
+    });
+    const startResp = await started;
+    await tick();
+
+    // A returning tab attaches to the SAME job.
+    const reconnect = await get(h, "/analysis?revision=7&level=quick");
+    await tick();
+
+    held.open();
+    const [startEvents, reconnectEvents] = await Promise.all([
+      collect(startResp),
+      collect(reconnect),
+    ]);
+    expect(startEvents.at(-1)).toMatchObject({ event: "result", data: { revision: 7 } });
+    expect(reconnectEvents.map((e) => e.event)).toContain("running");
+    expect(reconnectEvents.at(-1)).toMatchObject({ event: "result", data: { revision: 7 } });
+    // One search served both.
+    expect(h.runEngine).toHaveBeenCalledTimes(1);
+  });
+
+  it("serves a completed result on reconnect without recomputing", async () => {
+    const h = harness();
+    await (await h.call("/analysis", { expectedRevision: 7, level: "quick" })).json();
+    const events = await collect(await get(h, "/analysis?revision=7&level=quick"));
+    expect(events.at(-1)).toMatchObject({ event: "result", data: { revision: 7 } });
+    // The cache answered the reconnect; the engine ran exactly once, for the POST.
+    expect(h.runEngine).toHaveBeenCalledTimes(1);
+  });
+
+  it("reports idle when there is no job for the position", async () => {
+    const h = harness();
+    const events = await collect(await get(h, "/analysis?revision=7&level=quick"));
+    expect(events).toEqual([{ event: "idle", data: {} }]);
+    expect(h.runEngine).not.toHaveBeenCalled();
+  });
+
+  it("reconnects to a running bot job the same way", async () => {
+    const held = gate();
+    const h = harness({
+      source: { botSide: "B", botDifficulty: "hard", activeSide: "B", activeSideIsBot: true },
+      engine: async () => {
+        await held.promise;
+        return fakeEngineResponse();
+      },
+    });
+    const started = h.call("/bot-move", { expectedRevision: 7 }, { Accept: "text/event-stream" });
+    const startResp = await started;
+    await tick();
+    const reconnect = await get(h, "/bot-move?revision=7");
+    await tick();
+    held.open();
+    const [, reconnectEvents] = await Promise.all([collect(startResp), collect(reconnect)]);
+    expect(reconnectEvents.at(-1)).toMatchObject({ event: "result", data: { revision: 7 } });
+    // The bot's reasoning about its own rack never crosses the wire.
+    expect(JSON.stringify(reconnectEvents.at(-1)?.data)).not.toContain("oppReply");
+    expect(h.runEngine).toHaveBeenCalledTimes(1);
+  });
+
+  it("enforces authorization on reconnect, before any stream opens", async () => {
+    const h = harness({ source: { callerControlsActiveSide: false } });
+    const response = await get(h, "/analysis?revision=7&level=quick");
+    expect(response.status).toBe(403);
+    expect(await response.json()).toMatchObject({ code: "analysis_not_allowed" });
+    expect(h.runEngine).not.toHaveBeenCalled();
+  });
+
+  it("refuses a reconnect composed against a stale revision", async () => {
+    const h = harness({ source: { revision: 9 } });
+    const response = await get(h, "/analysis?revision=7&level=quick");
+    expect(response.status).toBe(409);
+    expect(await response.json()).toMatchObject({ code: "stale_revision", currentRevision: 9 });
+  });
+
+  it("cancels an in-flight analysis on an explicit request", async () => {
+    const held = gate();
+    const h = harness({
+      engine: ((options: { signal?: AbortSignal }) =>
+        new Promise((_, reject) => {
+          options.signal?.addEventListener(
+            "abort",
+            () => reject(new EngineCancelledError()),
+            { once: true },
+          );
+          // Never resolves on its own; only cancellation ends it.
+          void held;
+        })) as unknown as () => Promise<ReturnType<typeof fakeEngineResponse>>,
+    });
+    const started = h.call("/analysis", { expectedRevision: 7, level: "quick" }, {
+      Accept: "text/event-stream",
+    });
+    const startResp = await started;
+    await tick();
+
+    const cancelled = await h.app.request(`/v1/games/${GAME_ID}/analysis/cancel`, {
+      method: "POST",
+      headers: { Authorization: "Bearer token-1", "Content-Type": "application/json" },
+      body: JSON.stringify({ expectedRevision: 7, level: "quick" }),
+    });
+    expect(await cancelled.json()).toEqual({ cancelled: true });
+
+    const events = await collect(startResp);
+    expect(events.at(-1)).toMatchObject({ event: "error", data: { code: "cancelled" } });
+  });
+
+  it("refuses to cancel for someone who does not control the turn", async () => {
+    const h = harness({ source: { callerControlsActiveSide: false } });
+    const response = await h.app.request(`/v1/games/${GAME_ID}/analysis/cancel`, {
+      method: "POST",
+      headers: { Authorization: "Bearer token-1", "Content-Type": "application/json" },
+      body: JSON.stringify({ expectedRevision: 7, level: "quick" }),
+    });
+    expect(response.status).toBe(403);
   });
 });
