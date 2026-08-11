@@ -53,15 +53,86 @@ export interface GameStateSource {
   ): Promise<Array<{ kind: string }>>;
 }
 
+/**
+ * The two reads a compute request needs, issued CONCURRENTLY.
+ *
+ * They were sequential because the command window is derived from the
+ * authoritative revision, and that arrives with the context. But the caller
+ * already states the revision it believes the game is at, and that claim is
+ * checked against the database anyway — a request whose claim is wrong is
+ * refused before either result is used. So the claim is safe to use as a WINDOW
+ * HINT: right, the window is right; wrong, the request is already dead.
+ *
+ * This is a pure latency change. Both queries still run as the caller under RLS,
+ * neither accepts a position, and the authoritative revision still comes only
+ * from the context read.
+ */
+export async function loadContextAndCommands(
+  source: GameStateSource,
+  gameId: string,
+  token: string,
+  claimedRevision: number,
+  count: number,
+): Promise<{ context: EngineRoomContext; events: Array<{ kind: string }> }> {
+  const contextPromise = source.loadContext(gameId, token);
+  // A rejection here must not become an unhandled rejection while the context
+  // read is still in flight; it is re-thrown below, after the context settles.
+  const eventsPromise = source
+    .loadRecentCommands(gameId, token, claimedRevision, count)
+    .then(
+      (events) => ({ ok: true as const, events }),
+      (error: unknown) => ({ ok: false as const, error }),
+    );
+
+  const context = await contextPromise;
+  const events = await eventsPromise;
+  if (!events.ok) throw events.error;
+  // The speculative window was opened at the claimed revision. If the database
+  // disagrees the caller is about to be refused, but re-read rather than reason
+  // about which of the two is right.
+  if (context.revision !== claimedRevision) {
+    return { context, events: await source.loadRecentCommands(gameId, token, context.revision, count) };
+  }
+  return { context, events: events.events };
+}
+
 export function createSupabaseSource(
   supabaseUrl: string,
   publishableKey: string,
 ): GameStateSource {
-  const clientFor = (token: string) =>
+  // One client per access token instead of one per query. The client is a thin,
+  // stateless wrapper here — no session persistence, no refresh, no auth state
+  // — so two concurrent requests with the same token can share it safely, and
+  // sharing is what lets the underlying HTTP agent keep a connection warm
+  // instead of negotiating TLS on every read.
+  //
+  // Bounded and evicted least-recently-used: tokens rotate, and a map keyed by
+  // JWT would otherwise grow for the life of the process.
+  const create = (token: string) =>
     createClient(supabaseUrl, publishableKey, {
       accessToken: async () => token,
       auth: { persistSession: false, autoRefreshToken: false, detectSessionInUrl: false },
     });
+  const clients = new Map<string, ReturnType<typeof create>>();
+  const MAX_CLIENTS = 64;
+
+  const clientFor = (token: string) => {
+    const existing = clients.get(token);
+    if (existing) {
+      // Re-insert to move to the end of the LRU order.
+      clients.delete(token);
+      clients.set(token, existing);
+      return existing;
+    }
+    const client = create(token);
+    clients.set(token, client);
+    while (clients.size > MAX_CLIENTS) {
+      const oldest = clients.keys().next().value;
+      if (oldest === undefined) break;
+      clients.delete(oldest);
+    }
+    return client;
+  };
 
   return {
     async loadContext(gameId, token) {

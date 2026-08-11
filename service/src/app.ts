@@ -52,9 +52,14 @@ import {
   QueueWaitTimeoutError,
   type QueuePosition,
 } from "./queue.js";
-import { JobRegistry, type JobKind, type JobObserver } from "./jobRegistry.js";
+import { JobRegistry, type JobKind, type JobObserver, type JobParams } from "./jobRegistry.js";
 import { ComputeBudget, ConcurrencyLimit } from "./rateLimit.js";
-import { RoomAccessError, type EngineRoomContext, type GameStateSource } from "./roomContext.js";
+import {
+  RoomAccessError,
+  loadContextAndCommands,
+  type EngineRoomContext,
+  type GameStateSource,
+} from "./roomContext.js";
 
 /** How many trailing commands to read for the scoreless-turn streak. The rule
  *  ends a game at six, so anything beyond this cannot change the answer. */
@@ -76,6 +81,38 @@ const STREAK_LOOKBACK = 24;
  */
 function wantsStream(c: Context): boolean {
   return (c.req.header("Accept") ?? "").includes("text/event-stream");
+}
+
+/**
+ * Where the time before the engine went, reported to the caller as
+ * `Server-Timing`.
+ *
+ * Everything measured here happens BEFORE the response head is written, which is
+ * what makes a standard header the right carrier: by the time the client can
+ * read it, all of it is already true. It carries durations and nothing else — no
+ * identifiers, no position, no token — so it is safe to expose cross-origin, and
+ * it is what turns "the bot feels slow" into a number attributable to a stage.
+ */
+class RequestTiming {
+  readonly #start = performance.now();
+  #last = performance.now();
+  readonly #marks: Array<[string, number]> = [];
+
+  mark(name: string): void {
+    const now = performance.now();
+    this.#marks.push([name, now - this.#last]);
+    this.#last = now;
+  }
+
+  header(): string {
+    const parts = this.#marks.map(([name, ms]) => `${name};dur=${ms.toFixed(1)}`);
+    parts.push(`total;dur=${(performance.now() - this.#start).toFixed(1)}`);
+    return parts.join(", ");
+  }
+
+  applyTo(c: Context): void {
+    c.header("Server-Timing", this.header());
+  }
 }
 
 export type AppDependencies = {
@@ -243,6 +280,10 @@ export function createApp(deps: AppDependencies) {
       origin: config.allowedOrigins,
       allowMethods: ["POST", "GET", "OPTIONS"],
       allowHeaders: ["Authorization", "Content-Type"],
+      // Durations only — see RequestTiming. Without this the browser drops the
+      // header on a cross-origin read and the client can measure nothing but
+      // the round trip as a whole.
+      exposeHeaders: ["Server-Timing"],
       maxAge: 600,
     }),
   );
@@ -344,6 +385,7 @@ export function createApp(deps: AppDependencies) {
     priority: number;
     kind: JobKind;
     gameId: string;
+    params: JobParams;
     caller: Caller;
     /** The revision the request was admitted against. */
     admittedRevision: number;
@@ -351,6 +393,9 @@ export function createApp(deps: AppDependencies) {
     timeoutMs: number;
     signal: AbortSignal;
     hooks: RunHooks;
+    /** Called with `true` when this request joined an existing search instead of
+     *  starting one, so the caller can undo metering it did not earn. */
+    onReused?: () => void;
   }): Promise<EngineResponse> {
     const observer: JobObserver = {
       onQueued: (state) => options.hooks.onQueued?.(state),
@@ -364,6 +409,7 @@ export function createApp(deps: AppDependencies) {
         kind: options.kind,
         gameId: options.gameId,
         admittedRevision: options.admittedRevision,
+        params: options.params,
         run: async ({ signal, waited, onProgress }) => {
           if (waited) {
             const fresh = await source.loadContext(options.gameId, options.caller.token);
@@ -383,6 +429,10 @@ export function createApp(deps: AppDependencies) {
       },
       observer,
     );
+    // Joining an existing search costs this caller nothing, so it must not be
+    // billed for one. Two tabs of the same game, or a reconnect that raced a
+    // fresh POST, share one engine process and one charge.
+    if (attachment.reused) options.onReused?.();
     // The request signal now DETACHES this observer when the client disconnects;
     // it does NOT cancel the search. A page that navigates away, a tab that
     // closes, or a dropped socket stops watching — the job keeps running for any
@@ -472,11 +522,22 @@ export function createApp(deps: AppDependencies) {
   // ── POST /v1/games/:gameId/bot-move ────────────────────────────────────────
 
   app.post("/v1/games/:gameId/bot-move", async (c) => {
+    const timing = new RequestTiming();
     const caller = await authenticate(c);
+    timing.mark("auth");
     const gameId = c.req.param("gameId");
     const body = await readBody(c);
 
-    const context = await source.loadContext(gameId, caller.token);
+    // Both database reads at once. The command window is opened at the revision
+    // the caller claims; `requireRevision` below is what makes that safe.
+    const { context, events } = await loadContextAndCommands(
+      source,
+      gameId,
+      caller.token,
+      Number(body.expectedRevision),
+      STREAK_LOOKBACK,
+    );
+    timing.mark("context");
     requireRevision(context, body.expectedRevision);
     requirePlayable(context);
 
@@ -500,13 +561,16 @@ export function createApp(deps: AppDependencies) {
     const cost = context.botDifficulty === "max" ? 8 : 2;
     const charged = budget.charge(caller.userId, cost);
     if (!charged.allowed) throw new BudgetError(charged.retryAfterMs, charged.remaining);
-
-    const events = await source.loadRecentCommands(
-      gameId,
-      caller.token,
-      context.revision,
-      STREAK_LOOKBACK,
-    );
+    timing.mark("gates");
+    // A charge is undone at most once per request. Reuse and failure can both
+    // ask for it, and crediting twice would hand out budget that was never
+    // spent.
+    let refunded = false;
+    const refund = () => {
+      if (refunded) return;
+      refunded = true;
+      budget.refund(caller.userId, cost);
+    };
 
     const request = toEngineRequest(context.canonical, {
       side: context.botSide,
@@ -541,6 +605,7 @@ export function createApp(deps: AppDependencies) {
     // Keyed by position, so two tabs of the same game share one search instead
     // of each starting their own.
     const key = `bot:${gameId}:${context.revision}:${context.botDifficulty}`;
+    const difficulty = context.botDifficulty;
     const start = (hooks: RunHooks) =>
       runQueued({
         key,
@@ -550,22 +615,25 @@ export function createApp(deps: AppDependencies) {
         priority: BOT_PRIORITY,
         kind: "bot",
         gameId,
+        params: { difficulty },
         caller,
         admittedRevision: context.revision,
         request,
         timeoutMs: tier.timeoutMs,
         signal: c.req.raw.signal,
         hooks,
+        onReused: refund,
       });
 
+    timing.applyTo(c);
     if (wantsStream(c)) {
-      return streamResult(c, start, present, () => budget.refund(caller.userId, cost));
+      return streamResult(c, start, present, refund);
     }
 
     try {
       return c.json(present(await start({})));
     } catch (error) {
-      budget.refund(caller.userId, cost);
+      refund();
       throw error;
     }
   });
@@ -573,14 +641,23 @@ export function createApp(deps: AppDependencies) {
   // ── POST /v1/games/:gameId/analysis ────────────────────────────────────────
 
   app.post("/v1/games/:gameId/analysis", async (c) => {
+    const timing = new RequestTiming();
     const caller = await authenticate(c);
+    timing.mark("auth");
     const gameId = c.req.param("gameId");
     const body = await readBody(c);
 
     const level: AnalysisLevel = isAnalysisLevel(body.level) ? body.level : "quick";
     const tier = ANALYSIS_LEVEL_CONFIG[level];
 
-    const context = await source.loadContext(gameId, caller.token);
+    const { context, events } = await loadContextAndCommands(
+      source,
+      gameId,
+      caller.token,
+      Number(body.expectedRevision),
+      STREAK_LOOKBACK,
+    );
+    timing.mark("context");
     requireRevision(context, body.expectedRevision);
     requirePlayable(context);
 
@@ -607,25 +684,41 @@ export function createApp(deps: AppDependencies) {
       throw new AnalysisNotAllowedError("Analysis is only available on your own turn.");
     }
 
-    if (!analysisSlots.tryAcquire(caller.userId)) {
-      throw new TooManyAnalysesError(analysisSlots.heldBy(caller.userId));
+    const key = `analysis:${gameId}:${context.revision}:${level}`;
+
+    // Joining a search that already exists for this exact position and level is
+    // not a second analysis. Metering it as one is how a returning player, or a
+    // second tab, got refused for work they had already paid for — the cap
+    // exists to bound CONCURRENT SEARCHES, not observers of one.
+    const alreadyRunning = registry.inspect(key) !== null;
+    let holdsSlot = false;
+    if (!alreadyRunning) {
+      if (!analysisSlots.tryAcquire(caller.userId)) {
+        throw new TooManyAnalysesError(analysisSlots.heldBy(caller.userId));
+      }
+      holdsSlot = true;
     }
 
     const charged = budget.charge(caller.userId, tier.cost);
     if (!charged.allowed) {
-      analysisSlots.release(caller.userId);
+      if (holdsSlot) analysisSlots.release(caller.userId);
       throw new BudgetError(charged.retryAfterMs, charged.remaining);
     }
+    timing.mark("gates");
+    let refunded = false;
+    const refund = () => {
+      if (refunded) return;
+      refunded = true;
+      budget.refund(caller.userId, tier.cost);
+    };
+    const releaseSlot = () => {
+      if (!holdsSlot) return;
+      holdsSlot = false;
+      analysisSlots.release(caller.userId);
+    };
 
     let streamOwnsSlot = false;
     try {
-      const events = await source.loadRecentCommands(
-        gameId,
-        caller.token,
-        context.revision,
-        STREAK_LOOKBACK,
-      );
-
       // Analysed from the perspective of the side on move — which, by the rule
       // above, is the caller's own side. The adapter hands over that rack only;
       // the opponent reaches the engine as a count.
@@ -644,19 +737,23 @@ export function createApp(deps: AppDependencies) {
         seedSalt: `analysis:${level}`,
       });
 
-      const key = `analysis:${gameId}:${context.revision}:${level}`;
       const start = (hooks: RunHooks) =>
         runQueued({
           key,
           priority: tier.priority,
           kind: "analysis",
           gameId,
+          params: { level },
           caller,
           admittedRevision: context.revision,
           request,
           timeoutMs: tier.timeoutMs,
           signal: c.req.raw.signal,
           hooks,
+          onReused: () => {
+            refund();
+            releaseSlot();
+          },
         });
 
       const present = (response: EngineResponse): AnalysisResult =>
@@ -670,25 +767,22 @@ export function createApp(deps: AppDependencies) {
           requestedSamples: tier.sampleCap,
         });
 
+      timing.applyTo(c);
       if (wantsStream(c)) {
         // Streaming hands off the slot: this handler returns as soon as the
         // response head is written, long before the search finishes, so the
         // `finally` below must not release a slot the stream is still holding.
         streamOwnsSlot = true;
-        return streamResult(c, start, present, () => {
-          budget.refund(caller.userId, tier.cost);
-        }, () => {
-          analysisSlots.release(caller.userId);
-        });
+        return streamResult(c, start, present, refund, releaseSlot);
       }
 
       return c.json(present(await start({})));
     } catch (error) {
       if (error instanceof BudgetError) throw error;
-      budget.refund(caller.userId, tier.cost);
+      refund();
       throw error;
     } finally {
-      if (!streamOwnsSlot) analysisSlots.release(caller.userId);
+      if (!streamOwnsSlot) releaseSlot();
     }
   });
 
@@ -777,6 +871,73 @@ export function createApp(deps: AppDependencies) {
 
     const key = `analysis:${gameId}:${context.revision}:${level}`;
     return streamReconnect(c, key, present);
+  });
+
+  // ── GET /v1/games/:gameId/jobs  (discovery) ────────────────────────────────
+  //
+  // "What is already running for this position?"
+  //
+  // Without this the browser had to REMEMBER what it started, because an
+  // analysis is identified partly by its level and the level is not derivable
+  // from the game row. That note lived in one tab's session storage, so losing
+  // it — a second tab, a cleared cache, a mistimed reset — made a running search
+  // permanently unreachable while the registry still held it, and the only way
+  // out was to press Analyze and pay for it again.
+  //
+  // This never starts work, never spends budget, and never returns an answer:
+  // it returns the SHAPE of what exists, so the client knows which attach
+  // endpoint to open. Reading a result still goes through those endpoints, which
+  // apply the same presentation rules — so nothing here can widen what a caller
+  // may see.
+  //
+  // Each kind is gated by exactly the rule its own attach endpoint applies, so
+  // discovery can never reveal the existence of work the caller could not
+  // otherwise observe.
+  app.get("/v1/games/:gameId/jobs", async (c) => {
+    const caller = await authenticate(c);
+    const gameId = c.req.param("gameId");
+
+    // `loadContext` is a SELECT gated on `can_read_live_game`, so a caller with
+    // no read access gets 404 here exactly as everywhere else.
+    const context = await source.loadContext(gameId, caller.token);
+    requireRevision(context, c.req.query("revision"));
+
+    const controlsActiveSide = context.callerControlsActiveSide;
+    const mayDiscoverBot =
+      context.botSide !== null &&
+      context.activeSide === context.botSide &&
+      controlsActiveSide;
+    const mayDiscoverAnalysis = !context.activeSideIsBot && controlsActiveSide;
+
+    const jobs = registry
+      .listForGame(gameId, context.revision)
+      .filter((job) => (job.kind === "bot" ? mayDiscoverBot : mayDiscoverAnalysis))
+      .map((job) => ({
+        kind: job.kind,
+        // Only the discriminator its own kind uses. A bot job's difficulty is
+        // already a column the caller can read; an analysis level is the
+        // caller's own choice coming back to them.
+        ...(job.params.level != null ? { level: job.params.level } : {}),
+        ...(job.params.difficulty != null ? { difficulty: job.params.difficulty } : {}),
+        status: job.status,
+        // The engine's own numbers, identical to what the attach stream would
+        // replay one round trip later. Included so a returning client paints the
+        // true percentage on its first frame instead of a fabricated zero.
+        ...(job.progress
+          ? {
+              progress: {
+                phase: job.progress.phase,
+                percent: job.progress.percent,
+                elapsedMs: Math.round(job.progress.elapsedMs),
+                etaMs: Math.round(job.progress.etaMs),
+                detail: job.progress.detail,
+              },
+            }
+          : {}),
+        ...(job.position ? { queue: { ahead: job.position.ahead, position: job.position.position } } : {}),
+      }));
+
+    return c.json({ gameId, revision: context.revision, jobs });
   });
 
   // ── POST /v1/games/:gameId/analysis/cancel ─────────────────────────────────

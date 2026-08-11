@@ -62,6 +62,15 @@ export class ComputeBudget {
     if (window) window.spent = Math.max(0, window.spent - cost);
   }
 
+  /** What a user has left in the current window, without charging anything.
+   *  Read-only: for diagnostics and for asserting that attaching to an existing
+   *  search costs nothing. */
+  remaining(userId: string, now = Date.now()): number {
+    const window = this.#windows.get(userId);
+    if (!window || window.resetAt <= now) return this.#perWindow;
+    return Math.max(0, this.#perWindow - window.spent);
+  }
+
   /** Drop windows that have expired. Called on a timer so an idle service does
    *  not hold a map entry per user who ever visited. */
   sweep(now = Date.now()): void {
