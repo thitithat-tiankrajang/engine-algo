@@ -8,6 +8,7 @@
 #include <unordered_map>
 
 #include "inc_board.hpp"
+#include "prof.hpp"
 
 namespace amath {
 
@@ -176,9 +177,11 @@ struct Generator {
           c += pdc;
         }
 
+        PROF(crossCellCalls++);
         uint32_t mask = 0;
         for (uint8_t t = 0; t < ASSIGNED_COUNT; t++) {
           tokens[hole] = t;
+          PROF(validateLineCalls++);
           const LineResult lr = validateLine(tokens.data(), static_cast<int>(tokens.size()));
           if (lr.valid) mask |= 1u << t;
         }
@@ -216,7 +219,8 @@ struct Generator {
     return (info.fixedSum + TILE_POINTS[kind] * tileMult) * eqMult;
   }
 
-  void emitIfValid() {
+  PROF_NOINLINE void emitIfValid() {
+    PROF(emitCalls++);
     const int runLen = static_cast<int>(runTokens.size());
     const int placedCount = static_cast<int>(placed.size());
     if (placedCount == 1 && !isHorizontalPass) return;  // singles: horizontal pass only
@@ -226,6 +230,7 @@ struct Generator {
 
     if (runLen >= 2) {
       if (!lineState.complete()) return;
+      PROF(evalLineCalls++);
       const LineResult lr = evaluateLine(runTokens.data(), runLen);
       if (!lr.valid) return;
       score += mainSum * mainMult;
@@ -263,6 +268,7 @@ struct Generator {
     if (opts.dedup) {
       // Canonical key: cells (sorted) + their physical kinds. Collapses only
       // blank/choice ASSIGNMENT variants, preserving leave and defense.
+      PROF(dedupKeyBuilds++);
       std::array<std::pair<int, uint8_t>, RACK_SIZE> tmp;
       for (int i = 0; i < placedCount; i++) {
         tmp[i] = {Board::idx(placed[i].row, placed[i].col), placed[i].kind};
@@ -275,8 +281,11 @@ struct Generator {
         key.push_back(static_cast<char>((tmp[i].first >> 8) & 0xFF));
         key.push_back(static_cast<char>(tmp[i].second));
       }
+      PROF(dedupFind++);
       auto it = dedupIndex.find(key);
       if (it == dedupIndex.end()) {
+        PROF(dedupInsert++);
+        PROF(moveConstruct++);
         dedupIndex.emplace(std::move(key), out->size());
         Move mv;
         mv.type = MoveType::Place;
@@ -302,7 +311,8 @@ struct Generator {
   // Advance through existing tiles starting at (row, col); returns count
   // absorbed, or -1 when the run becomes structurally illegal (any tokens
   // pushed before the failure are popped again, so runTokens is unchanged).
-  int absorb(int row, int col, LineState& st) {
+  PROF_NOINLINE int absorb(int row, int col, LineState& st) {
+    PROF(absorbCalls++);
     int n = 0;
     int r = row, c = col;
     while (inBounds(r, c) && board.at(r, c).occupied()) {
@@ -329,6 +339,7 @@ struct Generator {
   // DFS: place the next new tile at (row, col), which must be an empty cell.
   void extend(int row, int col) {
     if (aborted) return;
+    PROF(extendCalls++);
     if (stats) {
       stats->nodesVisited++;
       if (stats->nodeLimit > 0 && stats->nodesVisited > stats->nodeLimit) {
@@ -363,6 +374,7 @@ struct Generator {
         candidates &= candidates - 1;
 
         const LineState savedState = lineState;
+        PROF(lineAdvance++);
         if (!lineState.advance(token)) {
           lineState = savedState;
           continue;
@@ -414,7 +426,8 @@ struct Generator {
   }
 
   // Enumerate all moves whose leftmost new tile is at (row, col).
-  void startAt(int row, int col) {
+  PROF_NOINLINE void startAt(int row, int col) {
+    PROF(startAtCalls++);
     if (board.at(row, col).occupied()) return;
     // The run's left boundary: existing tiles immediately left of the start.
     std::vector<const Cell*> prefix;

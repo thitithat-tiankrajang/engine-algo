@@ -39,6 +39,6 @@ wasm: build $(SRC) $(HDR) src/wasm_api.cpp
 .PHONY: build test test-bot test-inc cli wasm
 
 deploy-ui: wasm
-	cp build/amath_engine.mjs ../EQ-Lab/src/bot/amath_engine.mjs
+	cp build/amath_engine.mjs ../EQ-Lab/tools/engine-wasm/amath_engine.mjs
 
 .PHONY: build test test-bot test-inc cli wasm deploy-ui

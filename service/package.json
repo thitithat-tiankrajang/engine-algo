@@ -1,0 +1,30 @@
+{
+  "name": "amath-engine-service",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "description": "HTTP service that runs the A-Math C++ engine server-side for bot moves and turn analysis.",
+  "scripts": {
+    "dev": "tsx watch src/server.ts",
+    "build": "tsc -b",
+    "start": "node dist/server.js",
+    "test": "vitest run",
+    "typecheck": "tsc -b --force",
+    "lint": "eslint src tests --max-warnings=0"
+  },
+  "dependencies": {
+    "@hono/node-server": "^1.13.7",
+    "@supabase/supabase-js": "^2.107.0",
+    "hono": "^4.6.14",
+    "jose": "^5.9.6"
+  },
+  "devDependencies": {
+    "@eslint/js": "^9.39.1",
+    "@types/node": "^22.10.2",
+    "eslint": "^9.39.1",
+    "tsx": "^4.19.2",
+    "typescript": "^5.8.0",
+    "typescript-eslint": "^8.46.1",
+    "vitest": "^3.2.4"
+  }
+}

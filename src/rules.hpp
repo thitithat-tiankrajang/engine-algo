@@ -5,10 +5,13 @@
 // arithmetic instead of float-epsilon comparison.
 #pragma once
 
+#include <array>
+#include <cassert>
 #include <string>
 #include <vector>
 
 #include "board.hpp"
+#include "prof.hpp"
 #include "rational.hpp"
 #include "tiles.hpp"
 
@@ -91,10 +94,22 @@ struct LineState {
 // Evaluate a structurally valid line: split on '=', evaluate each side with
 // standard precedence (× ÷ pass, then + - pass, both left-to-right; a leading
 // '-' acts through an implicit 0), and require all side values to be equal.
-inline LineResult evaluateLine(const uint8_t* tokens, int n) {
+inline PROF_NOINLINE LineResult evaluateLine(const uint8_t* tokens, int n) {
   LineResult res;
   Rational common;
   bool haveCommon = false;
+
+  // Allocation-free temporaries. Bound proof (from game geometry, not a guess):
+  // a line/run occupies distinct cells of a single row or column, so it holds at
+  // most BOARD_SIZE tokens; every caller passes n <= BOARD_SIZE. A side (tokens
+  // between '=' separators) is <= n tokens. Per side each of the four containers
+  // is filled by at most one entry per consumed token plus at most one synthetic
+  // leading-'-' entry, so each holds <= (side length)+1 <= BOARD_SIZE+1 entries.
+  // CAP = BOARD_SIZE + 1 therefore can never be exceeded; indices past the live
+  // count are never read. (Same values, order, and arithmetic as the previous
+  // std::vector form — this only changes storage.)
+  constexpr int CAP = BOARD_SIZE + 1;
+  assert(n <= BOARD_SIZE && "evaluateLine: line exceeds board length");
 
   int i = 0;
   while (i <= n) {
@@ -107,12 +122,13 @@ inline LineResult evaluateLine(const uint8_t* tokens, int n) {
     }
 
     // Parse numbers/operators. A leading '-' becomes 0 - ....
-    std::vector<Rational> nums;
-    std::vector<uint8_t> ops;
+    std::array<Rational, CAP> nums;
+    std::array<uint8_t, CAP> ops;
+    int numsN = 0, opsN = 0;
     int p = i;
     if (tokens[p] == T_SUB) {
-      nums.push_back(Rational::fromInt(0));
-      ops.push_back(T_SUB);
+      nums[numsN++] = Rational::fromInt(0);
+      ops[opsN++] = T_SUB;
       p++;
     }
     while (p < j) {
@@ -123,37 +139,39 @@ inline LineResult evaluateLine(const uint8_t* tokens, int n) {
           v = v * 10 + tokens[p];
           p++;
         }
-        nums.push_back(Rational::fromInt(v));
+        nums[numsN++] = Rational::fromInt(v);
       } else if (isTensTok(t)) {
-        nums.push_back(Rational::fromInt(t));
+        nums[numsN++] = Rational::fromInt(t);
         p++;
       } else {  // operator
-        ops.push_back(t);
+        ops[opsN++] = t;
         p++;
       }
     }
-    if (nums.size() != ops.size() + 1) {
+    if (numsN != opsN + 1) {
       res.error = LineError::CannotEvaluate;
       return res;
     }
 
     // Pass 1: × and ÷.
-    std::vector<Rational> rn{nums[0]};
-    std::vector<uint8_t> ro;
-    for (size_t k = 0; k < ops.size(); k++) {
+    std::array<Rational, CAP> rn;
+    std::array<uint8_t, CAP> ro;
+    int rnN = 0, roN = 0;
+    rn[rnN++] = nums[0];
+    for (int k = 0; k < opsN; k++) {
       const Rational& right = nums[k + 1];
       if (ops[k] == T_MUL) {
-        rn.back() = rn.back() * right;
+        rn[rnN - 1] = rn[rnN - 1] * right;
       } else if (ops[k] == T_DIV) {
-        rn.back() = rn.back() / right;
+        rn[rnN - 1] = rn[rnN - 1] / right;
       } else {
-        ro.push_back(ops[k]);
-        rn.push_back(right);
+        ro[roN++] = ops[k];
+        rn[rnN++] = right;
       }
     }
     // Pass 2: + and -.
     Rational value = rn[0];
-    for (size_t k = 0; k < ro.size(); k++) {
+    for (int k = 0; k < roN; k++) {
       value = ro[k] == T_ADD ? value + rn[k + 1] : value - rn[k + 1];
     }
     if (!value.isValid()) {
@@ -176,7 +194,7 @@ inline LineResult evaluateLine(const uint8_t* tokens, int n) {
 }
 
 // Full validation of one run of assigned tokens (structure + arithmetic).
-inline LineResult validateLine(const uint8_t* tokens, int n) {
+inline PROF_NOINLINE LineResult validateLine(const uint8_t* tokens, int n) {
   LineResult res;
   LineState st;
   for (int i = 0; i < n; i++) {

@@ -55,6 +55,22 @@ struct Request {
   double budgetMs = 0;
   uint32_t seed = 1;
   bool forceHidden = false;  // test hook: route eligible endgames through the hidden solver
+  // How many ranked alternatives to report. Reporting is a pure read-out of the
+  // search that already happened, so this never changes which move is chosen —
+  // the analysis path simply asks for a longer tail than the bot path needs.
+  int topN = 16;
+  // Optional cap on the simulation's opponent-rack sample count.
+  //
+  // The bot path leaves this at 0 and is steered by `budgetMs`, exactly as
+  // before. The analysis path sets it instead, because a wall-clock cutoff makes
+  // the result depend on how fast the machine happened to be that second: the
+  // sim stops at whatever sample it had reached, so two runs of the same
+  // position can rank candidates differently. Bounding the WORK instead of the
+  // TIME makes a given (position, seed, sampleCap) reproducible, which is what
+  // lets analysis be cached and re-shown without changing its advice.
+  // `budgetMs` still applies as a safety net; when it is the binding constraint
+  // the response reports fewer samples than asked and the caller can say so.
+  int sampleCap = 0;
 };
 
 bool parseRequest(const std::string& text, Request& req, std::string& error) {
@@ -108,6 +124,12 @@ bool parseRequest(const std::string& text, Request& req, std::string& error) {
   if (auto d = root->get("difficulty")) req.difficulty = d->asString();
   if (auto b = root->get("budgetMs")) req.budgetMs = b->asDouble(0);
   if (auto s = root->get("seed")) req.seed = static_cast<uint32_t>(s->asInt(1));
+  if (auto n = root->get("topN")) {
+    req.topN = std::clamp(static_cast<int>(n->asInt(16)), 1, 64);
+  }
+  if (auto n = root->get("sampleCap")) {
+    req.sampleCap = std::clamp(static_cast<int>(n->asInt(0)), 0, 4096);
+  }
   return true;
 }
 
@@ -133,6 +155,14 @@ struct Config {
   // before raising this. Bumping past 1 without re-validating risks an unsound
   // "proven win".
   int endgameExactBagMax = 1;
+  // Only ATTEMPT the exact proof when few enough tiles are still in play that it
+  // can actually finish. At bag ≤ 1 both racks are usually full (8+8), so the
+  // remaining game is a ~17-tile tree that cannot be proven inside the endgame
+  // ceiling — the solver would grind the whole budget (looking frozen) and only
+  // then fall back to sampling. The exact solver is validated/feasible for small
+  // remainders (bench: 10–13 tiles), so gate on the total unplayed count
+  // (myRack + oppRack + bag). Over this, skip straight to the sampling search.
+  int endgameExactTilesMax = 13;
   // Cap on how many distinct opponent-rack scenarios we enumerate before giving
   // up on an exact proof (RAM/time bound); over this we fall back to sampling.
   int endgameMaxAssignments = 4'000;
@@ -263,6 +293,14 @@ SimResult simulate(const Request& req, const std::vector<Move>& candidates, int 
   // For exchange candidates, the kept rack; its value is completed per sample by
   // drawing real replacement tiles from the unseen pool (bag fishing).
   std::vector<TileCounts> keptRack(candidates.size());
+  // For placement candidates, the bare leftover rack (rack − tiles played); each
+  // sample refills it from the same bag draw and values the resulting full rack,
+  // so leave AND next-turn potential are averaged over the racks we might draw —
+  // symmetric with exchange. A bingo empties the leftover but still refills.
+  std::vector<TileCounts> leftoverRack(candidates.size());
+  // Per-placement memo: best next-turn score by refilled rack (board is fixed per
+  // candidate, so the same drawn rack always yields the same score).
+  std::vector<std::unordered_map<std::string, int>> placeMemo(candidates.size());
   Board board = req.board;
   const float beta = g_leave.nextTurnPotentialWeight;
 
@@ -280,14 +318,11 @@ SimResult simulate(const Request& req, const std::vector<Move>& candidates, int 
       leaveStatic[i] = leaveValue(req.rack, ctx) - 4.0f;
       potTerm[i] = beta * bestPlaceScore(req.board, req.rack);
     } else {
-      TileCounts after = req.rack;
-      for (const Placement& p : c.placements) after.sub(p.kind);
-      applyPlacements(board, c.placements);
-      const int potential = bestPlaceScore(board, after);
-      undoPlacements(board, c.placements);
+      // Only the immediate score is fixed; leave and potential are completed per
+      // sample from the refilled rack (see the sample loop below).
+      leftoverRack[i] = req.rack;
+      for (const Placement& p : c.placements) leftoverRack[i].sub(p.kind);
       scoreComp[i] = static_cast<float>(c.score);
-      leaveStatic[i] = leaveValue(after, ctx);
-      potTerm[i] = beta * potential;
     }
   }
 
@@ -295,6 +330,31 @@ SimResult simulate(const Request& req, const std::vector<Move>& candidates, int 
   // the SAME opponent racks (and, for exchanges, the SAME drawn replacements),
   // so the comparison stays fair even when the budget stops us early. A sample
   // is committed only when every candidate has finished it.
+  // Opponent's best reply to the CURRENT board `board`.
+  auto oppReplyValue = [&](const TileCounts& oppRack) {
+    std::vector<Move> replies;
+    GenStats replyStats;
+    replyStats.nodeLimit = 200'000;  // fast: keeps the sample count high
+    GenOptions replyOpts;
+    replyOpts.dedup = true;          // bound RAM against blank-heavy opp racks
+    replyOpts.premiumOrder = true;   // best reply found first, before the cap
+    generatePlaceMoves(board, oppRack, replies, &replyStats, replyOpts);
+    stats.nodesVisited += replyStats.nodesVisited;
+    float best = leaveValue(oppRack, ctx) - 4.0f;  // opponent passes
+    for (const Move& reply : replies) {
+      const float v = staticEquity(board, oppRack, reply, ctx);
+      if (v > best) best = v;
+    }
+    return best;
+  };
+  // Exchange next-turn scoring, memoized by resulting rack: the board is fixed
+  // (exchange places nothing) so the same drawn rack always yields the same
+  // score — different samples that draw the same tiles reuse it.
+  std::unordered_map<std::string, int> exPlaceScore;
+  auto rackKey = [](const TileCounts& r) {
+    return std::string(reinterpret_cast<const char*>(r.n.data()), r.n.size());
+  };
+
   int done = 0;
   std::vector<double> rowVal(candidates.size(), 0.0);
   std::vector<uint8_t> drawPool;  // shuffled per sample; exchanges draw its prefix
@@ -309,6 +369,11 @@ SimResult simulate(const Request& req, const std::vector<Move>& candidates, int 
     std::mt19937 drawRng(req.seed * 2654435761u + static_cast<uint32_t>(s) + 1u);
     std::shuffle(drawPool.begin(), drawPool.end(), drawRng);
 
+    // Exchange and pass place nothing, so they all face the SAME base board —
+    // the opponent's best reply to it is identical for every one of them. Compute
+    // it once per sample instead of re-running the movegen for each.
+    const float oppBestBase = oppReplyValue(racks[s]);
+
     bool rowComplete = true;
     for (size_t i = 0; i < candidates.size(); i++) {
       if (msSince(start) > budgetMs && done >= 3) {
@@ -316,26 +381,42 @@ SimResult simulate(const Request& req, const std::vector<Move>& candidates, int 
         break;
       }
       const Move& cand = candidates[i];
-      applyPlacements(board, cand.placements);  // no-op for exchange / pass
+      const bool isPlacement =
+          cand.type != MoveType::Exchange && cand.type != MoveType::Pass;
 
-      std::vector<Move> replies;
-      GenStats replyStats;
-      replyStats.nodeLimit = 200'000;  // fast: keeps the sample count high
-      GenOptions replyOpts;
-      replyOpts.dedup = true;          // bound RAM against blank-heavy opp racks
-      replyOpts.premiumOrder = true;   // best reply found first, before the cap
-      generatePlaceMoves(board, racks[s], replies, &replyStats, replyOpts);
-      stats.nodesVisited += replyStats.nodesVisited;
-      float oppBest = leaveValue(racks[s], ctx) - 4.0f;  // opponent passes
-      for (const Move& reply : replies) {
-        const float v = staticEquity(board, racks[s], reply, ctx);
-        if (v > oppBest) oppBest = v;
-      }
-
+      float oppBest;
       float myVal;
       float sampLeave;  // this-sample leave component (for the diag breakdown)
       float sampPot;    // this-sample next-turn potential component
-      if (cand.type == MoveType::Exchange) {
+      if (isPlacement) {
+        // Board after our placement: the opponent replies to it, and it is also
+        // the board our refilled rack would score on next turn.
+        applyPlacements(board, cand.placements);
+        oppBest = oppReplyValue(racks[s]);
+        // Refill the leftover from this sample's bag draw (the same pool the
+        // exchanges fish from) and value the resulting full rack — its leave and
+        // how much it could SCORE next turn. A bingo empties the leftover, so
+        // this is where the fresh rack it draws finally earns its keep, weighted
+        // by what the bag actually holds.
+        TileCounts refilled = leftoverRack[i];
+        const int nd = std::min(static_cast<int>(cand.placements.size()),
+                                static_cast<int>(drawPool.size()));
+        for (int d = 0; d < nd; d++) refilled.add(drawPool[d]);
+        sampLeave = leaveValue(refilled, ctx);
+        int placeScore;
+        auto& memo = placeMemo[i];
+        auto it = memo.find(rackKey(refilled));
+        if (it != memo.end()) {
+          placeScore = it->second;
+        } else {
+          placeScore = bestPlaceScore(board, refilled);  // board = after our placement
+          memo.emplace(rackKey(refilled), placeScore);
+        }
+        sampPot = beta * placeScore;
+        undoPlacements(board, cand.placements);
+        myVal = scoreComp[i] + sampLeave + sampPot;
+      } else if (cand.type == MoveType::Exchange) {
+        oppBest = oppBestBase;  // board unchanged: shared across exchange/pass
         // Draw real replacement tiles and value the resulting full rack — both
         // its leave and how much it could SCORE next turn (bingo potential).
         // This is what makes fishing worthwhile, e.g. swapping for a bingo.
@@ -344,11 +425,20 @@ SimResult simulate(const Request& req, const std::vector<Move>& candidates, int 
         for (int d = 0; d < count && d < static_cast<int>(drawPool.size()); d++)
           newRack.add(drawPool[d]);
         sampLeave = leaveValue(newRack, ctx);
-        sampPot = beta * bestPlaceScore(board, newRack);
+        int placeScore;
+        auto it = exPlaceScore.find(rackKey(newRack));
+        if (it != exPlaceScore.end()) {
+          placeScore = it->second;
+        } else {
+          placeScore = bestPlaceScore(board, newRack);  // base board (exchange places nothing)
+          exPlaceScore.emplace(rackKey(newRack), placeScore);
+        }
+        sampPot = beta * placeScore;
         myVal = sampLeave + sampPot - g_leave.exchangeTempoCost;
         if (ctx.scoreDiff > 0) myVal -= g_leave.leadDumpPenalty;      // ahead: keep it tight
         else if (ctx.scoreDiff < 0) myVal += g_leave.trailFishBonus;  // behind: fish
-      } else {
+      } else {  // Pass: keep the whole rack, no draw
+        oppBest = oppBestBase;  // board unchanged: shared across exchange/pass
         sampLeave = leaveStatic[i];
         sampPot = potTerm[i];
         myVal = scoreComp[i] + sampLeave + sampPot;
@@ -359,8 +449,6 @@ SimResult simulate(const Request& req, const std::vector<Move>& candidates, int 
         sumPot[i] += sampPot;
         sumOpp[i] += oppBest;
       }
-
-      undoPlacements(board, cand.placements);
     }
     if (!rowComplete) break;
     for (size_t i = 0; i < candidates.size(); i++) {
@@ -674,6 +762,16 @@ struct HiddenBagSolver {
   bool aborted = false;
   static constexpr int INF = 1 << 20;
 
+  // ── progress heartbeat (UI only; never affects search values) ───────────────
+  // The deep solve can run for many seconds inside a single scenario/move, so a
+  // per-unit report is not enough to keep the UI's elapsed clock moving. The
+  // driver keeps `reportPercent` / `reportDetail` current per unit; overBudget()
+  // emits at most one report every ~250 ms so the front-end never looks frozen.
+  double lastReportMs = 0;
+  double reportPercent = 0;
+  int reportBest = 0;
+  std::string reportDetail;
+
   // ── DP / transposition table for the bag-empty phase ────────────────────────
   // A fixed-size, direct-mapped table: RAM stays bounded no matter how many
   // positions the search visits (no multi-dimensional array, no unbounded map —
@@ -729,8 +827,18 @@ struct HiddenBagSolver {
 
   bool overBudget() {
     if (aborted) return true;
-    if (++nodes > nodeBudget || (nodes % 8192 == 0 && msSince(start) > budgetMs)) aborted = true;
-    return aborted;
+    if (++nodes > nodeBudget) { aborted = true; return true; }
+    if (nodes % 8192 == 0) {
+      const double el = msSince(start);
+      if (el > budgetMs) { aborted = true; return true; }
+      // Time-based heartbeat so a long single scenario/move still ticks the UI.
+      if (g_progress && el - lastReportMs >= 250) {
+        lastReportMs = el;
+        report("endgame", reportPercent, el, 0.0, reportBest,
+               reportDetail + " nodes=" + std::to_string(nodes));
+      }
+    }
+    return false;
   }
 
   // A refill draws `draw` tiles into the side that just moved. Draws are random,
@@ -971,6 +1079,22 @@ HiddenResult solveHiddenEndgame(const Request& req, long long nodeBudget, double
   solver.zob = &zobrist();
   solver.initTT(22);  // 4M-slot direct-mapped DP table (~64 MB), RAM-bounded
 
+  // Progress bookkeeping: one "unit" = evaluating one AI option (root move or the
+  // root pass) against one world. Switch the UI to the endgame phase up front so
+  // it stops showing the movegen line while the deep solve runs.
+  const size_t totalUnits = scenarios.size() * (aiMoves.size() + 1);
+  size_t doneUnits = 0;
+  report("endgame", 0.0, 0.0, 0.0, 0,
+         "solving " + std::to_string(scenarios.size()) + " worlds");
+  auto emitProgress = [&]() {
+    const double el = msSince(solver.start);
+    if (el - solver.lastReportMs < 250) return;
+    solver.lastReportMs = el;
+    const double pct = totalUnits ? 100.0 * doneUnits / totalUnits : 0.0;
+    const double eta = doneUnits ? el / doneUnits * (totalUnits - doneUnits) : 0.0;
+    report("endgame", pct, el, eta, 0, solver.reportDetail);
+  };
+
   for (size_t s = 0; s < scenarios.size(); s++) {
     TileCounts oppRack = req.unseen;
     for (uint8_t k = 0; k < KIND_COUNT; k++) oppRack.sub(k, scenarios[s].n[k]);
@@ -982,6 +1106,11 @@ HiddenResult solveHiddenEndgame(const Request& req, long long nodeBudget, double
     // Each AI root move, evaluated against this fixed scenario.
     for (size_t i = 0; i < aiMoves.size(); i++) {
       const Move& m = aiMoves[i];
+      // Keep the heartbeat's context current for this unit (world s, move i).
+      solver.reportPercent = totalUnits ? 100.0 * doneUnits / totalUnits : 0.0;
+      solver.reportDetail = "world " + std::to_string(s + 1) + "/" +
+                            std::to_string(scenarios.size()) + " move " +
+                            std::to_string(i + 1) + "/" + std::to_string(aiMoves.size());
       TileCounts ai = req.rack;
       for (const Placement& p : m.placements) {
         solver.boardHash ^= solver.zob->cell[Board::idx(p.row, p.col)][p.kind][p.token];
@@ -1004,10 +1133,15 @@ HiddenResult solveHiddenEndgame(const Request& req, long long nodeBudget, double
       }
       if (solver.aborted) return res;  // could not prove — fall back
       guaranteed[i] = std::min(guaranteed[i], v);
+      doneUnits++;
+      emitProgress();
     }
 
     // AI passes at the root.
     {
+      solver.reportPercent = totalUnits ? 100.0 * doneUnits / totalUnits : 0.0;
+      solver.reportDetail = "world " + std::to_string(s + 1) + "/" +
+                            std::to_string(scenarios.size()) + " pass";
       TileCounts ai = req.rack;
       TileCounts scenarioBag = bag;
       int v;
@@ -1019,6 +1153,8 @@ HiddenResult solveHiddenEndgame(const Request& req, long long nodeBudget, double
       }
       if (solver.aborted) return res;
       guaranteed[passIdx] = std::min(guaranteed[passIdx], v);
+      doneUnits++;
+      emitProgress();
     }
   }
 
@@ -1121,7 +1257,8 @@ json::ValuePtr serializeRows(std::vector<ReportRow> rows, int topN = 16) {
 
 // Sim path: turn the per-candidate diagnostics into report rows.
 json::ValuePtr buildCandidateReport(const std::vector<Move>& moves,
-                                    const std::vector<CandidateDiag>& diag, int chosenIdx) {
+                                    const std::vector<CandidateDiag>& diag, int chosenIdx,
+                                    int topN) {
   std::vector<ReportRow> rows;
   for (size_t i = 0; i < diag.size(); i++) {
     if (!diag[i].evaluated) continue;
@@ -1129,7 +1266,7 @@ json::ValuePtr buildCandidateReport(const std::vector<Move>& moves,
     rows.push_back(ReportRow{&moves[i], d.scoreComp, d.leave, d.potential, d.oppReply, d.mean,
                              d.stddev, d.value, static_cast<int>(i) == chosenIdx, false});
   }
-  return serializeRows(std::move(rows));
+  return serializeRows(std::move(rows), topN);
 }
 
 // Greedy path (opponent rack unknown/empty): rows are the static-equity
@@ -1137,9 +1274,10 @@ json::ValuePtr buildCandidateReport(const std::vector<Move>& moves,
 json::ValuePtr buildGreedyReport(const Board& board, const TileCounts& rack,
                                  const BoardContext& ctx, const std::vector<Move>& moves,
                                  const std::vector<std::pair<float, size_t>>& ranked,
-                                 const std::vector<Move>& exchanges, const Move& chosen) {
+                                 const std::vector<Move>& exchanges, const Move& chosen,
+                                 int topN) {
   std::vector<ReportRow> rows;
-  const int k = std::min<int>(16, static_cast<int>(ranked.size()));
+  const int k = std::min<int>(topN, static_cast<int>(ranked.size()));
   for (int i = 0; i < k; i++) {
     const Move& m = moves[ranked[i].second];
     TileCounts after = rack;
@@ -1158,13 +1296,13 @@ json::ValuePtr buildGreedyReport(const Board& board, const TileCounts& rack,
     const float eq = staticEquity(board, rack, ex, ctx);
     rows.push_back(ReportRow{&ex, 0.0f, leave, 0.0f, 0.0f, eq, 0.0f, eq, movesEqual(ex, chosen), false});
   }
-  return serializeRows(std::move(rows));
+  return serializeRows(std::move(rows), topN);
 }
 
 // End-game path: every root option with its proven final-score margin (my total
 // − opponent total). Positive = a proven win by that margin.
 json::ValuePtr buildEndgameReport(const std::vector<std::pair<Move, int>>& rootVals,
-                                  const Move& chosen) {
+                                  const Move& chosen, int topN) {
   std::vector<ReportRow> rows;
   for (const auto& rv : rootVals) {
     const float v = static_cast<float>(rv.second);
@@ -1172,7 +1310,7 @@ json::ValuePtr buildEndgameReport(const std::vector<std::pair<Move, int>>& rootV
     rows.push_back(
         ReportRow{&rv.first, sc, 0, 0, 0, v, 0, v, movesEqual(rv.first, chosen), true});
   }
-  return serializeRows(std::move(rows));
+  return serializeRows(std::move(rows), topN);
 }
 
 std::string respond(const Move& move, float equity, const std::string& solver, bool endgameSolved,
@@ -1266,13 +1404,17 @@ std::string handleRequest(const std::string& requestJson) {
     const HiddenResult hr = solveHiddenEndgame(req, cfg.endgameNodeBudget, egBudget * 0.9,
                                                cfg.endgameMaxAssignments);
     if (!hr.found) return respondError("hidden_no_result");
-    json::ValuePtr report = buildEndgameReport(hr.rootVals, hr.move);
+    json::ValuePtr report = buildEndgameReport(hr.rootVals, hr.move, req.topN);
     return respond(hr.move, static_cast<float>(hr.value), "endgame", hr.solved, hr.value, true,
                    stats, msSince(start), 0, 0, rootMoves, report);
   }
 
   const bool endgameEligible =
       req.oppRackCount > 0 && req.unseen.total == req.oppRackCount + req.bagCount;
+  // Total tiles still to be played out from here (both racks + bag). The exact
+  // proof is only attempted when this is small enough to finish in budget;
+  // otherwise the request falls through to sampling (see endgameExactTilesMax).
+  const int endgameTilesLeft = req.rack.total + req.oppRackCount + req.bagCount;
   const double egBudget = req.budgetMs > 0 ? req.budgetMs : cfg.endgameBudgetMs;  // 5-min ceiling
 
   // ── nearly-empty bag (bag ≤ endgameExactBagMax): exact endgame proof ───────
@@ -1286,13 +1428,14 @@ std::string handleRequest(const std::string& requestJson) {
   // Validated bit-exact vs a pure-minimax ground truth (bag 0: 86/86, bag 1:
   // 16/16). It gets almost the whole endgame budget; if it can't finish it aborts
   // and we fall back below.
-  if (endgameEligible && req.bagCount <= cfg.endgameExactBagMax) {
+  if (endgameEligible && req.bagCount <= cfg.endgameExactBagMax &&
+      endgameTilesLeft <= cfg.endgameExactTilesMax) {
     const HiddenResult hr = solveHiddenEndgame(req, cfg.endgameNodeBudget, egBudget * 0.92,
                                                cfg.endgameMaxAssignments);
     // PROVEN: the exact solver finished. This is the only path that returns a
     // move through the "endgame" channel, and it is always endgameSolved=true.
     if (hr.found && hr.solved) {
-      json::ValuePtr report = buildEndgameReport(hr.rootVals, hr.move);
+      json::ValuePtr report = buildEndgameReport(hr.rootVals, hr.move, req.topN);
       return respond(hr.move, static_cast<float>(hr.value), "endgame", true, hr.value, true, stats,
                      msSince(start), 0, 0, rootMoves, report);
     }
@@ -1340,11 +1483,12 @@ std::string handleRequest(const std::string& requestJson) {
     candidates.push_back(Move{});  // pass (MoveType::Pass by default)
 
     std::vector<CandidateDiag> diag;
+    const int simSamples = req.sampleCap > 0 ? std::min(req.sampleCap, cfg.simSamples) : cfg.simSamples;
     const SimResult sim =
-        simulate(req, candidates, cfg.simSamples, budgetMs * 0.9, start, rng, stats, ctx, &diag);
+        simulate(req, candidates, simSamples, budgetMs * 0.9, start, rng, stats, ctx, &diag);
     if (sim.bestIndex >= 0) {
       const Move& chosen = candidates[sim.bestIndex];
-      json::ValuePtr report = buildCandidateReport(candidates, diag, sim.bestIndex);
+      json::ValuePtr report = buildCandidateReport(candidates, diag, sim.bestIndex, req.topN);
       return respond(chosen, sim.bestValue, "sim", false, 0, false, stats, msSince(start),
                      static_cast<int>(candidates.size()), sim.samplesUsed, rootMoves, report);
     }
@@ -1365,7 +1509,7 @@ std::string handleRequest(const std::string& requestJson) {
     }
   }
   json::ValuePtr greedyReport =
-      buildGreedyReport(req.board, req.rack, ctx, moves, ranked, exchanges, chosen);
+      buildGreedyReport(req.board, req.rack, ctx, moves, ranked, exchanges, chosen, req.topN);
   return respond(chosen, bestEq, "greedy", false, 0, false, stats, msSince(start), 0, 0, rootMoves,
                  greedyReport);
 }

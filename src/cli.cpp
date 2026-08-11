@@ -196,7 +196,9 @@ int main(int argc, char** argv) {
                  "  amath_cli bench\n"
                  "  amath_cli selfplay <games> <diffA> <diffB> [seed]\n"
                  "  amath_cli golden <positions> <seed> <out.jsonl>\n"
-                 "  amath_cli request   (JSON on stdin)\n");
+                 "  amath_cli request   (JSON on stdin)\n"
+                 "  amath_cli worker    (JSON on stdin, response on stdout,\n"
+                 "                       NDJSON progress on stderr)\n");
     return 2;
   }
   const std::string mode = argv[1];
@@ -219,6 +221,26 @@ int main(int argc, char** argv) {
     ss << std::cin.rdbuf();
     setProgressCallback([](const char* j) { std::fprintf(stderr, "progress: %s\n", j); });
     std::printf("%s\n", handleRequest(ss.str()).c_str());
+    return 0;
+  }
+  // One request per process, machine-readable both ways. The backend engine
+  // service runs the engine like this: JSON request on stdin, progress as NDJSON
+  // on stderr (flushed per line so a stream stays live), and exactly one JSON
+  // response line on stdout. A process per request is what makes a wall-clock
+  // timeout and a cancellation into the same, always-available operation: kill
+  // it. Nothing is retained between requests, so no request can influence
+  // another's search.
+  if (mode == "worker") {
+    std::ostringstream ss;
+    ss << std::cin.rdbuf();
+    setProgressCallback([](const char* j) {
+      std::fprintf(stderr, "%s\n", j);
+      std::fflush(stderr);
+    });
+    const std::string out = handleRequest(ss.str());
+    std::fwrite(out.data(), 1, out.size(), stdout);
+    std::fputc('\n', stdout);
+    std::fflush(stdout);
     return 0;
   }
   std::fprintf(stderr, "unknown mode %s\n", mode.c_str());
