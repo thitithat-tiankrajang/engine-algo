@@ -197,8 +197,8 @@ roughly **1 second per sample**. Midgame and endgame positions differ.
 | `ENGINE_BUDGET_PER_WINDOW` | no | `60` | Cost units per user per window |
 | `ENGINE_BUDGET_WINDOW_MS` | no | `600000` | Budget window |
 | `ENGINE_MAX_ANALYSIS_PER_USER` | no | `1` | Concurrent analyses per user |
-| `ENGINE_ANALYSIS_RESULT_TTL_MS` | no | `300000` | How long a completed analysis is served from the result cache. Analysis is a pure function of an immutable (position, settings), so a returning player reads it without recomputing. |
-| `ENGINE_BOT_RESULT_TTL_MS` | no | `60000` | How long a completed bot move is cached. Short by design: it pins one move to one canonical turn across a reconnect, and must not make the bot deterministic across turns. |
+| `ENGINE_ANALYSIS_RESULT_TTL_MS` | no | `1800000` | How long a completed analysis is served from the result cache. Analysis is a pure function of an immutable (position, settings), so a returning player reads it without recomputing. |
+| `ENGINE_BOT_RESULT_TTL_MS` | no | `1800000` | How long a completed bot move is cached. The cache key includes the revision, so it pins one move only to that same canonical turn and cannot carry into a later turn. |
 | `ENGINE_JOB_CACHE_MAX` | no | `256` | Ceiling on cached engine results, evicted least-recently-used. 1–100000. |
 
 An engine job (a bot turn or an analysis) now outlives the request that started

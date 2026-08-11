@@ -114,9 +114,9 @@ export type JobRegistryOptions = {
   /** How long a completed ANALYSIS result stays served. Analysis is a pure
    *  function of an immutable (position, settings), so this can be generous. */
   analysisResultTtlMs: number;
-  /** How long a completed BOT result stays served. Short on purpose: it exists
-   *  only to pin ONE move to one canonical turn across a reconnect, not to make
-   *  the bot deterministic across turns. */
+  /** How long a completed BOT result stays served. The key includes the
+   *  revision, so retaining it can only pin one move to that same canonical
+   *  turn; a later turn always has a different key. */
   botResultTtlMs: number;
   /** Hard ceiling on cached results, evicted least-recently-used. */
   maxCached: number;

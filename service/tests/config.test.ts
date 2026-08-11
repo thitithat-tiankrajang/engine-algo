@@ -123,3 +123,11 @@ describe("queue bounds", () => {
     ).toBe(45_000);
   });
 });
+
+describe("reconnect result retention", () => {
+  it("keeps completed work long enough for a player to return from another app", () => {
+    const config = loadConfig(minimumEnv, { cpu: oneCpu });
+    expect(config.analysisResultTtlMs).toBe(30 * 60 * 1000);
+    expect(config.botResultTtlMs).toBe(30 * 60 * 1000);
+  });
+});

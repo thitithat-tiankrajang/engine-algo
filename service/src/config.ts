@@ -143,8 +143,8 @@ export function loadConfig(
     budgetPerWindow: integer(env, "ENGINE_BUDGET_PER_WINDOW", 60),
     budgetWindowMs: integer(env, "ENGINE_BUDGET_WINDOW_MS", 10 * 60 * 1000),
     maxAnalysisPerUser: integer(env, "ENGINE_MAX_ANALYSIS_PER_USER", 1),
-    analysisResultTtlMs: integer(env, "ENGINE_ANALYSIS_RESULT_TTL_MS", 5 * 60 * 1000),
-    botResultTtlMs: integer(env, "ENGINE_BOT_RESULT_TTL_MS", 60 * 1000),
+    analysisResultTtlMs: integer(env, "ENGINE_ANALYSIS_RESULT_TTL_MS", 30 * 60 * 1000),
+    botResultTtlMs: integer(env, "ENGINE_BOT_RESULT_TTL_MS", 30 * 60 * 1000),
     jobCacheMax: boundedInteger(env, "ENGINE_JOB_CACHE_MAX", 256, 1, 100_000),
   };
 }
