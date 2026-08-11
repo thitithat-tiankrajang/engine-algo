@@ -104,11 +104,17 @@ export type FakeSourceOptions = Partial<
   commands?: Array<{ kind: string }>;
 };
 
-export function fakeSource(options: FakeSourceOptions = {}): GameStateSource & { calls: number } {
-  const revision = options.revision ?? 7;
+export function fakeSource(
+  options: FakeSourceOptions = {},
+): GameStateSource & { calls: number; advanceTo(revision: number): void } {
+  let revision = options.revision ?? 7;
   const activeSide = options.activeSide ?? "A";
   const state = {
     calls: 0,
+    /** Model the game moving on underneath a request that is already queued. */
+    advanceTo(next: number) {
+      revision = next;
+    },
     async loadContext(gameId: string): Promise<EngineRoomContext> {
       state.calls += 1;
       if (options.failWith) throw options.failWith;
@@ -220,11 +226,19 @@ export function baseConfig(overrides: Record<string, unknown> = {}) {
     supabasePublishableKey: "sb_publishable_test",
     allowedOrigins: ["http://127.0.0.1:5173"],
     concurrency: 2,
+    concurrencySource: "env" as const,
+    cpu: { cpus: 4, source: "cgroup-v2" as const, parallelism: 8 },
     maxWaiting: 16,
+    // The ordering and admission tests care about who runs, not about the
+    // clock. Tests that mean to exercise the deadline set it themselves.
+    maxQueueWaitMs: 60_000,
     maxBodyBytes: 8 * 1024,
     budgetPerWindow: 60,
     budgetWindowMs: 600_000,
     maxAnalysisPerUser: 1,
+    analysisResultTtlMs: 5 * 60 * 1000,
+    botResultTtlMs: 60 * 1000,
+    jobCacheMax: 256,
     ...overrides,
   };
 }

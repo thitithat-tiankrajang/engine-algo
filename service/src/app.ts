@@ -45,7 +45,14 @@ import {
   type AnalysisLevel,
   isAnalysisLevel,
 } from "./levels.js";
-import { EngineQueue, QueueFullError } from "./queue.js";
+import {
+  EngineQueue,
+  QueueCancelledError,
+  QueueFullError,
+  QueueWaitTimeoutError,
+  type QueuePosition,
+} from "./queue.js";
+import { JobRegistry, type JobKind, type JobObserver } from "./jobRegistry.js";
 import { ComputeBudget, ConcurrencyLimit } from "./rateLimit.js";
 import { RoomAccessError, type EngineRoomContext, type GameStateSource } from "./roomContext.js";
 
@@ -75,6 +82,9 @@ export type AppDependencies = {
   config: ServiceConfig;
   source: GameStateSource;
   queue: EngineQueue;
+  /** Owns engine jobs independently of any request. Built from `queue` when not
+   *  injected; tests inject one to share and inspect it. */
+  registry?: JobRegistry;
   budget: ComputeBudget;
   analysisSlots: ConcurrencyLimit;
   /** Injectable so tests can drive the whole request path without a compiler
@@ -89,13 +99,34 @@ function fail(code: string, message: string, detail?: string): ApiError {
   return detail ? { error: message, code, detail } : { error: message, code };
 }
 
+/** The hooks a queued-and-then-executed search reports its life through. */
+export type RunHooks = {
+  onQueued?: (state: QueuePosition) => void;
+  onRunning?: () => void;
+  onProgress?: (progress: EngineProgress) => void;
+};
+
 /**
- * Run a search with its progress streamed, then send the result.
+ * Run a search with its lifecycle streamed, then send the result.
  *
- * The contract on the wire is three event kinds — `progress`, `result`,
- * `error` — and exactly one of `result` or `error` ends the stream. A client
- * that sees neither has lost the connection, which is a case it must handle
- * anyway.
+ * The contract on the wire is five event kinds, and exactly one of `result` or
+ * `error` ends the stream:
+ *
+ *   queued    {ahead, position}   the engine is busy; this job is in line.
+ *                                 Re-sent whenever the place in line changes.
+ *   running   {}                  an engine process is now working on it
+ *   progress  {phase, percent, …} the engine's own report, throttled
+ *   result    <the answer>
+ *   error     {code, error}
+ *
+ * A client that sees neither `result` nor `error` has lost the connection,
+ * which is a case it must handle anyway.
+ *
+ * Every one of these is a FACT the server holds. `queued` is emitted only when
+ * the job really did not start, `running` only once a process exists, and
+ * `progress` only carries numbers the engine itself reported — there is no
+ * synthesised percentage anywhere in this path, because a made-up progress bar
+ * is worse than an honest indeterminate one.
  *
  * Progress is throttled: the engine reports every sample, which on a long
  * search is hundreds of messages nobody reads. One per 400ms is enough to keep
@@ -103,34 +134,52 @@ function fail(code: string, message: string, detail?: string): ApiError {
  */
 function streamResult<T>(
   c: Context,
-  start: (onProgress?: (progress: EngineProgress) => void) => Promise<EngineResponse>,
+  start: (hooks: RunHooks) => Promise<EngineResponse>,
   present: (response: EngineResponse) => T,
   onFailure: () => void,
   onSettled?: () => void,
 ) {
   return streamSSE(c, async (stream) => {
+    // Lifecycle events are raised from callbacks that cannot await, so writes
+    // are serialised through one chain. Without it a `running` raised during a
+    // `queued` write could reach the client first, and the client would read
+    // the job as going backwards.
+    let chain: Promise<unknown> = Promise.resolve();
+    const send = (event: string, data: unknown) => {
+      chain = chain
+        .then(() => stream.writeSSE({ event, data: JSON.stringify(data) }))
+        .catch(() => {
+          // The client is gone. The queue learns that from the request signal;
+          // failing the search over a failed write would be the wrong order of
+          // events.
+        });
+      return chain;
+    };
+
     let lastSent = 0;
     try {
-      const response = await start((progress) => {
-        const now = Date.now();
-        if (now - lastSent < 400) return;
-        lastSent = now;
-        void stream.writeSSE({
-          event: "progress",
-          data: JSON.stringify({
+      const response = await start({
+        onQueued: (state) => send("queued", { ahead: state.ahead, position: state.position }),
+        onRunning: () => send("running", {}),
+        onProgress: (progress) => {
+          const now = Date.now();
+          if (now - lastSent < 400) return;
+          lastSent = now;
+          send("progress", {
             phase: progress.phase,
             percent: progress.percent,
             elapsedMs: Math.round(progress.elapsedMs),
             etaMs: Math.round(progress.etaMs),
             detail: progress.detail,
-          }),
-        });
+          });
+        },
       });
-      await stream.writeSSE({ event: "result", data: JSON.stringify(present(response)) });
+      send("result", present(response));
+      await chain;
     } catch (error) {
       onFailure();
-      const described = describeStreamError(error);
-      await stream.writeSSE({ event: "error", data: JSON.stringify(described) });
+      send("error", describeStreamError(error));
+      await chain;
     } finally {
       onSettled?.();
     }
@@ -139,18 +188,32 @@ function streamResult<T>(
 
 /** The same coded errors the JSON path returns, for a failure that arrives
  *  after the status line has already been sent. */
-function describeStreamError(error: unknown): { code: string; error: string } {
+function describeStreamError(error: unknown): Record<string, unknown> {
   if (error instanceof EngineTimeoutError) {
     return { code: "engine_timeout", error: "The engine ran out of time on this position." };
   }
-  if (error instanceof EngineCancelledError) {
+  if (error instanceof EngineCancelledError || error instanceof QueueCancelledError) {
     return { code: "cancelled", error: "The request was cancelled." };
   }
-  if (error instanceof QueueFullError) {
+  if (error instanceof QueueFullError || error instanceof QueueWaitTimeoutError) {
+    // Two causes, one meaning for the caller: the server is oversubscribed and
+    // this request should be made again rather than waited on.
     return { code: "queue_full", error: "The engine is busy. Try again shortly." };
+  }
+  if (error instanceof StaleRevisionError) {
+    // Reached the front of the queue for a position the game has already left.
+    return {
+      code: "stale_revision",
+      error: "The position changed while this request was waiting.",
+      currentRevision: error.current,
+      requestedRevision: error.requested,
+    };
   }
   if (error instanceof AnalysisUnavailableError) {
     return { code: "analysis_unavailable", error: error.message };
+  }
+  if (error instanceof RoomAccessError) {
+    return { code: error.status === 404 ? "not_found" : "forbidden", error: error.message };
   }
   if (error instanceof EngineFailureError) {
     console.error("engine failure (stream)", error.message, error.detail ?? "");
@@ -164,6 +227,13 @@ export function createApp(deps: AppDependencies) {
   const { config, source, queue, budget, analysisSlots } = deps;
   const engine = deps.runEngine ?? runEngine;
   const verify = deps.verifyToken ?? createTokenVerifier(config.supabaseUrl);
+  const registry =
+    deps.registry ??
+    new JobRegistry(queue, {
+      analysisResultTtlMs: config.analysisResultTtlMs,
+      botResultTtlMs: config.botResultTtlMs,
+      maxCached: config.jobCacheMax,
+    });
 
   const app = new Hono();
 
@@ -177,9 +247,29 @@ export function createApp(deps: AppDependencies) {
     }),
   );
 
-  // Liveness only. Deliberately says nothing about games, users or load beyond
-  // the queue depth an operator needs to see.
-  app.get("/health", (c) => c.json({ ok: true, queue: queue.stats() }));
+  // Liveness, plus the handful of numbers an operator needs to decide whether
+  // this instance is sized correctly. Deliberately says nothing about games,
+  // users, rooms or individual jobs: everything here is an aggregate about this
+  // process, and none of it identifies anybody.
+  //
+  // `cpu` is included because the single most likely misconfiguration is a
+  // concurrency derived from the host's core count instead of the container's
+  // quota, and this is where that shows up before it becomes a slow afternoon.
+  app.get("/health", (c) =>
+    c.json({
+      ok: true,
+      queue: {
+        ...queue.stats(),
+        maxWaitMs: config.maxQueueWaitMs,
+      },
+      cpu: {
+        detected: Math.round(config.cpu.cpus * 100) / 100,
+        source: config.cpu.source,
+        parallelism: config.cpu.parallelism,
+        concurrencySource: config.concurrencySource,
+      },
+    }),
+  );
 
   // ── shared request handling ────────────────────────────────────────────────
 
@@ -228,6 +318,140 @@ export function createApp(deps: AppDependencies) {
     if (revision !== context.revision) {
       throw new StaleRevisionError(context.revision, revision);
     }
+  }
+
+  /**
+   * Put one engine run on the queue, and guard the two things queueing breaks.
+   *
+   * **Staleness.** The revision was checked at admission. A job that then waited
+   * in line has been holding an answer to a question about a board that may no
+   * longer exist. So a job that actually waited re-reads the authoritative
+   * revision at the moment it reaches the front, BEFORE a process is spawned,
+   * and refuses if the game has moved on. This is not belt-and-braces: it is the
+   * difference between spending a minute of a shared CPU on a dead position and
+   * not spending it. The client checks again on the way in, because a result can
+   * also go stale during the search itself.
+   *
+   * **Invisibility.** Waiting is reported, not hidden. `onQueued` fires only when
+   * the job genuinely did not start, and `onRunning` only once a process exists.
+   */
+  function runQueued(options: {
+    key: string;
+    priority: number;
+    kind: JobKind;
+    gameId: string;
+    caller: Caller;
+    /** The revision the request was admitted against. */
+    admittedRevision: number;
+    request: unknown;
+    timeoutMs: number;
+    signal: AbortSignal;
+    hooks: RunHooks;
+  }): Promise<EngineResponse> {
+    const observer: JobObserver = {
+      onQueued: (state) => options.hooks.onQueued?.(state),
+      onRunning: () => options.hooks.onRunning?.(),
+      onProgress: (progress) => options.hooks.onProgress?.(progress),
+    };
+    const attachment = registry.submit(
+      {
+        key: options.key,
+        priority: options.priority,
+        kind: options.kind,
+        gameId: options.gameId,
+        admittedRevision: options.admittedRevision,
+        run: async ({ signal, waited, onProgress }) => {
+          if (waited) {
+            const fresh = await source.loadContext(options.gameId, options.caller.token);
+            if (fresh.revision !== options.admittedRevision) {
+              throw new StaleRevisionError(fresh.revision, options.admittedRevision);
+            }
+            if (signal.aborted) throw new EngineCancelledError();
+          }
+          return engine({
+            binaryPath: config.enginePath,
+            request: options.request,
+            timeoutMs: options.timeoutMs,
+            signal,
+            onProgress,
+          });
+        },
+      },
+      observer,
+    );
+    // The request signal now DETACHES this observer when the client disconnects;
+    // it does NOT cancel the search. A page that navigates away, a tab that
+    // closes, or a dropped socket stops watching — the job keeps running for any
+    // other observer and for the player when they return. Cancellation is a
+    // separate, deliberate decision the registry makes (superseded/explicit/
+    // timeout), never a consequence of a lost connection.
+    if (options.signal.aborted) attachment.detach();
+    else options.signal.addEventListener("abort", () => attachment.detach(), { once: true });
+    return attachment.promise;
+  }
+
+  /**
+   * Reconnect to an existing job (or its cached result) for `key`, streaming its
+   * lifecycle. Starts nothing and charges nothing: a returning client is only
+   * ever allowed to WATCH work it already caused, never to cause new work here.
+   * Emits `idle` and closes when there is nothing to attach to.
+   */
+  function streamReconnect(
+    c: Context,
+    key: string,
+    present: (response: EngineResponse) => unknown,
+  ) {
+    return streamSSE(c, async (stream) => {
+      let chain: Promise<unknown> = Promise.resolve();
+      const send = (event: string, data: unknown) => {
+        chain = chain
+          .then(() => stream.writeSSE({ event, data: JSON.stringify(data) }))
+          .catch(() => {});
+        return chain;
+      };
+
+      let lastSent = 0;
+      const observer: JobObserver = {
+        onQueued: (state) => send("queued", { ahead: state.ahead, position: state.position }),
+        onRunning: () => send("running", {}),
+        onProgress: (progress) => {
+          const now = Date.now();
+          if (now - lastSent < 400) return;
+          lastSent = now;
+          send("progress", {
+            phase: progress.phase,
+            percent: progress.percent,
+            elapsedMs: Math.round(progress.elapsedMs),
+            etaMs: Math.round(progress.etaMs),
+            detail: progress.detail,
+          });
+        },
+      };
+
+      const attachment = registry.attach(key, observer);
+      if (!attachment) {
+        await send("idle", {});
+        await chain;
+        return;
+      }
+
+      const signal = c.req.raw.signal;
+      const onAbort = () => attachment.detach();
+      if (signal.aborted) attachment.detach();
+      else signal.addEventListener("abort", onAbort, { once: true });
+
+      try {
+        const response = await attachment.promise;
+        await send("result", present(response));
+        await chain;
+      } catch (error) {
+        await send("error", describeStreamError(error));
+        await chain;
+      } finally {
+        signal.removeEventListener("abort", onAbort);
+        attachment.detach();
+      }
+    });
   }
 
   function requirePlayable(context: EngineRoomContext): void {
@@ -313,29 +537,29 @@ export function createApp(deps: AppDependencies) {
     // Keyed by position, so two tabs of the same game share one search instead
     // of each starting their own.
     const key = `bot:${gameId}:${context.revision}:${context.botDifficulty}`;
-    const start = (onProgress?: (progress: EngineProgress) => void) =>
-      queue.submit(
-        {
-          key,
-          priority: BOT_PRIORITY,
-          run: (signal) =>
-            engine({
-              binaryPath: config.enginePath,
-              request,
-              timeoutMs: tier.timeoutMs,
-              signal,
-              ...(onProgress ? { onProgress } : {}),
-            }),
-        },
-        c.req.raw.signal,
-      );
+    const start = (hooks: RunHooks) =>
+      runQueued({
+        key,
+        // Gameplay outranks every analysis level. A player waiting on their
+        // opponent to move is a worse experience than a study aid taking
+        // longer, and this ordering is what makes that guarantee structural.
+        priority: BOT_PRIORITY,
+        kind: "bot",
+        gameId,
+        caller,
+        admittedRevision: context.revision,
+        request,
+        timeoutMs: tier.timeoutMs,
+        signal: c.req.raw.signal,
+        hooks,
+      });
 
     if (wantsStream(c)) {
       return streamResult(c, start, present, () => budget.refund(caller.userId, cost));
     }
 
     try {
-      return c.json(present(await start()));
+      return c.json(present(await start({})));
     } catch (error) {
       budget.refund(caller.userId, cost);
       throw error;
@@ -417,22 +641,19 @@ export function createApp(deps: AppDependencies) {
       });
 
       const key = `analysis:${gameId}:${context.revision}:${level}`;
-      const start = (onProgress?: (progress: EngineProgress) => void) =>
-        queue.submit(
-          {
-            key,
-            priority: tier.priority,
-            run: (signal) =>
-              engine({
-                binaryPath: config.enginePath,
-                request,
-                timeoutMs: tier.timeoutMs,
-                signal,
-                ...(onProgress ? { onProgress } : {}),
-              }),
-          },
-          c.req.raw.signal,
-        );
+      const start = (hooks: RunHooks) =>
+        runQueued({
+          key,
+          priority: tier.priority,
+          kind: "analysis",
+          gameId,
+          caller,
+          admittedRevision: context.revision,
+          request,
+          timeoutMs: tier.timeoutMs,
+          signal: c.req.raw.signal,
+          hooks,
+        });
 
       const present = (response: EngineResponse): AnalysisResult =>
         buildAnalysis({
@@ -457,7 +678,7 @@ export function createApp(deps: AppDependencies) {
         });
       }
 
-      return c.json(present(await start()));
+      return c.json(present(await start({})));
     } catch (error) {
       if (error instanceof BudgetError) throw error;
       budget.refund(caller.userId, tier.cost);
@@ -465,6 +686,114 @@ export function createApp(deps: AppDependencies) {
     } finally {
       if (!streamOwnsSlot) analysisSlots.release(caller.userId);
     }
+  });
+
+  // ── GET /v1/games/:gameId/bot-move  (reconnect) ────────────────────────────
+  //
+  // A returning client asks: "is there already a bot search for this exact
+  // position?" It attaches to a running/queued job or reads its cached move, and
+  // is told `idle` when there is none. It never STARTS a search and never spends
+  // a budget — starting is the POST's job. Every gate the POST applies is applied
+  // here too, so reconnecting can never see something the caller could not
+  // otherwise obtain: a cache hit does not bypass auth or authorization.
+  app.get("/v1/games/:gameId/bot-move", async (c) => {
+    const caller = await authenticate(c);
+    const gameId = c.req.param("gameId");
+
+    const context = await source.loadContext(gameId, caller.token);
+    requireRevision(context, c.req.query("revision"));
+    requirePlayable(context);
+    if (!context.botSide || !context.botDifficulty) {
+      throw new TurnRuleError("This game has no engine player.");
+    }
+    if (context.activeSide !== context.botSide) {
+      throw new TurnRuleError("It is not the engine's turn.");
+    }
+    if (!context.callerControlsActiveSide) {
+      throw new ForbiddenError("You do not control this game.");
+    }
+
+    const botSide = context.botSide;
+    const present = (response: EngineResponse) => ({
+      revision: context.revision,
+      gameId,
+      side: botSide,
+      move: {
+        type: response.type,
+        placements: response.placements,
+        exchange: response.exchange,
+        score: response.score,
+      },
+      solver: response.solver,
+      endgameSolved: response.endgameSolved,
+      stats: {
+        elapsedMs: Math.round(response.stats.elapsedMs),
+        nodes: response.stats.nodes,
+        samples: response.stats.samples,
+      },
+    });
+
+    const key = `bot:${gameId}:${context.revision}:${context.botDifficulty}`;
+    return streamReconnect(c, key, present);
+  });
+
+  // ── GET /v1/games/:gameId/analysis  (reconnect) ────────────────────────────
+  //
+  // The same reconnect contract for analysis. The level is part of the job's
+  // identity, so it is named in the query. Cached-or-in-flight only; never starts
+  // a search, never charges a budget, never takes an analysis slot.
+  app.get("/v1/games/:gameId/analysis", async (c) => {
+    const caller = await authenticate(c);
+    const gameId = c.req.param("gameId");
+    const levelParam = c.req.query("level");
+    const level: AnalysisLevel = isAnalysisLevel(levelParam) ? levelParam : "quick";
+
+    const context = await source.loadContext(gameId, caller.token);
+    requireRevision(context, c.req.query("revision"));
+    requirePlayable(context);
+    if (context.activeSideIsBot) {
+      throw new AnalysisNotAllowedError("Analysis is only available on a turn a human is playing.");
+    }
+    if (!context.callerControlsActiveSide) {
+      throw new AnalysisNotAllowedError("Analysis is only available on your own turn.");
+    }
+
+    const side = context.activeSide;
+    const tier = ANALYSIS_LEVEL_CONFIG[level];
+    const present = (response: EngineResponse): AnalysisResult =>
+      buildAnalysis({
+        response,
+        level,
+        gameId,
+        revision: context.revision,
+        turnNumber: context.turnNumber,
+        side,
+        requestedSamples: tier.sampleCap,
+      });
+
+    const key = `analysis:${gameId}:${context.revision}:${level}`;
+    return streamReconnect(c, key, present);
+  });
+
+  // ── POST /v1/games/:gameId/analysis/cancel ─────────────────────────────────
+  //
+  // Explicit cancellation — the player pressed "cancel". Distinct from a
+  // disconnect, which never cancels. Only the human who controls this turn may
+  // cancel their own analysis; the same authorization gate as starting it.
+  app.post("/v1/games/:gameId/analysis/cancel", async (c) => {
+    const caller = await authenticate(c);
+    const gameId = c.req.param("gameId");
+    const body = await readBody(c);
+    const level: AnalysisLevel = isAnalysisLevel(body.level) ? body.level : "quick";
+
+    const context = await source.loadContext(gameId, caller.token);
+    requireRevision(context, body.expectedRevision);
+    if (!context.callerControlsActiveSide) {
+      throw new AnalysisNotAllowedError("Analysis is only available on your own turn.");
+    }
+
+    const key = `analysis:${gameId}:${context.revision}:${level}`;
+    return c.json({ cancelled: registry.cancel(key) });
   });
 
   // ── failure translation ────────────────────────────────────────────────────
@@ -528,14 +857,16 @@ export function createApp(deps: AppDependencies) {
         429,
       );
     }
-    if (error instanceof QueueFullError) {
+    if (error instanceof QueueFullError || error instanceof QueueWaitTimeoutError) {
+      // An overload is an EXPECTED condition, not a fault. It gets its own code
+      // and a retry hint, never a generic 500 the client has to guess about.
       c.header("Retry-After", "10");
       return c.json(fail("queue_full", "The engine is busy. Try again shortly."), 503);
     }
     if (error instanceof EngineTimeoutError) {
       return c.json(fail("engine_timeout", "The engine ran out of time on this position."), 504);
     }
-    if (error instanceof EngineCancelledError) {
+    if (error instanceof EngineCancelledError || error instanceof QueueCancelledError) {
       return c.json(fail("cancelled", "The request was cancelled."), 499 as 500);
     }
     if (error instanceof AnalysisUnavailableError) {

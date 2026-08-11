@@ -16,6 +16,7 @@ import { buildAnalysis } from "../src/analysis.js";
 import { parseCanonical, rackTokens } from "../src/canonical.js";
 import { EngineTimeoutError, runEngine } from "../src/engineRunner.js";
 import { ANALYSIS_LEVEL_CONFIG } from "../src/levels.js";
+import { EngineQueue } from "../src/queue.js";
 import { buildCanonicalPayload } from "./helpers.js";
 
 const ENGINE = fileURLToPath(new URL("../../build/amath_cli", import.meta.url));
@@ -215,4 +216,190 @@ suite("the real engine", () => {
       }),
     ).rejects.toThrow();
   }, 20_000);
+
+  // ── the queue against real processes ───────────────────────────────────────
+  //
+  // The unit tests in queue.test.ts prove the SCHEDULING with stand-ins. These
+  // prove the thing that actually matters on a 1-CPU box: that what gets
+  // serialised is real `amath_cli` processes, not just promises.
+
+  /** A cheap but genuine search. */
+  const smallRequest = (revision: number) =>
+    toEngineRequest(parseCanonical(position(revision)), {
+      side: "A",
+      difficulty: "analysis",
+      sampleCap: 1,
+      topN: 4,
+      budgetMs: 2_000,
+      events: [{ kind: "place" }],
+    });
+
+  it("runs one engine process at a time at concurrency 1", async () => {
+    const queue = new EngineQueue({ concurrency: 1, maxWaiting: 8 });
+    const spans: Array<{ start: number; end: number }> = [];
+
+    await Promise.all(
+      [0, 1, 2].map((index) =>
+        queue.submit({
+          key: `serial-${index}`,
+          priority: 0,
+          run: async (signal) => {
+            const start = Date.now();
+            await runEngine({
+              binaryPath: ENGINE,
+              request: smallRequest(7 + index),
+              timeoutMs: 60_000,
+              signal,
+            });
+            spans.push({ start, end: Date.now() });
+          },
+        }),
+      ),
+    );
+
+    expect(spans).toHaveLength(3);
+    spans.sort((first, second) => first.start - second.start);
+    // No two searches were alive at the same moment. Three processes sharing
+    // one CPU is the failure this whole design exists to prevent, and it is
+    // observable here as overlapping wall-clock spans.
+    for (let index = 1; index < spans.length; index += 1) {
+      expect(spans[index]!.start).toBeGreaterThanOrEqual(spans[index - 1]!.end - 20);
+    }
+    expect(queue.stats()).toMatchObject({ running: 0, waiting: 0 });
+  }, 180_000);
+
+  it("never exceeds its limit at concurrency 2", async () => {
+    const queue = new EngineQueue({ concurrency: 2, maxWaiting: 8 });
+    let live = 0;
+    let peak = 0;
+
+    await Promise.all(
+      [0, 1, 2, 3, 4].map((index) =>
+        queue.submit({
+          key: `pool-${index}`,
+          priority: 0,
+          run: async (signal) => {
+            live += 1;
+            peak = Math.max(peak, live);
+            try {
+              await runEngine({
+                binaryPath: ENGINE,
+                request: smallRequest(7 + index),
+                timeoutMs: 60_000,
+                signal,
+              });
+            } finally {
+              live -= 1;
+            }
+          },
+        }),
+      ),
+    );
+
+    expect(peak).toBe(2);
+    expect(queue.stats().running).toBe(0);
+  }, 240_000);
+
+  it("kills a real engine process on cancellation and gives the slot back", async () => {
+    // Cancellation has to free actual CPU, not just stop a caller waiting. The
+    // proof is that the next job runs at all: at concurrency 1 it cannot start
+    // until the previous process is gone.
+    const queue = new EngineQueue({ concurrency: 1, maxWaiting: 4 });
+    const controller = new AbortController();
+
+    const cancelled = queue.submit(
+      {
+        key: "long-search",
+        priority: 0,
+        run: (signal) =>
+          runEngine({
+            binaryPath: ENGINE,
+            request: toEngineRequest(parseCanonical(position()), {
+              side: "A",
+              difficulty: "max",
+              budgetMs: 120_000,
+              events: [],
+            }),
+            timeoutMs: 300_000,
+            signal,
+          }),
+      },
+      controller.signal,
+    );
+
+    await new Promise((resolve) => setTimeout(resolve, 400));
+    expect(queue.stats().running).toBe(1);
+    controller.abort();
+    await expect(cancelled).rejects.toThrow();
+
+    const started = Date.now();
+    await queue.submit({
+      key: "follows-on",
+      priority: 0,
+      run: (signal) =>
+        runEngine({
+          binaryPath: ENGINE,
+          request: smallRequest(9),
+          timeoutMs: 60_000,
+          signal,
+        }),
+    });
+    // Well under the 120s the cancelled search was told to take: the process
+    // really was killed rather than left to finish.
+    expect(Date.now() - started).toBeLessThan(60_000);
+    expect(queue.stats()).toMatchObject({ running: 0, waiting: 0 });
+  }, 180_000);
+
+  it("gives the slot back when a real engine run times out", async () => {
+    const queue = new EngineQueue({ concurrency: 1, maxWaiting: 4 });
+    await expect(
+      queue.submit({
+        key: "overruns",
+        priority: 0,
+        run: (signal) =>
+          runEngine({
+            binaryPath: ENGINE,
+            request: toEngineRequest(parseCanonical(position()), {
+              side: "A",
+              difficulty: "max",
+              budgetMs: 300_000,
+              events: [],
+            }),
+            timeoutMs: 1_500,
+            signal,
+          }),
+      }),
+    ).rejects.toBeInstanceOf(EngineTimeoutError);
+
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(queue.stats().running).toBe(0);
+    await expect(
+      queue.submit({
+        key: "after-timeout",
+        priority: 0,
+        run: (signal) =>
+          runEngine({ binaryPath: ENGINE, request: smallRequest(11), timeoutMs: 60_000, signal }),
+      }),
+    ).resolves.toBeTruthy();
+  }, 180_000);
+
+  it("gives the slot back when a real engine process fails to start", async () => {
+    const queue = new EngineQueue({ concurrency: 1, maxWaiting: 4 });
+    await expect(
+      queue.submit({
+        key: "no-binary",
+        priority: 0,
+        run: (signal) =>
+          runEngine({
+            binaryPath: "/nonexistent/amath_cli",
+            request: smallRequest(7),
+            timeoutMs: 5_000,
+            signal,
+          }),
+      }),
+    ).rejects.toThrow();
+
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(queue.stats()).toMatchObject({ running: 0, waiting: 0 });
+  }, 60_000);
 });

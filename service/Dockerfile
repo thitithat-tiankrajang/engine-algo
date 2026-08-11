@@ -59,9 +59,10 @@ ENV NODE_ENV=production \
 
 EXPOSE 8787
 
-# The engine is CPU-bound and the queue sizes itself from the visible core
-# count, so give the container a real CPU limit rather than letting it see the
-# whole host.
+# The engine is CPU-bound and the queue sizes itself from the container's cgroup
+# CPU QUOTA (see src/cpu.ts) — not from the host's core count, which a quota
+# does not change. If the runtime exposes no readable quota, the service says so
+# at boot and ENGINE_CONCURRENCY should be set explicitly.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
   CMD node -e "fetch('http://127.0.0.1:'+(process.env.PORT||8787)+'/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
 
