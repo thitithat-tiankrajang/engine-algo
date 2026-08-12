@@ -575,6 +575,7 @@ export function createApp(deps: AppDependencies) {
     const request = toEngineRequest(context.canonical, {
       side: context.botSide,
       difficulty: context.botDifficulty,
+      solver: tier.solver,
       ...(tier.budgetMs != null ? { budgetMs: tier.budgetMs } : {}),
       events,
     });

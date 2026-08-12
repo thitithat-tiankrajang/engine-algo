@@ -52,6 +52,17 @@ struct Request {
   int noScoreStreak = 0;
   bool exchangeAllowed = false;
   std::string difficulty = "normal";
+  // Which decision procedure to run once the exact end-game path has declined
+  // the position (see handleRequest). "sim" is the 2-ply sampling search;
+  // "static" is the deterministic static-equity ranking.
+  //
+  // This is an EXPLICIT request field rather than something inferred from
+  // `budgetMs`, and deliberately so: the behaviour this replaces was a
+  // wall-clock budget that could not actually stop the search (the sampler
+  // refuses to return before three complete samples), so a nominal 200 ms tier
+  // spent ~2.9 s. A budget is advice about time; it was never a statement about
+  // which algorithm to run, and conflating the two is what hid the problem.
+  std::string solver = "sim";
   double budgetMs = 0;
   uint32_t seed = 1;
   bool forceHidden = false;  // test hook: route eligible endgames through the hidden solver
@@ -122,6 +133,17 @@ bool parseRequest(const std::string& text, Request& req, std::string& error) {
   req.exchangeAllowed = root->get("exchangeAllowed") ? root->get("exchangeAllowed")->asBool() : false;
   req.forceHidden = root->get("forceHidden") ? root->get("forceHidden")->asBool() : false;
   if (auto d = root->get("difficulty")) req.difficulty = d->asString();
+  if (auto s = root->get("solver")) {
+    req.solver = s->asString();
+    // Rejected rather than defaulted. Silently running a different solver than
+    // the caller asked for is exactly the class of mistake this field exists to
+    // prevent, and a typo in a tier table should fail loudly on the first
+    // request instead of quietly costing seconds a turn.
+    if (req.solver != "sim" && req.solver != "static") {
+      error = "bad solver";
+      return false;
+    }
+  }
   if (auto b = root->get("budgetMs")) req.budgetMs = b->asDouble(0);
   if (auto s = root->get("seed")) req.seed = static_cast<uint32_t>(s->asInt(1));
   if (auto n = root->get("topN")) {
@@ -146,7 +168,41 @@ struct Config {
   int endgameBeamFallback = 32;           // beam width for the approximate retry
   double defaultBudgetMs = 120'000;       // 2-min mid-game ceiling
   double endgameBudgetMs = 300'000;       // 5-min end-game ceiling (bag ≤ threshold)
-  double genBudgetMs = 40'000;            // wall-clock ceiling for root generation
+  double genBudgetMs = 40'000;            // wall-clock ceiling for root generation (sim path)
+  // Root-generation ceiling for the STATIC path, in DFS nodes rather than
+  // milliseconds. A wall-clock cap makes the chosen move depend on how fast the
+  // machine happened to be that second — a busy server explores less of the
+  // board and can return a different move for the same position. Nodes are
+  // exactly reproducible, so the static path is a pure function of the request.
+  //
+  // Chosen from measurement over 176 self-play positions. Complete generation
+  // needs p50 174k nodes (11 ms), p95 6.5M (307 ms), p99 18M (1.0 s), max 93M
+  // (6.9 s). So "never cap" is not an option — it would be slower than the
+  // 2.9 s path this replaces, on exactly the positions where the bot already
+  // looks stuck.
+  //
+  // What a cap COSTS was measured the only way that matters: does the board's
+  // best static-equity move — the very thing this path maximises — survive it?
+  //
+  //     cap    binds     loses the best move        worst single loss
+  //      2M    19/176     8  (4.5%)                     40.00 equity
+  //      4M    14/176     7  (4.0%)                     40.00
+  //      8M     8/176     1  (0.6%)                      3.92
+  //     16M     4/176     1  (0.6%)                      3.92
+  //     32M     2/176     0                              0
+  //     64M     2/176     0                              0
+  //
+  // 32M is the smallest cap with no measured loss. It is deliberately not
+  // tuned tighter: an earlier 106-position sample showed 4M losing nothing at
+  // all, and the wider sample found it dropping a 40-point move — the tail is
+  // where this decision lives, so the cap is set past the tail rather than at
+  // the median. `premiumOrder` is what makes any of this work; without it a
+  // truncated run would lose the valuable region first rather than last.
+  //
+  // Cost of that choice: p50 is unaffected (11 ms), and the ~1% of positions
+  // that bind are bounded near 2 s instead of 7 s. Latency is the last of the
+  // three priorities, so the slack goes to strength.
+  long long rootNodeLimit = 32'000'000;
   int endgameBagThreshold = 5;            // eventual target for exact end-game reasoning
   // Largest bag for which we run the EXACT hidden-info proof. Kept at 1: bag 0
   // and 1 are validated bit-exact against a pure-minimax ground truth (bag 0:
@@ -1193,6 +1249,9 @@ struct ReportRow {
   float value = 0;      // ranking key
   bool chosen = false;
   bool proven = false;  // endgame: value is an exact proven final-score margin
+  // Source order (candidate index / rank), used only to break ties in the
+  // report so the same search always serializes the same list.
+  int order = 0;
 };
 
 bool movesEqual(const Move& a, const Move& b) {
@@ -1232,9 +1291,26 @@ void writeMoveCells(const json::ValuePtr& o, const Move& m) {
 }
 
 // Rank rows by value (desc), keep the top N, serialize with the full breakdown.
+//
+// The ordering is a TOTAL order, and both tiebreaks earn their place:
+//
+//  • `chosen` first among equals. The report exists to explain the move that was
+//    played, so the played move must survive truncation — and it will not
+//    survive on value alone. A position with several symmetric realisations of
+//    the same bingo produces dozens of candidates with bit-identical value; an
+//    unstable sort can then push the chosen one past topN, and the consumer
+//    (service/src/analysis.ts, `rows.find(row => row.chosen) ?? rows[0]`)
+//    quietly recommends a DIFFERENT move than the engine played. `chosen` is
+//    always an argmax of `value`, so this only ever reorders within a tie.
+//
+//  • `order` last, so the remaining ties resolve by source index instead of by
+//    whatever std::sort happened to do with them. Same search, same bytes.
 json::ValuePtr serializeRows(std::vector<ReportRow> rows, int topN = 16) {
-  std::sort(rows.begin(), rows.end(),
-            [](const ReportRow& a, const ReportRow& b) { return a.value > b.value; });
+  std::sort(rows.begin(), rows.end(), [](const ReportRow& a, const ReportRow& b) {
+    if (a.value != b.value) return a.value > b.value;
+    if (a.chosen != b.chosen) return a.chosen;
+    return a.order < b.order;
+  });
   if (static_cast<int>(rows.size()) > topN) rows.resize(topN);
   auto arr = json::makeArray();
   for (const ReportRow& row : rows) {
@@ -1264,7 +1340,8 @@ json::ValuePtr buildCandidateReport(const std::vector<Move>& moves,
     if (!diag[i].evaluated) continue;
     const CandidateDiag& d = diag[i];
     rows.push_back(ReportRow{&moves[i], d.scoreComp, d.leave, d.potential, d.oppReply, d.mean,
-                             d.stddev, d.value, static_cast<int>(i) == chosenIdx, false});
+                             d.stddev, d.value, static_cast<int>(i) == chosenIdx, false,
+                             static_cast<int>(i)});
   }
   return serializeRows(std::move(rows), topN);
 }
@@ -1287,14 +1364,16 @@ json::ValuePtr buildGreedyReport(const Board& board, const TileCounts& rack,
     // eq = score + leave − defense  ⇒  defense = score + leave − eq (shown as oppReply).
     const float defense = static_cast<float>(m.score) + leave - eq;
     rows.push_back(ReportRow{&m, static_cast<float>(m.score), leave, 0.0f, defense, eq, 0.0f, eq,
-                             movesEqual(m, chosen), false});
+                             movesEqual(m, chosen), false, i});
   }
+  int exOrder = k;
   for (const Move& ex : exchanges) {
     TileCounts after = rack;
     for (uint8_t t : ex.exchangeKinds) after.sub(t);
     const float leave = leaveValue(after, ctx);
     const float eq = staticEquity(board, rack, ex, ctx);
-    rows.push_back(ReportRow{&ex, 0.0f, leave, 0.0f, 0.0f, eq, 0.0f, eq, movesEqual(ex, chosen), false});
+    rows.push_back(ReportRow{&ex, 0.0f, leave, 0.0f, 0.0f, eq, 0.0f, eq, movesEqual(ex, chosen),
+                             false, exOrder++});
   }
   return serializeRows(std::move(rows), topN);
 }
@@ -1304,11 +1383,12 @@ json::ValuePtr buildGreedyReport(const Board& board, const TileCounts& rack,
 json::ValuePtr buildEndgameReport(const std::vector<std::pair<Move, int>>& rootVals,
                                   const Move& chosen, int topN) {
   std::vector<ReportRow> rows;
+  int order = 0;
   for (const auto& rv : rootVals) {
     const float v = static_cast<float>(rv.second);
     const float sc = rv.first.type == MoveType::Place ? static_cast<float>(rv.first.score) : 0.0f;
     rows.push_back(
-        ReportRow{&rv.first, sc, 0, 0, 0, v, 0, v, movesEqual(rv.first, chosen), true});
+        ReportRow{&rv.first, sc, 0, 0, 0, v, 0, v, movesEqual(rv.first, chosen), true, order++});
   }
   return serializeRows(std::move(rows), topN);
 }
@@ -1350,6 +1430,11 @@ std::string respond(const Move& move, float equity, const std::string& solver, b
   st->obj["elapsedMs"] = json::makeDouble(elapsedMs);
   st->obj["candidates"] = json::makeInt(candidates);
   st->obj["samples"] = json::makeInt(samples);
+  // Full move generations this decision performed. Reported because it is the
+  // only cost in a midgame decision that is worth watching: one call is ~10 ms,
+  // everything else in the evaluation is under a microsecond. The static path
+  // is contractually 1 (see STATIC_MAX_GEN_CALLS in engine.hpp).
+  st->obj["genCalls"] = json::makeInt(moveGenCalls());
   o->obj["stats"] = st;
   if (candidateReport) o->obj["candidates"] = candidateReport;
   return json::stringify(o);
@@ -1367,6 +1452,10 @@ void setProgressCallback(ProgressFn fn) { g_progress = fn; }
 
 std::string handleRequest(const std::string& requestJson) {
   const auto start = Clock::now();
+  // Per-decision accounting, so `stats.genCalls` counts THIS request. The
+  // service runs one request per process, so this is belt-and-braces there; it
+  // matters for the CLI, the tests, and self-play, which reuse the process.
+  resetMoveGenCalls();
 
   Request req;
   std::string error;
@@ -1384,14 +1473,27 @@ std::string handleRequest(const std::string& requestJson) {
   report("movegen", 0, 0, 0, 0, "");
 
   // Root generation: premium-ordered (so a spent budget never silently drops
-  // the board's best plays), dedup'd (RAM bounded by geometry, not by blanks),
-  // time-bounded. Endgame generation below stays complete for exactness.
+  // the board's best plays), dedup'd (RAM bounded by geometry, not by blanks).
+  // Endgame generation below stays complete for exactness.
+  //
+  // How generation is BOUNDED depends on the solver, and this is the one place
+  // the two paths differ before they diverge:
+  //   • sim    — wall-clock, as before. Unchanged behaviour for every tier that
+  //              still simulates.
+  //   • static — DFS nodes. The static path's whole contract is that the same
+  //              position always yields the same move, and a millisecond
+  //              deadline would break that on a loaded machine.
+  const bool staticSolver = req.solver == "static";
   GenStats stats;
   std::vector<Move> moves;
   GenOptions genOpts;
-  genOpts.budgetMs = cfg.genBudgetMs;
   genOpts.dedup = true;
   genOpts.premiumOrder = true;
+  if (staticSolver) {
+    stats.nodeLimit = cfg.rootNodeLimit;
+  } else {
+    genOpts.budgetMs = cfg.genBudgetMs;
+  }
   generatePlaceMoves(req.board, req.rack, moves, &stats, genOpts);
   const int rootMoves = static_cast<int>(moves.size());
 
@@ -1458,11 +1560,23 @@ std::string handleRequest(const std::string& requestJson) {
   ranked.reserve(moves.size());
   for (size_t i = 0; i < moves.size(); i++)
     ranked.push_back({staticEquity(req.board, req.rack, moves[i], ctx), i});
-  std::sort(ranked.begin(), ranked.end(),
-            [](const auto& a, const auto& b) { return a.first > b.first; });
+  // Total order, not just a strict-weak one on equity. Equal-equity moves are
+  // common (mirrored placements, blank assignments that dedup could not merge),
+  // and std::sort leaves ties in an unspecified order — so without the index
+  // tie-break the chosen move would be a property of the standard library
+  // rather than of the position. The static path's determinism has to be
+  // structural, and this is where ties would otherwise leak.
+  std::sort(ranked.begin(), ranked.end(), [](const auto& a, const auto& b) {
+    if (a.first != b.first) return a.first > b.first;
+    return a.second < b.second;
+  });
 
+  // The static solver stops here and falls through to the static-equity ranking
+  // below. Note where "here" is: AFTER the exact end-game block, so a position
+  // that can be PROVEN is still proven. Asking for a cheap midgame procedure is
+  // not a reason to throw away a solved endgame.
   std::vector<Move> candidates;
-  if (req.oppRackCount > 0) {
+  if (req.oppRackCount > 0 && !staticSolver) {
     const int k = std::min<int>(cfg.simTopK, static_cast<int>(ranked.size()));
     candidates.reserve(k + 3);
     if (!moves.empty()) {

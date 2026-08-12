@@ -15,7 +15,7 @@ import { toEngineRequest } from "../src/adapter.js";
 import { buildAnalysis } from "../src/analysis.js";
 import { parseCanonical, rackTokens } from "../src/canonical.js";
 import { EngineTimeoutError, runEngine } from "../src/engineRunner.js";
-import { ANALYSIS_LEVEL_CONFIG } from "../src/levels.js";
+import { ANALYSIS_LEVEL_CONFIG, BOT_TIER_CONFIG } from "../src/levels.js";
 import { EngineQueue } from "../src/queue.js";
 import { buildCanonicalPayload } from "./helpers.js";
 
@@ -64,6 +64,47 @@ suite("the real engine", () => {
 
     expect(["place", "exchange", "pass"]).toContain(response.type);
     expect(response.candidates?.length).toBeGreaterThan(0);
+  }, 120_000);
+
+  it("runs the easy tier on the static path: one generation, and the same move every time", async () => {
+    // The whole point of the tier. Before this, `easy` sent budgetMs=200 and
+    // took ~2.9 s, because the sampling search will not return before three
+    // complete opponent-rack samples — roughly 385 move generations a turn.
+    const state = parseCanonical(position());
+    const tier = BOT_TIER_CONFIG.easy;
+    expect(tier.solver).toBe("static");
+
+    const build = (salt: string) =>
+      toEngineRequest(state, {
+        side: "A",
+        difficulty: "easy",
+        solver: tier.solver,
+        ...(tier.budgetMs != null ? { budgetMs: tier.budgetMs } : {}),
+        events: [],
+        seedSalt: salt,
+      });
+
+    const first = await runEngine({ binaryPath: ENGINE, request: build(""), timeoutMs: 30_000 });
+    expect(["place", "exchange", "pass"]).toContain(first.type);
+    // One root generation. This is the bound the tier is sold on, checked
+    // through the real service path rather than only in the C++ test.
+    expect(first.stats.genCalls).toBe(1);
+    expect(first.stats.samples).toBe(0);
+
+    // Seed-invariant. Production seeds are seedFor(gameId, revision), so the
+    // interesting question is not "does the same request repeat" but "would a
+    // different game id have played something else". Under the old path it
+    // would have: six seeds produced ~4.6 distinct moves.
+    const identity = (r: typeof first) =>
+      JSON.stringify([r.type, r.placements, r.exchange, r.score]);
+    for (const salt of ["a", "b", "zzz"]) {
+      const again = await runEngine({
+        binaryPath: ENGINE,
+        request: build(salt),
+        timeoutMs: 30_000,
+      });
+      expect(identity(again)).toBe(identity(first));
+    }
   }, 120_000);
 
   it("only ever plays tiles that are on the analysed rack", async () => {

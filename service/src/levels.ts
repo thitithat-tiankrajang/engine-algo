@@ -5,8 +5,9 @@
 // back out. Both tables live here so the difference between "what the bot would
 // do" and "what analysis recommends" is one file, not an emergent property.
 
-/** Bot tiers. Steered by wall-clock budget, preserving the browser's behaviour
- *  exactly — including the ceilings `max` inherits from the engine itself. */
+/** Bot tiers. Each names a decision procedure and, for the simulating ones, a
+ *  wall-clock budget — preserving the browser's behaviour exactly for those,
+ *  including the ceilings `max` inherits from the engine itself. */
 export const BOT_TIERS = ["easy", "medium", "hard", "max"] as const;
 export type BotTier = (typeof BOT_TIERS)[number];
 
@@ -17,20 +18,37 @@ export type BotTierConfig = {
   /** Hard ceiling enforced by the service. Above the engine's own ceiling, so
    *  under normal operation the engine stops itself and this never fires. */
   timeoutMs: number;
+  /** Which decision procedure the engine should run once the exact end-game
+   *  path has declined the position.
+   *
+   *  `"static"` is the deterministic static-equity ranking: one root move
+   *  generation and no sampling. `"sim"` is the 2-ply search over sampled
+   *  opponent racks.
+   *
+   *  This is stated per tier rather than inferred from `budgetMs`, because
+   *  inferring it is what went wrong before: `budgetMs` is advice about time,
+   *  the sampler cannot honour a deadline below three complete samples, and so
+   *  the 200 ms tier below quietly cost ~2.9 s a move. */
+  solver: "static" | "sim";
 };
 
 export const BOT_TIER_CONFIG: Record<BotTier, BotTierConfig> = {
-  // These four numbers are the browser's, unchanged. Note that the low tiers
-  // are not as fast as they look: the simulation takes a minimum of three
-  // opponent-rack samples before a deadline can stop it, so anything under
-  // roughly three seconds is unreachable on a full board. Measured on the
-  // reference machine, easy/medium/hard all land near 3.4s at the opening.
-  easy: { budgetMs: 200, timeoutMs: 60_000 },
-  medium: { budgetMs: 1_000, timeoutMs: 60_000 },
-  hard: { budgetMs: 4_000, timeoutMs: 90_000 },
+  // `easy` runs the static path. Its `budgetMs` is retained at the browser's
+  // 200 ms because on that path the number no longer bounds the midgame search
+  // (there isn't one) — it bounds only the exact end-game solver, which still
+  // runs ahead of solver selection and is still worth the wait when a position
+  // can be PROVEN. Measured: ~2.9 s -> tens of milliseconds, deterministic.
+  easy: { budgetMs: 200, timeoutMs: 60_000, solver: "static" },
+  // The simulating tiers are untouched. Note they are not as fast as they look:
+  // the simulation takes a minimum of three opponent-rack samples before a
+  // deadline can stop it, so anything under roughly three seconds is
+  // unreachable on a full board — medium and hard both land near 3.4s at the
+  // opening on the reference machine.
+  medium: { budgetMs: 1_000, timeoutMs: 60_000, solver: "sim" },
+  hard: { budgetMs: 4_000, timeoutMs: 90_000, solver: "sim" },
   // Full strength, including the exact endgame proof. A single move here can
   // legitimately run for two minutes mid-game and five in the endgame.
-  max: { budgetMs: null, timeoutMs: 330_000 },
+  max: { budgetMs: null, timeoutMs: 330_000, solver: "sim" },
 };
 
 export function isBotTier(value: unknown): value is BotTier {
