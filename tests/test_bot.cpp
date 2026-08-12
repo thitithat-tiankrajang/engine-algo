@@ -74,6 +74,7 @@ static int refNegamax(Board& board, TileCounts racks[2], int side, int streak) {
 
 int main() {
   int tested = 0;
+  const GameSim::TierSpec fixtureBuilder{"easy", "static", 200};
   for (uint32_t seed = 1; seed <= 60 && tested < 8; seed++) {
     // Play a real game until the bag is empty and both racks are small.
     GameSim sim(seed);
@@ -90,7 +91,11 @@ int main() {
         capturedStreak = sim.noScoreStreak;
         break;
       }
-      const std::string res = handleRequest(sim.requestJson(side, "normal", seed * 31 + turn));
+      // This loop only constructs legal endgame fixtures. The static path is
+      // deterministic and avoids making this exactness test spend minutes in
+      // the unrelated legacy sampler on every setup turn.
+      const std::string res =
+          handleRequest(sim.requestJson(side, fixtureBuilder, seed * 31 + turn));
       if (!sim.applyResponse(side, res)) {
         std::printf("seed %u: self-play broke: %s\n", seed, sim.endReason.c_str());
         CHECK(false);

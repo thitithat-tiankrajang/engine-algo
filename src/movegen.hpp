@@ -26,6 +26,11 @@ namespace amath {
 
 struct IncrementalBoard;  // src/inc_board.hpp — optional maintained cross/contact state
 
+struct MovegenStartMasks {
+  std::array<uint8_t, BOARD_CELLS> horizontal{};
+  std::array<uint8_t, BOARD_CELLS> vertical{};
+};
+
 // Streaming emit callback (Phase 4): invoked once per legal move with its final
 // score and its placement buffer. The buffer is transient — copy out anything
 // that must outlive the call. The callback must NOT leave the board mutated when
@@ -67,6 +72,11 @@ struct GenOptions {
   // exhausted the most valuable moves have already been found (no silent,
   // position-order-biased loss of the board's right/bottom).
   bool premiumOrder = false;
+
+  // Optional exact start-cell restriction. Callers must prove that every move
+  // they need has its leftmost/topmost new tile in the corresponding mask.
+  // Null means all empty starts and preserves complete legacy generation.
+  const MovegenStartMasks* allowedStarts = nullptr;
 };
 
 // Enumerates legal Place moves for `rack` on `board`.

@@ -341,12 +341,12 @@ struct Generator {
     if (aborted) return;
     PROF(extendCalls++);
     if (stats) {
-      stats->nodesVisited++;
-      if (stats->nodeLimit > 0 && stats->nodesVisited > stats->nodeLimit) {
+      if (stats->nodeLimit > 0 && stats->nodesVisited >= stats->nodeLimit) {
         stats->truncated = true;
         aborted = true;
         return;
       }
+      stats->nodesVisited++;
     }
     if (budgetExpired()) return;
 
@@ -497,9 +497,15 @@ struct Generator {
     if (board.empty()) {
       // First move: only the center line can cover the star.
       if (horizontal) {
-        for (int col = 0; col < BOARD_SIZE; col++) startAt(CENTER, col);
+        for (int col = 0; col < BOARD_SIZE; col++) {
+          const int idx = Board::idx(CENTER, col);
+          if (!opts.allowedStarts || opts.allowedStarts->horizontal[idx]) startAt(CENTER, col);
+        }
       } else {
-        for (int row = 0; row < BOARD_SIZE; row++) startAt(row, CENTER);
+        for (int row = 0; row < BOARD_SIZE; row++) {
+          const int idx = Board::idx(row, CENTER);
+          if (!opts.allowedStarts || opts.allowedStarts->vertical[idx]) startAt(row, CENTER);
+        }
       }
       return;
     }
@@ -509,7 +515,14 @@ struct Generator {
     anchors.reserve(BOARD_CELLS);
     for (int row = 0; row < BOARD_SIZE; row++) {
       for (int col = 0; col < BOARD_SIZE; col++) {
-        if (!board.at(row, col).occupied()) anchors.push_back(Board::idx(row, col));
+        const int idx = Board::idx(row, col);
+        const bool allowed =
+            !opts.allowedStarts ||
+            (horizontal ? opts.allowedStarts->horizontal[idx]
+                        : opts.allowedStarts->vertical[idx]);
+        if (!board.at(row, col).occupied() && allowed) {
+          anchors.push_back(idx);
+        }
       }
     }
 

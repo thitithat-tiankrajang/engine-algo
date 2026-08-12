@@ -168,7 +168,10 @@ struct GameSim {
       noScoreStreak++;
     }
 
-    if (noScoreStreak >= NO_SCORE_STREAK_LENGTH) {
+    // EQ-Lab starts the versus no-score ending only after an opening equation
+    // exists. Opening passes/exchanges still advance the visible streak, but
+    // cannot finish an unstarted game.
+    if (!board.empty() && noScoreStreak >= NO_SCORE_STREAK_LENGTH) {
       const int a = racks[0].points(), b = racks[1].points();
       if (a < b) scores[0] += b - a;
       else if (b < a) scores[1] += a - b;
