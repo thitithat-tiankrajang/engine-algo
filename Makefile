@@ -21,6 +21,12 @@ test-inc: build $(SRC) $(HDR) tests/test_inc_board.cpp
 	$(CXX) $(CXXFLAGS) -o build/test_inc_board tests/test_inc_board.cpp $(SRC)
 	./build/test_inc_board
 
+# Level-1 static path: generation-call bound, determinism, legality, endgame
+# precedence, root-generation completeness.
+test-static: build $(SRC) $(HDR) tests/test_static_l1.cpp
+	$(CXX) $(CXXFLAGS) -o build/test_static_l1 tests/test_static_l1.cpp $(SRC)
+	./build/test_static_l1
+
 cli: build $(SRC) $(HDR) src/cli.cpp
 	$(CXX) $(CXXFLAGS) -o build/amath_cli src/cli.cpp $(SRC)
 
@@ -36,9 +42,9 @@ wasm: build $(SRC) $(HDR) src/wasm_api.cpp
 		-s EXPORTED_RUNTIME_METHODS=UTF8ToString,stringToUTF8,lengthBytesUTF8 \
 		-s STACK_SIZE=4MB
 
-.PHONY: build test test-bot test-inc cli wasm
+.PHONY: build test test-bot test-inc test-static cli wasm
 
 deploy-ui: wasm
 	cp build/amath_engine.mjs ../EQ-Lab/tools/engine-wasm/amath_engine.mjs
 
-.PHONY: build test test-bot test-inc cli wasm deploy-ui
+.PHONY: build test test-bot test-inc test-static cli wasm deploy-ui

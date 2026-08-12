@@ -46,6 +46,23 @@ struct GameSim {
     }
   }
 
+  // One side's engine configuration, as the service states it per tier
+  // (service/src/levels.ts). Kept here so a gauntlet can pit two REAL tiers
+  // against each other rather than two difficulty strings the engine ignores.
+  struct TierSpec {
+    std::string difficulty = "normal";
+    std::string solver;   // empty = omit the field, i.e. the engine's default
+    double budgetMs = 0;  // 0 = omit
+  };
+
+  std::string requestJson(int side, const TierSpec& tier, uint32_t seed) const {
+    std::string j = requestJson(side, tier.difficulty, seed);
+    j.pop_back();  // drop the closing brace and append the tier's own fields
+    if (!tier.solver.empty()) j += ",\"solver\":\"" + tier.solver + "\"";
+    if (tier.budgetMs > 0) j += ",\"budgetMs\":" + std::to_string(tier.budgetMs);
+    return j + "}";
+  }
+
   std::string requestJson(int side, const std::string& difficulty, uint32_t seed) const {
     auto o = json::makeObject();
     auto cells = json::makeArray();

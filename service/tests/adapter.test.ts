@@ -120,6 +120,24 @@ describe("engine request", () => {
     const maxRequest = toEngineRequest(state, { side: "A", difficulty: "max", events: [] });
     expect("budgetMs" in maxRequest).toBe(false);
   });
+
+  it("passes the tier's solver through, and omits it when unset", () => {
+    // Which decision procedure to run is stated, not inferred from budgetMs.
+    // Inferring it is what let a 200 ms tier cost ~2.9 s a move: the sampling
+    // search cannot return before three complete opponent samples, so its
+    // budget was advice it was unable to take.
+    const staticRequest = toEngineRequest(state, {
+      side: "A",
+      difficulty: "easy",
+      solver: "static",
+      budgetMs: 200,
+      events: [],
+    });
+    expect(staticRequest.solver).toBe("static");
+    // Callers that say nothing keep the engine's default (the sampling search),
+    // so adding the field changed no existing path.
+    expect("solver" in request).toBe(false);
+  });
 });
 
 describe("exchange rule", () => {

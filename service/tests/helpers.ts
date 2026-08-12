@@ -106,11 +106,18 @@ export type FakeSourceOptions = Partial<
 
 export function fakeSource(
   options: FakeSourceOptions = {},
-): GameStateSource & { calls: number; advanceTo(revision: number): void } {
+): GameStateSource & {
+  calls: number;
+  /** Every `loadRecentCommands` call, so a test can prove the command window was
+   *  opened once and at the right revision. */
+  commandWindows: number[];
+  advanceTo(revision: number): void;
+} {
   let revision = options.revision ?? 7;
   const activeSide = options.activeSide ?? "A";
   const state = {
     calls: 0,
+    commandWindows: [] as number[],
     /** Model the game moving on underneath a request that is already queued. */
     advanceTo(next: number) {
       revision = next;
@@ -136,7 +143,8 @@ export function fakeSource(
         activeSideIsBot: options.activeSideIsBot ?? false,
       };
     },
-    async loadRecentCommands() {
+    async loadRecentCommands(_gameId: string, _token: string, atRevision: number) {
+      state.commandWindows.push(atRevision);
       return options.commands ?? [{ kind: "place" }];
     },
   };

@@ -86,4 +86,18 @@ void generatePlaceMovesStream(const Board& board, const TileCounts& rack, const 
                               GenStats* stats = nullptr, const GenOptions& opts = {},
                               const IncrementalBoard* inc = nullptr);
 
+// ── generation-call accounting ───────────────────────────────────────────────
+//
+// Move generation is the only expensive operation in a midgame decision: one
+// call costs ~10 ms while every heuristic in the engine costs under a
+// microsecond. The Level-1 decision path is therefore bounded by CONTRACT at one
+// root generation plus a small constant, and this counter is what turns that
+// contract into something a test can prove. (The path it replaced reached ~385
+// calls per turn precisely because nothing counted them.)
+//
+// Counts both generation entry points. Not thread-safe and not meant to be: the
+// engine runs one request per process (see service/src/engineRunner.ts).
+long long moveGenCalls();
+void resetMoveGenCalls();
+
 }  // namespace amath

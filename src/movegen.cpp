@@ -531,8 +531,16 @@ struct Generator {
 
 }  // namespace
 
+// Counts every full generation, both entry points. See moveGenCalls() in the
+// header for why this exists.
+static long long g_genCalls = 0;
+
+long long moveGenCalls() { return g_genCalls; }
+void resetMoveGenCalls() { g_genCalls = 0; }
+
 void generatePlaceMoves(const Board& board, const TileCounts& rack, std::vector<Move>& out,
                         GenStats* stats, const GenOptions& opts, const IncrementalBoard* inc) {
+  g_genCalls++;
   Generator gen(board, rack, &out, nullptr, stats, opts, inc);
   // Split the budget evenly so both directions are always explored; a vertical
   // best move must never be starved by a slow horizontal pass.
@@ -548,6 +556,7 @@ void generatePlaceMoves(const Board& board, const TileCounts& rack, std::vector<
 // transient buffer: consume them within the call.
 void generatePlaceMovesStream(const Board& board, const TileCounts& rack, const MoveSink& sink,
                               GenStats* stats, const GenOptions& opts, const IncrementalBoard* inc) {
+  g_genCalls++;
   Generator gen(board, rack, nullptr, &sink, stats, opts, inc);
   const double passBudget = opts.budgetMs > 0 ? opts.budgetMs / 2.0 : 0.0;
   gen.runPass(true, passBudget);

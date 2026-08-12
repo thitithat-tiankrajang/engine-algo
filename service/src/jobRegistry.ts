@@ -43,6 +43,35 @@ export type JobKind = "bot" | "analysis";
 /** Where a job is, from the registry's point of view. */
 export type JobStatus = "queued" | "running" | "completed" | "failed";
 
+/**
+ * What distinguishes two jobs of the same kind for the same position.
+ *
+ * Held as a field rather than parsed back out of the key, because the key is an
+ * opaque identity string and the discovery endpoint needs to *describe* a job to
+ * a client that does not know what is running. A client cannot rediscover an
+ * analysis without its level, and the level is not derivable from the game row —
+ * which is exactly why it has to be reported rather than remembered in the
+ * browser.
+ */
+export type JobParams = { level?: string; difficulty?: string };
+
+/**
+ * A job described well enough for a returning client to decide what to attach
+ * to. Deliberately carries NO result payload: reading an answer goes through the
+ * attach endpoint, which applies the same presentation (and the same
+ * hidden-information rules) the original request did.
+ */
+export type JobListing = {
+  key: string;
+  kind: JobKind;
+  params: JobParams;
+  status: Exclude<JobStatus, "failed">;
+  progress: EngineProgress | null;
+  position: QueuePosition | null;
+  createdAt: number;
+  completedAt?: number;
+};
+
 /** What a caller learns by asking whether a job exists, WITHOUT starting one. */
 export type JobSnapshot =
   | { status: "queued"; position: QueuePosition | null }
@@ -63,6 +92,13 @@ export type JobAttachment = {
   promise: Promise<EngineResponse>;
   /** Stop receiving lifecycle events. Idempotent. Never cancels the job. */
   detach: () => void;
+  /**
+   * Whether this call joined work that already existed rather than causing new
+   * work. The metering layer needs this: a caller that only attached has spent
+   * no CPU, and charging it would bill the second tab of one game twice for a
+   * single search.
+   */
+  reused: boolean;
 };
 
 /** The run the registry executes, composed by the caller (app.ts). It is handed
@@ -85,6 +121,11 @@ export type JobSpec = {
   /** The revision the job was admitted against. A later request for the same
    *  game at a higher revision supersedes this one. */
   admittedRevision: number;
+  /** What distinguishes this job from another of the same kind at the same
+   *  position, reported verbatim by the discovery endpoint. Absent means "the
+   *  kind is the whole identity", which is true of nothing the API exposes today
+   *  but keeps the registry usable without one. */
+  params?: JobParams;
   run: JobRun;
 };
 
@@ -93,6 +134,7 @@ type ActiveJob = {
   kind: JobKind;
   gameId: string;
   admittedRevision: number;
+  params: JobParams;
   status: "queued" | "running";
   waited: boolean;
   lastPosition: QueuePosition | null;
@@ -106,6 +148,7 @@ type CachedResult = {
   kind: JobKind;
   gameId: string;
   admittedRevision: number;
+  params: JobParams;
   result: EngineResponse;
   completedAt: number;
 };
@@ -147,7 +190,7 @@ export class JobRegistry {
     const cached = this.#readCache(spec.key);
     if (cached) {
       // Already answered. No lifecycle to replay; hand back the result.
-      return { promise: Promise.resolve(cached.result), detach: () => {} };
+      return { promise: Promise.resolve(cached.result), detach: () => {}, reused: true };
     }
 
     const existing = this.#active.get(spec.key);
@@ -164,10 +207,54 @@ export class JobRegistry {
    */
   attach(key: string, observer?: JobObserver): JobAttachment | null {
     const cached = this.#readCache(key);
-    if (cached) return { promise: Promise.resolve(cached.result), detach: () => {} };
+    if (cached) return { promise: Promise.resolve(cached.result), detach: () => {}, reused: true };
     const existing = this.#active.get(key);
     if (existing) return this.#observe(existing, observer);
     return null;
+  }
+
+  /**
+   * Every job this registry holds for one position, described but not answered.
+   *
+   * This is what makes a returning client's recovery server-authoritative. The
+   * browser previously had to remember which analysis level it had started,
+   * because nothing else could tell it: lose that note — a second tab, cleared
+   * session storage, a mistimed cache clear — and a running search became
+   * permanently unreachable even though the registry still had it.
+   *
+   * Filtering by revision is the caller's job, not a courtesy: a job for a
+   * position the game has left is not a job for THIS position, and the endpoint
+   * above has already refused a revision that disagrees with the database.
+   */
+  listForGame(gameId: string, revision: number): JobListing[] {
+    const listings: JobListing[] = [];
+    for (const job of this.#active.values()) {
+      if (job.gameId !== gameId || job.admittedRevision !== revision) continue;
+      listings.push({
+        key: job.key,
+        kind: job.kind,
+        params: job.params,
+        status: job.status,
+        progress: job.status === "running" ? job.lastProgress : null,
+        position: job.status === "queued" ? job.lastPosition : null,
+        createdAt: job.createdAt,
+      });
+    }
+    for (const [cacheKey, entry] of this.#cache) {
+      if (entry.gameId !== gameId || entry.admittedRevision !== revision) continue;
+      if (Date.now() - entry.completedAt >= this.#ttlFor(entry.kind)) continue;
+      listings.push({
+        key: cacheKey.slice(`${CACHE_NAMESPACE}::`.length),
+        kind: entry.kind,
+        params: entry.params,
+        status: "completed",
+        progress: null,
+        position: null,
+        createdAt: entry.completedAt,
+        completedAt: entry.completedAt,
+      });
+    }
+    return listings;
   }
 
   /** A read-only look at a job's state, for a caller that wants to answer
@@ -209,6 +296,7 @@ export class JobRegistry {
       kind: spec.kind,
       gameId: spec.gameId,
       admittedRevision: spec.admittedRevision,
+      params: spec.params ?? {},
       status: "queued",
       waited: false,
       lastPosition: null,
@@ -269,6 +357,7 @@ export class JobRegistry {
           kind: spec.kind,
           gameId: spec.gameId,
           admittedRevision: spec.admittedRevision,
+          params: spec.params ?? {},
           result,
           completedAt: Date.now(),
         });
@@ -279,7 +368,7 @@ export class JobRegistry {
       },
     );
 
-    return { promise, detach: this.#detacher(job, observer) };
+    return { promise, detach: this.#detacher(job, observer), reused: false };
   }
 
   #observe(job: ActiveJob, observer?: JobObserver): JobAttachment {
@@ -294,7 +383,7 @@ export class JobRegistry {
         if (job.lastProgress) observer.onProgress?.(job.lastProgress);
       }
     }
-    return { promise: job.promise, detach: this.#detacher(job, observer) };
+    return { promise: job.promise, detach: this.#detacher(job, observer), reused: true };
   }
 
   #detacher(job: ActiveJob, observer?: JobObserver): () => void {

@@ -16,11 +16,17 @@ No server, no network round-trip: the engine runs on the player's machine.
   prefix pruning, rack tile-kind counts (no permutation duplicates), and
   contact-distance pruning. Proven equal to a brute-force reference enumerator
   on random positions (`tests/test_engine.cpp`).
-- **Solvers** (`src/engine.cpp`):
-  - *greedy* — immediate score + rack-leave static equity (`src/eval.cpp`)
-  - *sim* — 2-ply simulation under hidden information: top-K candidates ×
-    sampled opponent racks from the unseen pool, common random numbers,
-    sample-major order so early termination stays fair, budget-capped
+- **Solvers** (`src/engine.cpp`), chosen by the request's `solver` field:
+  - *static* (`"solver":"static"`) — deterministic static-equity ranking over a
+    complete root generation: immediate score + rack-leave − premium exposure
+    (`src/eval.cpp`). One move generation per decision and no RNG, so the answer
+    is a pure function of the request. This is what the `easy` tier runs; it
+    replaced a sampling search that issued ~385 generations a turn and cost
+    ~2.9 s at a tier asking for 200 ms. Root generation is bounded in DFS
+    **nodes**, never wall-clock, so a loaded machine cannot change the move.
+  - *sim* (default) — 2-ply simulation under hidden information: top-K
+    candidates × sampled opponent racks from the unseen pool, common random
+    numbers, sample-major order so early termination stays fair, budget-capped
   - *endgame* — when the bag is empty the opponent rack is known exactly
     (tile accounting); alpha-beta + Zobrist transposition table computes the
     game-theoretic final margin, including rack-out double bonus and the
@@ -36,6 +42,7 @@ Native tests and CLI (needs clang++ with C++20):
 ```bash
 make test        # rules + movegen completeness vs brute force
 make test-bot    # endgame exactness vs reference negamax (slow, ~5 min)
+make test-static # Level-1 static path: generation bound, determinism, legality
 make cli         # build/amath_cli: bench | selfplay | golden | request
 ```
 
@@ -59,11 +66,18 @@ valid/invalid verdict and score from both implementations.
 ## Self-play
 
 ```bash
-./build/amath_cli selfplay 6 hard easy 555
+./build/amath_cli selfplay 6 easy easy-sim 555
 ```
 
 Plays full games under real EQ-Lab rules (draw-to-8, exchange with delayed
 tile return, rack-out and no-score-streak endings) and validates every move.
+
+The tier names are the ones the service ships (`service/src/levels.ts`), so a
+gauntlet compares what players actually get: `easy` (static), `easy-sim` (the
+pre-static `easy`, kept so the two can be played head to head), `medium`,
+`hard`, `max`. Reports win/loss, mean margin, pass/exchange mix, generation
+calls per decision, and the latency distribution per side — a mean alone hides
+the tail that decides whether a tier feels instant.
 
 ## Move generation (bounded & fair)
 

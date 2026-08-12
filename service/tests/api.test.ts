@@ -8,6 +8,7 @@ import { describe, expect, it, vi } from "vitest";
 import { createApp } from "../src/app.js";
 import { EngineCancelledError, EngineFailureError, EngineTimeoutError } from "../src/engineRunner.js";
 import { EngineQueue } from "../src/queue.js";
+import { JobRegistry } from "../src/jobRegistry.js";
 import { ComputeBudget, ConcurrencyLimit } from "../src/rateLimit.js";
 import { RoomAccessError } from "../src/roomContext.js";
 import {
@@ -25,6 +26,9 @@ type Overrides = {
   engine?: () => Promise<ReturnType<typeof fakeEngineResponse>>;
   /** Share one queue between harnesses, to model two users on one instance. */
   queue?: EngineQueue;
+  /** Share one registry between harnesses, to model two CALLERS reaching the
+   *  same jobs on one instance — which is what discovery has to get right. */
+  registry?: JobRegistry;
 };
 
 function harness(overrides: Overrides = {}) {
@@ -37,6 +41,13 @@ function harness(overrides: Overrides = {}) {
       concurrency: config.concurrency,
       maxWaiting: config.maxWaiting,
       maxWaitMs: config.maxQueueWaitMs,
+    });
+  const registry =
+    overrides.registry ??
+    new JobRegistry(queue, {
+      analysisResultTtlMs: config.analysisResultTtlMs,
+      botResultTtlMs: config.botResultTtlMs,
+      maxCached: config.jobCacheMax,
     });
   const budget = new ComputeBudget({
     perWindow: config.budgetPerWindow,
@@ -53,6 +64,7 @@ function harness(overrides: Overrides = {}) {
     config,
     source,
     queue,
+    registry,
     budget,
     analysisSlots,
     runEngine: runEngine as unknown as Parameters<typeof createApp>[0]["runEngine"],
@@ -70,7 +82,14 @@ function harness(overrides: Overrides = {}) {
       body: JSON.stringify(body),
     });
 
-  return { app, call, runEngine, source, queue, budget, analysisSlots };
+  return { app, call, runEngine, source, queue, registry, budget, analysisSlots };
+}
+
+/** A second caller on the SAME instance: same registry and queue, a different
+ *  view of who they are. What discovery must never do is let this one learn
+ *  about work the first one's authorization would not have shown them. */
+function harnessSharing(base: ReturnType<typeof harness>, source: FakeSourceOptions) {
+  return harness({ source, registry: base.registry, queue: base.queue });
 }
 
 describe("authentication", () => {
@@ -264,6 +283,38 @@ describe("analysis result", () => {
     for (const alternative of body.alternatives) {
       expect(alternative.evaluation).toBeLessThanOrEqual(body.recommendation.evaluation);
       expect(alternative.evaluationGap).toBeGreaterThanOrEqual(0);
+    }
+  });
+
+  it("explains an alternative by what it LOSES on, not by a strength it happens to have", async () => {
+    // The fixture's runner-up scores 6 more points but hands the opponent 10.3
+    // more. Leading with the largest difference in either direction would
+    // describe it purely by the extra points and then say it ranks behind,
+    // which argues the wrong side and reads as a contradiction.
+    const { call } = harness();
+    const body = (await (await call("/analysis", { expectedRevision: 7 })).json()) as {
+      alternatives: Array<{ immediateScore: number; note: string }>;
+    };
+    const higherScoring = body.alternatives.find((entry) => entry.immediateScore === 30);
+    expect(higherScoring).toBeTruthy();
+    // The reason it is not the pick: it concedes more to the opponent.
+    expect(higherScoring?.note).toMatch(/hands the opponent/i);
+    // And its compensating strength is acknowledged, as the concession.
+    expect(higherScoring?.note).toMatch(/though it scores 6 more now/i);
+  });
+
+  it("never claims an alternative is behind without naming a term", async () => {
+    const { call } = harness();
+    const body = (await (await call("/analysis", { expectedRevision: 7 })).json()) as {
+      alternatives: Array<{ note: string }>;
+    };
+    for (const alternative of body.alternatives) {
+      expect(alternative.note.length).toBeGreaterThan(0);
+      // Every note is either a named comparison or an explicit "too close to
+      // separate" — never a bare verdict with no reason attached.
+      expect(alternative.note).toMatch(
+        /scores|rack|next turn|opponent|Close alternative|proven final margin/i,
+      );
     }
   });
 
@@ -485,14 +536,49 @@ describe("compute protection", () => {
         return fakeEngineResponse();
       },
     });
-    const first = call("/analysis", { expectedRevision: 7 });
+    // Two DIFFERENT analyses. The cap bounds concurrent searches, so what it has
+    // to refuse is a second distinct one — asking the same question twice is
+    // deduplicated below rather than refused.
+    const first = call("/analysis", { expectedRevision: 7, level: "quick" });
     // Give the first request time to acquire the slot.
     await new Promise((resolve) => setTimeout(resolve, 10));
-    const second = await call("/analysis", { expectedRevision: 7 });
+    const second = await call("/analysis", { expectedRevision: 7, level: "deep" });
     expect(second.status).toBe(429);
     expect(await second.json()).toMatchObject({ code: "analysis_in_progress" });
     release?.();
     expect((await first).status).toBe(200);
+  });
+
+  it("shares one search between identical analyses instead of refusing the second", async () => {
+    // Two tabs of the same game, or a reconnect racing a fresh request. They ask
+    // the same question about the same position: that is ONE search, and the
+    // second caller must be answered from it rather than told it is too busy —
+    // being refused for work you already caused is how a returning player ended
+    // up pressing Analyze again.
+    let release: (() => void) | undefined;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const { call, runEngine, analysisSlots, budget } = harness({
+      config: { budgetPerWindow: 100 },
+      engine: async () => {
+        await gate;
+        return fakeEngineResponse();
+      },
+    });
+    const first = call("/analysis", { expectedRevision: 7, level: "quick" });
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    const second = call("/analysis", { expectedRevision: 7, level: "quick" });
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    release?.();
+
+    expect((await first).status).toBe(200);
+    expect((await second).status).toBe(200);
+    // One position, one level, one engine process.
+    expect(runEngine).toHaveBeenCalledTimes(1);
+    // And one charge: the attaching caller spent no CPU. `quick` costs 1.
+    expect(budget.remaining("user-1")).toBe(99);
+    expect(analysisSlots.heldBy("user-1")).toBe(0);
   });
 
   it("does not charge an analysis slot against a request refused on turn rules", async () => {
@@ -1053,10 +1139,19 @@ describe("reconnect + cancel", () => {
     const held = gate();
     const h = harness({
       source: { botSide: "B", botDifficulty: "hard", activeSide: "B", activeSideIsBot: true },
-      engine: async () => {
+      engine: (async (options: {
+        onProgress?: (progress: Record<string, unknown>) => void;
+      }) => {
+        options.onProgress?.({
+          phase: "sim",
+          percent: 50,
+          elapsedMs: 900,
+          etaMs: 900,
+          detail: "samples=2/4",
+        });
         await held.promise;
         return fakeEngineResponse();
-      },
+      }) as unknown as () => Promise<ReturnType<typeof fakeEngineResponse>>,
     });
     const started = h.call("/bot-move", { expectedRevision: 7 }, { Accept: "text/event-stream" });
     const startResp = await started;
@@ -1065,6 +1160,12 @@ describe("reconnect + cancel", () => {
     await tick();
     held.open();
     const [, reconnectEvents] = await Promise.all([collect(startResp), collect(reconnect)]);
+    expect(reconnectEvents).toContainEqual(
+      expect.objectContaining({
+        event: "progress",
+        data: expect.objectContaining({ percent: 50 }),
+      }),
+    );
     expect(reconnectEvents.at(-1)).toMatchObject({ event: "result", data: { revision: 7 } });
     // The bot's reasoning about its own rack never crosses the wire.
     expect(JSON.stringify(reconnectEvents.at(-1)?.data)).not.toContain("oppReply");
@@ -1125,5 +1226,295 @@ describe("reconnect + cancel", () => {
       body: JSON.stringify({ expectedRevision: 7, level: "quick" }),
     });
     expect(response.status).toBe(403);
+  });
+});
+
+// ── job discovery ────────────────────────────────────────────────────────────
+//
+// "What is already running for this position?" — the question the browser could
+// not previously ask. Without it, an analysis was identified partly by a level
+// that only one tab's session storage remembered, so losing that note stranded a
+// live search behind a button the player had to press (and pay for) again.
+describe("job discovery", () => {
+  const tick = (ms = 10) => new Promise((resolve) => setTimeout(resolve, ms));
+
+  function gate() {
+    let open!: () => void;
+    const promise = new Promise<void>((resolve) => {
+      open = resolve;
+    });
+    return { promise, open };
+  }
+
+  const jobs = (h: ReturnType<typeof harness>, query: string) =>
+    h.app.request(`/v1/games/${GAME_ID}/jobs${query}`, {
+      headers: { Authorization: "Bearer token-1" },
+    });
+
+  it("reports nothing for a position with no work", async () => {
+    const h = harness();
+    const response = await jobs(h, "?revision=7");
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({ gameId: GAME_ID, revision: 7, jobs: [] });
+    expect(h.runEngine).not.toHaveBeenCalled();
+  });
+
+  it("finds a running analysis by position alone, naming the level the client lost", async () => {
+    const held = gate();
+    const h = harness({
+      engine: async () => {
+        await held.promise;
+        return fakeEngineResponse();
+      },
+    });
+    void h.call("/analysis", { expectedRevision: 7, level: "deep" }, {
+      Accept: "text/event-stream",
+    });
+    await tick();
+
+    const found = (await (await jobs(h, "?revision=7")).json()) as {
+      jobs: Array<Record<string, unknown>>;
+    };
+    expect(found.jobs).toHaveLength(1);
+    // The level is the whole point: it is the one part of the job's identity a
+    // returning client cannot derive from the game row.
+    expect(found.jobs[0]).toMatchObject({ kind: "analysis", level: "deep", status: "running" });
+    held.open();
+  });
+
+  it("reports the engine's real progress, so a returning client paints no fake zero", async () => {
+    const held = gate();
+    const h = harness({
+      engine: (async (options: {
+        onProgress?: (progress: Record<string, unknown>) => void;
+      }) => {
+        options.onProgress?.({
+          phase: "sim",
+          percent: 63,
+          elapsedMs: 4200,
+          etaMs: 2500,
+          bestScore: 0,
+          detail: "samples=5/8",
+        });
+        await held.promise;
+        return fakeEngineResponse();
+      }) as unknown as () => Promise<ReturnType<typeof fakeEngineResponse>>,
+    });
+    void h.call("/analysis", { expectedRevision: 7, level: "quick" }, {
+      Accept: "text/event-stream",
+    });
+    await tick();
+
+    const found = (await (await jobs(h, "?revision=7")).json()) as {
+      jobs: Array<{ progress?: { percent: number; phase: string } }>;
+    };
+    expect(found.jobs[0]?.progress).toMatchObject({ percent: 63, phase: "sim" });
+    held.open();
+  });
+
+  it("reports a completed job so a returning client reads the answer instead of recomputing", async () => {
+    const h = harness();
+    expect((await h.call("/analysis", { expectedRevision: 7, level: "quick" })).status).toBe(200);
+
+    const found = (await (await jobs(h, "?revision=7")).json()) as {
+      jobs: Array<Record<string, unknown>>;
+    };
+    expect(found.jobs).toEqual([
+      expect.objectContaining({ kind: "analysis", level: "quick", status: "completed" }),
+    ]);
+    // The listing describes; it never answers. Reading the result still goes
+    // through the attach endpoint, which applies the presentation rules.
+    expect(JSON.stringify(found.jobs)).not.toContain("recommendation");
+    expect(JSON.stringify(found.jobs)).not.toContain("oppReply");
+  });
+
+  it("never starts work and never spends budget", async () => {
+    const h = harness();
+    const before = h.budget.remaining("user-1");
+    await jobs(h, "?revision=7");
+    expect(h.runEngine).not.toHaveBeenCalled();
+    expect(h.budget.remaining("user-1")).toBe(before);
+    expect(h.analysisSlots.heldBy("user-1")).toBe(0);
+  });
+
+  it("refuses a revision the game has left, naming the current one", async () => {
+    const h = harness({ source: { revision: 9 } });
+    const response = await jobs(h, "?revision=7");
+    expect(response.status).toBe(409);
+    expect(await response.json()).toMatchObject({ code: "stale_revision", currentRevision: 9 });
+  });
+
+  it("requires authentication", async () => {
+    const h = harness();
+    const response = await h.app.request(`/v1/games/${GAME_ID}/jobs?revision=7`);
+    expect(response.status).toBe(401);
+  });
+
+  it("reports a game it may not read as absent", async () => {
+    const h = harness({
+      source: { failWith: new RoomAccessError("No such game, or it is not yours to read.", 404) },
+    });
+    const response = await jobs(h, "?revision=7");
+    expect(response.status).toBe(404);
+  });
+
+  it("hides an analysis from someone who does not control the turn", async () => {
+    // The same rule the analysis attach endpoint applies. A spectator must not
+    // even learn that the player on move is consulting the engine.
+    const held = gate();
+    const running = harness({
+      engine: async () => {
+        await held.promise;
+        return fakeEngineResponse();
+      },
+    });
+    void running.call("/analysis", { expectedRevision: 7, level: "quick" }, {
+      Accept: "text/event-stream",
+    });
+    await tick();
+
+    // Same registry, a caller who does not control the turn.
+    const spectator = harnessSharing(running, { callerControlsActiveSide: false });
+    const found = (await (
+      await spectator.app.request(`/v1/games/${GAME_ID}/jobs?revision=7`, {
+        headers: { Authorization: "Bearer token-1" },
+      })
+    ).json()) as { jobs: unknown[] };
+    expect(found.jobs).toEqual([]);
+    held.open();
+  });
+
+  it("hides a bot search from a caller who does not control the bot's game", async () => {
+    const held = gate();
+    const running = harness({
+      source: { botSide: "A", botDifficulty: "hard", activeSideIsBot: true },
+      engine: async () => {
+        await held.promise;
+        return fakeEngineResponse();
+      },
+    });
+    void running.call("/bot-move", { expectedRevision: 7 }, { Accept: "text/event-stream" });
+    await tick();
+
+    const owner = (await (
+      await running.app.request(`/v1/games/${GAME_ID}/jobs?revision=7`, {
+        headers: { Authorization: "Bearer token-1" },
+      })
+    ).json()) as { jobs: Array<Record<string, unknown>> };
+    expect(owner.jobs).toEqual([
+      expect.objectContaining({ kind: "bot", difficulty: "hard", status: "running" }),
+    ]);
+
+    const spectator = harnessSharing(running, {
+      botSide: "A",
+      botDifficulty: "hard",
+      activeSideIsBot: true,
+      callerControlsActiveSide: false,
+    });
+    const hidden = (await (
+      await spectator.app.request(`/v1/games/${GAME_ID}/jobs?revision=7`, {
+        headers: { Authorization: "Bearer token-1" },
+      })
+    ).json()) as { jobs: unknown[] };
+    expect(hidden.jobs).toEqual([]);
+    held.open();
+  });
+});
+
+// ── the database reads in front of a search ──────────────────────────────────
+describe("canonical context acquisition", () => {
+  it("opens the command window once, at the revision the caller claimed", async () => {
+    const h = harness();
+    await h.call("/analysis", { expectedRevision: 7, level: "quick" });
+    // One read, speculatively windowed on the claim, which the revision gate
+    // then proves correct. Previously this waited on the context read first.
+    expect(h.source.commandWindows).toEqual([7]);
+  });
+
+  it("re-reads the window when the caller's claim disagrees with the database", async () => {
+    // The claim was wrong, so the speculative window may be wrong too. The
+    // request is refused either way, but the engine must never be handed a
+    // command window opened at a revision the database does not hold.
+    const h = harness({ source: { revision: 9 } });
+    const response = await h.call("/analysis", { expectedRevision: 7, level: "quick" });
+    expect(response.status).toBe(409);
+    expect(h.source.commandWindows).toEqual([7, 9]);
+    expect(h.runEngine).not.toHaveBeenCalled();
+  });
+
+  it("reports where the pre-engine time went, in durations and nothing else", async () => {
+    const h = harness();
+    const response = await h.call("/analysis", { expectedRevision: 7, level: "quick" });
+    const timing = response.headers.get("Server-Timing");
+    expect(timing).toMatch(/auth;dur=/);
+    expect(timing).toMatch(/context;dur=/);
+    expect(timing).toMatch(/total;dur=/);
+    // Durations only: no identifiers, no token, no position.
+    expect(timing).not.toContain(GAME_ID);
+    expect(timing).not.toContain("token");
+  });
+});
+
+// ── two tabs, one turn ───────────────────────────────────────────────────────
+//
+// The same player with the game open twice is ordinary, and so is a reconnect
+// racing a fresh request. Both produce two callers asking the same question
+// about the same position at the same moment. Exactly one search may run, and
+// exactly one answer may come back — the DB commit is idempotent on the client
+// side, but the CPU is spent here and cannot be un-spent.
+describe("two callers, one canonical turn", () => {
+  const tick = (ms = 10) => new Promise((resolve) => setTimeout(resolve, ms));
+
+  it("computes a bot turn once and charges for it once", async () => {
+    let release: (() => void) | undefined;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const h = harness({
+      source: { botSide: "B", botDifficulty: "medium", activeSide: "B" },
+      engine: async () => {
+        await gate;
+        return fakeEngineResponse();
+      },
+    });
+
+    const tabA = h.call("/bot-move", { expectedRevision: 7 });
+    await tick();
+    const tabB = h.call("/bot-move", { expectedRevision: 7 });
+    await tick();
+    release?.();
+
+    const [first, second] = await Promise.all([tabA, tabB]);
+    expect(first.status).toBe(200);
+    expect(second.status).toBe(200);
+    // One engine process for one canonical turn.
+    expect(h.runEngine).toHaveBeenCalledTimes(1);
+    // And both tabs are told the same move, for the same revision, so whichever
+    // of them writes it writes the same thing.
+    const a = (await first.json()) as { revision: number; move: unknown };
+    const b = (await second.json()) as { revision: number; move: unknown };
+    expect(a.revision).toBe(7);
+    expect(b).toEqual(a);
+    // `medium` costs 2. Charged once, not twice.
+    expect(h.budget.remaining("user-1")).toBe(58);
+  });
+
+  it("serves a second caller from the cached result rather than re-searching", async () => {
+    const h = harness({ source: { botSide: "B", botDifficulty: "medium", activeSide: "B" } });
+    expect((await h.call("/bot-move", { expectedRevision: 7 })).status).toBe(200);
+    const again = await h.call("/bot-move", { expectedRevision: 7 });
+    expect(again.status).toBe(200);
+    expect(h.runEngine).toHaveBeenCalledTimes(1);
+    expect(h.budget.remaining("user-1")).toBe(58);
+  });
+
+  it("does not let a cached turn answer for the NEXT position", async () => {
+    // The retention that makes a reconnect cheap must not make the bot
+    // deterministic across turns: the revision is part of the key.
+    const h = harness({ source: { botSide: "B", botDifficulty: "medium", activeSide: "B" } });
+    await h.call("/bot-move", { expectedRevision: 7 });
+    h.source.advanceTo(8);
+    await h.call("/bot-move", { expectedRevision: 8 });
+    expect(h.runEngine).toHaveBeenCalledTimes(2);
   });
 });

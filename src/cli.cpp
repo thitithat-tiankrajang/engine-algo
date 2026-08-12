@@ -24,23 +24,87 @@ namespace {
 // ── shared helpers ───────────────────────────────────────────────────────────
 
 
-int runSelfplay(int games, const std::string& diffA, const std::string& diffB, uint32_t seed0) {
+// The tiers the SERVICE actually ships (service/src/levels.ts), so a gauntlet
+// compares what players get rather than two difficulty strings the engine
+// ignores. `easy-sim` is the pre-static `easy` — the thing the static path
+// replaced — kept so the two can be played head to head.
+GameSim::TierSpec tierFor(const std::string& name) {
+  if (name == "easy") return {"easy", "static", 200};
+  if (name == "easy-sim") return {"easy", "sim", 200};
+  if (name == "medium") return {"medium", "sim", 1000};
+  if (name == "hard") return {"hard", "sim", 4000};
+  if (name == "max") return {"max", "sim", 0};
+  return {name, "", 0};  // raw difficulty string, engine defaults
+}
+
+// Per-side measurements a tier change has to be judged on. Latency is reported
+// as a distribution because a mean hides exactly the tail that matters, and
+// generation calls are reported because they are the only cost in a midgame
+// decision worth watching (~10 ms each; every heuristic is under a microsecond).
+struct SideStats {
+  std::vector<double> ms;
+  long long genCalls = 0;
+  long long moves = 0, passes = 0, exchanges = 0;
+  long long placedTiles = 0, score = 0;
+
+  double pct(double p) const {
+    if (ms.empty()) return 0;
+    std::vector<double> s = ms;
+    std::sort(s.begin(), s.end());
+    return s[static_cast<size_t>(p * (s.size() - 1))];
+  }
+  double meanMs() const {
+    double t = 0;
+    for (double v : ms) t += v;
+    return ms.empty() ? 0 : t / ms.size();
+  }
+};
+
+void reportSide(const char* label, const std::string& name, const SideStats& s) {
+  const long long decisions = s.moves + s.passes + s.exchanges;
+  std::printf("%s (%s): mean %.1f ms | p50 %.1f | p95 %.1f | p99 %.1f | max %.1f\n", label,
+              name.c_str(), s.meanMs(), s.pct(0.50), s.pct(0.95), s.pct(0.99), s.pct(1.0));
+  std::printf("%s          gen calls %.2f/decision | place %lld pass %lld exchange %lld"
+              " | %.2f tiles/place\n",
+              label, decisions ? double(s.genCalls) / decisions : 0.0, s.moves, s.passes,
+              s.exchanges, s.moves ? double(s.placedTiles) / s.moves : 0.0);
+}
+
+int runSelfplay(int games, const std::string& nameA, const std::string& nameB, uint32_t seed0) {
+  const GameSim::TierSpec tierA = tierFor(nameA), tierB = tierFor(nameB);
   int winsA = 0, winsB = 0, draws = 0;
-  double totalMs = 0;
-  long long moveCount = 0;
   int endReasons[3] = {0, 0, 0};  // rack_out, streak, turn-limit
+  SideStats stats[2];
+  long long marginSum = 0;
 
   for (int g = 0; g < games; g++) {
     GameSim sim(seed0 + g);
     int side = g % 2;  // alternate first player
+    // Which SIDE index each tier is playing this game, so per-tier stats stay
+    // attached to the tier and not to the seat.
+    const int seatOfA = g % 2;
     int turns = 0;
     bool broken = false;
     while (!sim.finished && turns < 200) {
-      const std::string diff = side == 0 ? diffA : diffB;
+      const GameSim::TierSpec& tier = side == seatOfA ? tierA : tierB;
+      SideStats& st = stats[side == seatOfA ? 0 : 1];
       const auto t0 = std::chrono::steady_clock::now();
-      const std::string res = handleRequest(sim.requestJson(side, diff, seed0 * 1000 + g * 100 + turns));
-      totalMs += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
-      moveCount++;
+      const std::string res =
+          handleRequest(sim.requestJson(side, tier, seed0 * 1000 + g * 100 + turns));
+      st.ms.push_back(
+          std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
+      if (auto parsed = json::parse(res)) {
+        if (auto s = parsed->get("stats")) st.genCalls += s->get("genCalls")->asInt(0);
+        const std::string type = parsed->get("type") ? parsed->get("type")->asString() : "";
+        if (type == "place") {
+          st.moves++;
+          st.placedTiles += static_cast<long long>(parsed->get("placements")->arr.size());
+        } else if (type == "exchange") {
+          st.exchanges++;
+        } else {
+          st.passes++;
+        }
+      }
       if (!sim.applyResponse(side, res)) {
         std::printf("game %d BROKEN: %s\n", g, sim.endReason.c_str());
         broken = true;
@@ -53,17 +117,26 @@ int runSelfplay(int games, const std::string& diffA, const std::string& diffB, u
     if (sim.endReason == "rack_out") endReasons[0]++;
     else if (sim.endReason == "no_score_streak") endReasons[1]++;
     else endReasons[2]++;
-    if (sim.scores[0] > sim.scores[1]) winsA++;
-    else if (sim.scores[1] > sim.scores[0]) winsB++;
+    const int scoreA = sim.scores[seatOfA], scoreB = sim.scores[1 - seatOfA];
+    stats[0].score += scoreA;
+    stats[1].score += scoreB;
+    marginSum += scoreA - scoreB;
+    if (scoreA > scoreB) winsA++;
+    else if (scoreB > scoreA) winsB++;
     else draws++;
-    std::printf("game %2d: A(%s)=%d B(%s)=%d  end=%s turns=%d\n", g, diffA.c_str(), sim.scores[0],
-                diffB.c_str(), sim.scores[1], sim.endReason.c_str(), turns);
+    std::printf("game %2d: A(%s)=%d B(%s)=%d  end=%s turns=%d\n", g, nameA.c_str(), scoreA,
+                nameB.c_str(), scoreB, sim.endReason.c_str(), turns);
   }
-  std::printf("\nA(%s) wins %d, B(%s) wins %d, draws %d\n", diffA.c_str(), winsA, diffB.c_str(),
+
+  std::printf("\nA(%s) wins %d, B(%s) wins %d, draws %d\n", nameA.c_str(), winsA, nameB.c_str(),
               winsB, draws);
+  std::printf("mean score A %.1f  B %.1f  mean margin (A−B) %+.1f\n",
+              double(stats[0].score) / std::max(1, games), double(stats[1].score) / std::max(1, games),
+              double(marginSum) / std::max(1, games));
   std::printf("ends: rack_out=%d streak=%d turn_limit=%d\n", endReasons[0], endReasons[1],
               endReasons[2]);
-  std::printf("avg think %.1f ms over %lld moves\n", totalMs / std::max(1LL, moveCount), moveCount);
+  reportSide("A", nameA, stats[0]);
+  reportSide("B", nameB, stats[1]);
   return 0;
 }
 
@@ -194,7 +267,9 @@ int main(int argc, char** argv) {
     std::fprintf(stderr,
                  "usage:\n"
                  "  amath_cli bench\n"
-                 "  amath_cli selfplay <games> <diffA> <diffB> [seed]\n"
+                 "  amath_cli selfplay <games> <tierA> <tierB> [seed]\n"
+                 "      tiers: easy (static) | easy-sim (pre-static easy) |\n"
+                 "             medium | hard | max, or a raw difficulty string\n"
                  "  amath_cli golden <positions> <seed> <out.jsonl>\n"
                  "  amath_cli request   (JSON on stdin)\n"
                  "  amath_cli worker    (JSON on stdin, response on stdout,\n"

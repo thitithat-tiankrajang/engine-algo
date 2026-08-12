@@ -35,6 +35,10 @@ export type EngineRequest = {
   noScoreStreak: number;
   exchangeAllowed: boolean;
   difficulty: string;
+  /** Which decision procedure the engine runs after the exact end-game path
+   *  declines the position. Omitted means the engine's default (`"sim"`), so
+   *  every existing caller keeps its behaviour. */
+  solver?: "static" | "sim";
   budgetMs?: number;
   sampleCap?: number;
   topN?: number;
@@ -111,6 +115,7 @@ export type AdapterOptions = {
    *  analysis passes the human's own side. */
   side: Side;
   difficulty: string;
+  solver?: "static" | "sim";
   budgetMs?: number;
   sampleCap?: number;
   topN?: number;
@@ -150,6 +155,7 @@ export function toEngineRequest(
     noScoreStreak: noScoreStreak(options.events),
     exchangeAllowed: exchangeAllowed(state),
     difficulty: options.difficulty,
+    ...(options.solver != null ? { solver: options.solver } : {}),
     ...(options.budgetMs != null ? { budgetMs: options.budgetMs } : {}),
     ...(options.sampleCap != null ? { sampleCap: options.sampleCap } : {}),
     ...(options.topN != null ? { topN: options.topN } : {}),

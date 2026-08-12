@@ -62,6 +62,12 @@ export type EngineResponse = {
     elapsedMs: number;
     candidates: number;
     samples: number;
+    /** Full move generations this decision performed — the only cost in a
+     *  midgame decision worth watching, at ~10 ms a call against under a
+     *  microsecond for every heuristic the engine computes. The static path is
+     *  contractually 1. Optional because older engine binaries do not report
+     *  it. */
+    genCalls?: number;
   };
   candidates?: EngineCandidate[];
   error?: string;

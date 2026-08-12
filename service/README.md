@@ -255,8 +255,11 @@ docker build -f service/Dockerfile -t amath-engine-service .
 The service is CPU-bound, single-purpose, and holds queue state in memory. Two
 consequences for the plan you pick:
 
-- **Keep it to one instance.** The queue, the per-user budget and the per-user
-  analysis cap are all per-process. Two replicas behind a load balancer means
+- **Keep it to one instance.** The queue, the per-user budget, the per-user
+  analysis cap, the job registry and the result cache are all per-process. Job
+  DISCOVERY (`GET /v1/games/:id/jobs`) reads that same in-memory registry, so
+  behind two replicas a returning player could ask the instance that is not
+  running their search and be told there is none. Two replicas behind a load balancer means
   two independent queues, each sized for a whole CPU it does not have, and a
   per-user budget that is trivially doubled. Scaling out needs Redis first.
 - **Buy CPU, not RAM.** Memory use is a few hundred MB regardless of plan; the
@@ -314,9 +317,10 @@ in the dashboard rather than an inference from a file the platform may change.
 - Rate limiting, the queue and the per-user analysis cap are **in-memory and
   per-instance**. Correct for a single instance; behind more than one replica
   they would need Redis.
-- There is no result cache beyond in-flight deduplication. Asking for the same
-  analysis after it completes recomputes it — deterministically, so the answer
-  is the same, but the CPU is spent again.
+- Completed results are cached in memory, TTL'd and LRU-bounded
+  (`ENGINE_ANALYSIS_RESULT_TTL_MS`, `ENGINE_BOT_RESULT_TTL_MS`,
+  `ENGINE_JOB_CACHE_MAX`). Like the queue and the rate limiter, the cache is
+  **per-process**: a restart empties it, and a second replica would not see it.
 - Deduplicated callers share the run but only the first one's connection
   receives `progress` events; the others see `queued`/`running` and then the
   result. This affects two tabs of the same game, and nothing else.
