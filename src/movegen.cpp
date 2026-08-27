@@ -1,6 +1,7 @@
 #include "movegen.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <array>
 #include <cassert>
 #include <chrono>
@@ -546,9 +547,9 @@ struct Generator {
 
 // Counts every full generation, both entry points. See moveGenCalls() in the
 // header for why this exists.
-static long long g_genCalls = 0;
+static std::atomic<long long> g_genCalls{0};
 
-long long moveGenCalls() { return g_genCalls; }
+long long moveGenCalls() { return g_genCalls.load(); }
 void resetMoveGenCalls() { g_genCalls = 0; }
 
 void generatePlaceMoves(const Board& board, const TileCounts& rack, std::vector<Move>& out,

@@ -1,9 +1,13 @@
 #include "engine.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cmath>
+#include <cstdlib>
 #include <random>
+#include <system_error>
+#include <thread>
 #include <unordered_map>
 
 #include "board.hpp"
@@ -81,6 +85,14 @@ struct Request {
   // and an end-game node budget), so this terminates; it just terminates when
   // it has finished rather than when time ran out.
   bool unlimited = false;
+  // How many threads the sample loop may use, 0 = decide here (sequential).
+  //
+  // Only the client can answer this: it is the one that knows the device's core
+  // count, how much memory it can spare, and how many pooled WASM workers
+  // actually came up. Unlike `sampleCap` this is safe to derive from hardware —
+  // the schedule, the seed and the resulting move are identical at every thread
+  // count, so the device changes how LONG the move takes and nothing else.
+  int threads = 0;
   uint32_t seed = 1;
   bool forceHidden = false;  // test hook: route eligible endgames through the hidden solver
   // How many ranked alternatives to report. Reporting is a pure read-out of the
@@ -285,6 +297,10 @@ bool parseRequest(const std::string& text, Request& req, std::string& error) {
   }
   if (auto b = root->get("budgetMs")) req.budgetMs = b->asDouble(0);
   if (auto u = root->get("unlimited")) req.unlimited = u->asBool();
+  // Clamped again in simThreadCount(); this bound only keeps a hostile number
+  // out of the thread-pool sizing.
+  if (auto n = root->get("threads"))
+    req.threads = std::clamp(static_cast<int>(n->asInt(0)), 0, 64);
   if (auto s = root->get("seed")) req.seed = static_cast<uint32_t>(s->asInt(1));
   if (auto n = root->get("topN")) {
     req.topN = std::clamp(static_cast<int>(n->asInt(16)), 1, 64);
@@ -494,6 +510,31 @@ struct CandidateDiag {
   float value = 0;      // risk-adjusted score used to rank: mean − λ·stddev
 };
 
+// How many threads the sample loop may use, taken from the request.
+//
+// The CLIENT picks this number, because only the client knows what the device
+// is: how many cores it has, how much memory it can spare, and how many pooled
+// WASM workers actually spawned. The engine's job is to clamp it to something
+// it can honour.
+//
+// This is not a strength dial and must never become one. Every thread count
+// runs the identical 160-sample schedule and returns a bit-identical decision —
+// the ordered reduction in `simulate` is what guarantees that — so unlike
+// `sampleCap` it is legitimate to choose from the device. See
+// docs/parallel-sample-loop.md.
+constexpr int MAX_SIM_THREADS = 8;
+
+int simThreadCount(int fromRequest, int samples) {
+  int n = fromRequest;
+  if (n <= 0) {
+    // No thread count in the request: an older client, the service's own
+    // legality path, or the CLI. Sequential is always safe.
+    const char* env = std::getenv("AMATH_THREADS");  // benchmarking only
+    n = env ? std::atoi(env) : 1;
+  }
+  return std::clamp(n, 1, std::min(MAX_SIM_THREADS, std::max(1, samples)));
+}
+
 SimResult simulate(const Request& req, const std::vector<Move>& candidates, int samples,
                    double budgetMs, Clock::time_point start, std::mt19937& rng,
                    GenStats& stats, const BoardContext& ctx,
@@ -516,10 +557,6 @@ SimResult simulate(const Request& req, const std::vector<Move>& candidates, int 
   // so leave AND next-turn potential are averaged over the racks we might draw —
   // symmetric with exchange. A bingo empties the leftover but still refills.
   std::vector<TileCounts> leftoverRack(candidates.size());
-  // Per-placement memo: best next-turn score by refilled rack (board is fixed per
-  // candidate, so the same drawn rack always yields the same score).
-  std::vector<std::unordered_map<std::string, int>> placeMemo(candidates.size());
-  Board board = req.board;
   const float beta = g_leave.nextTurnPotentialWeight;
 
   // Per-candidate value base for the moves whose value does NOT depend on what
@@ -548,38 +585,74 @@ SimResult simulate(const Request& req, const std::vector<Move>& candidates, int 
   // the SAME opponent racks (and, for exchanges, the SAME drawn replacements),
   // so the comparison stays fair even when the budget stops us early. A sample
   // is committed only when every candidate has finished it.
-  // Opponent's best reply to the CURRENT board `board`.
-  auto oppReplyValue = [&](const TileCounts& oppRack) {
+  auto rackKey = [](const TileCounts& r) {
+    return std::string(reinterpret_cast<const char*>(r.n.data()), r.n.size());
+  };
+
+  // ── per-thread state ───────────────────────────────────────────────────────
+  // Everything one sample mutates. The board is applied/undone in place, and
+  // both memos are pure-function caches — what they hold can change how often a
+  // value is recomputed, never what the value is. So giving each thread its own
+  // copy costs cache hits and nothing else.
+  struct SampleWorker {
+    Board board;
+    std::vector<std::unordered_map<std::string, int>> placeMemo;
+    std::unordered_map<std::string, int> exPlaceScore;
+    long long nodes = 0;
+  };
+
+  // One sample's row of per-candidate values, held apart from the running
+  // totals. The totals are then summed in sample order, which is what keeps the
+  // parallel result bit-identical to the sequential one: double addition is not
+  // associative, and a race to `accum` would decide near-ties by thread timing.
+  struct SampleRow {
+    std::vector<double> val;
+    std::vector<float> leave;
+    std::vector<float> pot;
+    std::vector<float> opp;
+    size_t filled = 0;
+    bool complete = false;
+  };
+  auto makeRow = [&] {
+    SampleRow r;
+    r.val.assign(candidates.size(), 0.0);
+    r.leave.assign(candidates.size(), 0.0f);
+    r.pot.assign(candidates.size(), 0.0f);
+    r.opp.assign(candidates.size(), 0.0f);
+    return r;
+  };
+  auto makeWorker = [&] {
+    SampleWorker w;
+    w.board = req.board;
+    w.placeMemo.resize(candidates.size());
+    return w;
+  };
+
+  // Opponent's best reply to `w.board` as it currently stands.
+  auto oppReplyValue = [&](SampleWorker& w, const TileCounts& oppRack) {
     std::vector<Move> replies;
     GenStats replyStats;
     replyStats.nodeLimit = 200'000;  // fast: keeps the sample count high
     GenOptions replyOpts;
     replyOpts.dedup = true;          // bound RAM against blank-heavy opp racks
     replyOpts.premiumOrder = true;   // best reply found first, before the cap
-    generatePlaceMoves(board, oppRack, replies, &replyStats, replyOpts);
-    stats.nodesVisited += replyStats.nodesVisited;
+    generatePlaceMoves(w.board, oppRack, replies, &replyStats, replyOpts);
+    w.nodes += replyStats.nodesVisited;
     float best = leaveValue(oppRack, ctx) - 4.0f;  // opponent passes
     for (const Move& reply : replies) {
-      const float v = staticEquity(board, oppRack, reply, ctx);
+      const float v = staticEquity(w.board, oppRack, reply, ctx);
       if (v > best) best = v;
     }
     return best;
   };
-  // Exchange next-turn scoring, memoized by resulting rack: the board is fixed
-  // (exchange places nothing) so the same drawn rack always yields the same
-  // score — different samples that draw the same tiles reuse it.
-  std::unordered_map<std::string, int> exPlaceScore;
-  auto rackKey = [](const TileCounts& r) {
-    return std::string(reinterpret_cast<const char*>(r.n.data()), r.n.size());
-  };
 
-  int done = 0;
-  std::vector<double> rowVal(candidates.size(), 0.0);
-  std::vector<uint8_t> drawPool;  // shuffled per sample; exchanges draw its prefix
-  for (int s = 0; s < static_cast<int>(racks.size()); s++) {
+  // One whole sample. Reads only `s` and the immutable prep above, so two
+  // threads on different samples cannot observe each other's work.
+  auto runSample = [&](int s, SampleWorker& w, SampleRow& row, bool checkBudget,
+                       int doneSoFar) {
     // Tiles that could be drawn on an exchange this sample = unseen pool minus
     // the opponent's sampled rack (the same physical tiles can't be in both).
-    drawPool.clear();
+    std::vector<uint8_t> drawPool;
     for (uint8_t k = 0; k < KIND_COUNT; k++) {
       int avail = req.unseen.n[k] - racks[s].n[k];
       for (int j = 0; j < avail; j++) drawPool.push_back(k);
@@ -590,12 +663,13 @@ SimResult simulate(const Request& req, const std::vector<Move>& candidates, int 
     // Exchange and pass place nothing, so they all face the SAME base board —
     // the opponent's best reply to it is identical for every one of them. Compute
     // it once per sample instead of re-running the movegen for each.
-    const float oppBestBase = oppReplyValue(racks[s]);
+    const float oppBestBase = oppReplyValue(w, racks[s]);
 
-    bool rowComplete = true;
+    row.complete = true;
+    row.filled = 0;
     for (size_t i = 0; i < candidates.size(); i++) {
-      if (msSince(start) > budgetMs && done >= 3) {
-        rowComplete = false;
+      if (checkBudget && msSince(start) > budgetMs && doneSoFar >= 3) {
+        row.complete = false;
         break;
       }
       const Move& cand = candidates[i];
@@ -609,47 +683,39 @@ SimResult simulate(const Request& req, const std::vector<Move>& candidates, int 
       if (isPlacement) {
         // Board after our placement: the opponent replies to it, and it is also
         // the board our refilled rack would score on next turn.
-        applyPlacements(board, cand.placements);
-        oppBest = oppReplyValue(racks[s]);
-        // Refill the leftover from this sample's bag draw (the same pool the
-        // exchanges fish from) and value the resulting full rack — its leave and
-        // how much it could SCORE next turn. A bingo empties the leftover, so
-        // this is where the fresh rack it draws finally earns its keep, weighted
-        // by what the bag actually holds.
+        applyPlacements(w.board, cand.placements);
+        oppBest = oppReplyValue(w, racks[s]);
         TileCounts refilled = leftoverRack[i];
         const int nd = std::min(static_cast<int>(cand.placements.size()),
                                 static_cast<int>(drawPool.size()));
         for (int d = 0; d < nd; d++) refilled.add(drawPool[d]);
         sampLeave = leaveValue(refilled, ctx);
         int placeScore;
-        auto& memo = placeMemo[i];
+        auto& memo = w.placeMemo[i];
         auto it = memo.find(rackKey(refilled));
         if (it != memo.end()) {
           placeScore = it->second;
         } else {
-          placeScore = bestPlaceScore(board, refilled);  // board = after our placement
+          placeScore = bestPlaceScore(w.board, refilled);  // board = after our placement
           memo.emplace(rackKey(refilled), placeScore);
         }
         sampPot = beta * placeScore;
-        undoPlacements(board, cand.placements);
+        undoPlacements(w.board, cand.placements);
         myVal = scoreComp[i] + sampLeave + sampPot;
       } else if (cand.type == MoveType::Exchange) {
         oppBest = oppBestBase;  // board unchanged: shared across exchange/pass
-        // Draw real replacement tiles and value the resulting full rack — both
-        // its leave and how much it could SCORE next turn (bingo potential).
-        // This is what makes fishing worthwhile, e.g. swapping for a bingo.
         TileCounts newRack = keptRack[i];
         const int count = static_cast<int>(cand.exchangeKinds.size());
         for (int d = 0; d < count && d < static_cast<int>(drawPool.size()); d++)
           newRack.add(drawPool[d]);
         sampLeave = leaveValue(newRack, ctx);
         int placeScore;
-        auto it = exPlaceScore.find(rackKey(newRack));
-        if (it != exPlaceScore.end()) {
+        auto it = w.exPlaceScore.find(rackKey(newRack));
+        if (it != w.exPlaceScore.end()) {
           placeScore = it->second;
         } else {
-          placeScore = bestPlaceScore(board, newRack);  // base board (exchange places nothing)
-          exPlaceScore.emplace(rackKey(newRack), placeScore);
+          placeScore = bestPlaceScore(w.board, newRack);  // base board (exchange places nothing)
+          w.exPlaceScore.emplace(rackKey(newRack), placeScore);
         }
         sampPot = beta * placeScore;
         myVal = sampLeave + sampPot - g_leave.exchangeTempoCost;
@@ -661,32 +727,160 @@ SimResult simulate(const Request& req, const std::vector<Move>& candidates, int 
         sampPot = potTerm[i];
         myVal = scoreComp[i] + sampLeave + sampPot;
       }
-      rowVal[i] = myVal - oppBest;
-      if (diag) {
-        sumLeave[i] += sampLeave;
-        sumPot[i] += sampPot;
-        sumOpp[i] += oppBest;
+      row.val[i] = myVal - oppBest;
+      row.leave[i] = sampLeave;
+      row.pot[i] = sampPot;
+      row.opp[i] = oppBest;
+      row.filled = i + 1;
+    }
+  };
+
+  int done = 0;
+  const int nSamples = static_cast<int>(racks.size());
+  const int threads = simThreadCount(req.threads, nSamples);
+  if (threads > 1 && req.unlimited) {
+    // ── parallel schedule ────────────────────────────────────────────────────
+    // Only taken when the request is unlimited, which is the one case where
+    // every sample is known in advance to run. A wall-clock budget stops at
+    // "whatever sample we reached", and that is a sequential idea: handing it to
+    // threads would make the stopping point — and therefore the move — depend on
+    // how busy the machine happened to be.
+    std::vector<SampleRow> rows(nSamples);
+    for (SampleRow& r : rows) r = makeRow();
+    // A finished row is published with a release store and read with an acquire
+    // load, so the progress reporter only ever sums rows whose writes it can
+    // already see.
+    std::vector<std::atomic<uint8_t>> rowDone(nSamples);
+    for (std::atomic<uint8_t>& d : rowDone) d.store(0, std::memory_order_relaxed);
+
+    std::vector<SampleWorker> workers;
+    workers.reserve(threads);  // no reallocation: each thread holds one element
+    for (int t = 0; t < threads; t++) workers.push_back(makeWorker());
+
+    std::atomic<int> nextSample{0};
+    std::atomic<int> completed{0};
+    auto claimAndRun = [&](int t) {
+      const int s = nextSample.fetch_add(1, std::memory_order_relaxed);
+      if (s >= nSamples) return false;
+      runSample(s, workers[t], rows[s], false, 0);
+      rowDone[s].store(1, std::memory_order_release);
+      completed.fetch_add(1, std::memory_order_release);
+      return true;
+    };
+
+    // Worker 0 is the calling thread, and it takes a share of the samples rather
+    // than only supervising. It is also the ONLY thread allowed to report
+    // progress: `report()` reaches the UI through an EM_JS hook installed on the
+    // host worker's global scope, and a pthread is its own Worker with its own
+    // global scope, where that hook does not exist.
+    std::vector<std::thread> pool;
+    pool.reserve(threads - 1);
+    for (int t = 1; t < threads; t++) {
+      // A device that will not hand out another thread is not an error — it is a
+      // device that runs the same search with fewer hands. Whatever started
+      // keeps working, and one thread is always available: this one.
+      try {
+        pool.emplace_back([&, t] { while (claimAndRun(t)) {} });
+      } catch (const std::system_error&) {
+        break;
       }
     }
-    if (!rowComplete) break;
-    for (size_t i = 0; i < candidates.size(); i++) {
-      accum[i] += rowVal[i];
-      accumSq[i] += rowVal[i] * rowVal[i];
-      seen[i]++;
-    }
-    done = s + 1;
+    const int started = static_cast<int>(pool.size()) + 1;
 
-    const double elapsed = msSince(start);
-    const double eta = std::min(elapsed / done * (racks.size() - done),
-                                std::max(0.0, budgetMs - elapsed));
-    int bestScore = 0;
-    double bestAcc = -1e18;
-    for (size_t i = 0; i < candidates.size(); i++)
-      if (accum[i] > bestAcc) { bestAcc = accum[i]; bestScore = candidates[i].score; }
-    report("sim", 100.0 * done / racks.size(), elapsed, eta, bestScore,
-           "candidates=" + std::to_string(candidates.size()) + " samples=" +
-               std::to_string(done) + "/" + std::to_string(racks.size()));
-    if (elapsed > budgetMs && done >= 3) break;
+    // Progress, from the calling thread only. Percent and ETA come from the
+    // shared counter. `bestScore` is summed over whatever rows have landed so
+    // far, which makes it a UI hint that can differ from run to run — it is
+    // deliberately NOT `accum`, which is built by the ordered reduction after
+    // the join and is the only thing the decision is allowed to come from.
+    double lastReportMs = 0;
+    std::vector<double> partial(candidates.size(), 0.0);
+    auto reportProgress = [&](bool force) {
+      const double elapsed = msSince(start);
+      if (!force && elapsed - lastReportMs < 250) return;
+      lastReportMs = elapsed;
+      const int doneNow = completed.load(std::memory_order_acquire);
+      const double eta =
+          doneNow > 0 ? elapsed / doneNow * (nSamples - doneNow) : 0.0;
+      // Recomputed from the landed rows rather than carried forward, so a row
+      // can never be counted twice however the threads interleave.
+      std::fill(partial.begin(), partial.end(), 0.0);
+      for (int s = 0; s < nSamples; s++) {
+        if (rowDone[s].load(std::memory_order_acquire) == 0) continue;
+        for (size_t i = 0; i < candidates.size(); i++) partial[i] += rows[s].val[i];
+      }
+      int bestScore = 0;
+      double bestAcc = -1e18;
+      for (size_t i = 0; i < candidates.size(); i++)
+        if (partial[i] > bestAcc) { bestAcc = partial[i]; bestScore = candidates[i].score; }
+      report("sim", 100.0 * doneNow / nSamples, elapsed, eta, bestScore,
+             "candidates=" + std::to_string(candidates.size()) + " samples=" +
+                 std::to_string(doneNow) + "/" + std::to_string(nSamples) +
+                 " threads=" + std::to_string(started));
+    };
+
+    while (claimAndRun(0)) reportProgress(false);
+    // The queue is empty but the last few samples are still running elsewhere.
+    // Sitting here keeps the bar moving through that tail instead of freezing it
+    // at whichever sample this thread happened to hand out last.
+    while (completed.load(std::memory_order_acquire) < nSamples) {
+      reportProgress(false);
+      std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+    for (std::thread& th : pool) th.join();
+    for (SampleWorker& w : workers) stats.nodesVisited += w.nodes;
+
+    // Reduce in sample order: same arithmetic, same order, therefore the same
+    // doubles the sequential loop would have produced. Double addition is not
+    // associative, so this ordering is the whole reason a parallel Super plays
+    // the same move as a sequential one.
+    for (int s = 0; s < nSamples; s++) {
+      const SampleRow& row = rows[s];
+      for (size_t i = 0; i < candidates.size(); i++) {
+        accum[i] += row.val[i];
+        accumSq[i] += row.val[i] * row.val[i];
+        seen[i]++;
+        if (diag) {
+          sumLeave[i] += row.leave[i];
+          sumPot[i] += row.pot[i];
+          sumOpp[i] += row.opp[i];
+        }
+      }
+    }
+    done = nSamples;
+    reportProgress(true);
+  } else {
+    SampleWorker worker = makeWorker();
+    SampleRow row = makeRow();
+    for (int s = 0; s < nSamples; s++) {
+      runSample(s, worker, row, true, done);
+      if (diag) {
+        for (size_t i = 0; i < row.filled; i++) {
+          sumLeave[i] += row.leave[i];
+          sumPot[i] += row.pot[i];
+          sumOpp[i] += row.opp[i];
+        }
+      }
+      if (!row.complete) break;
+      for (size_t i = 0; i < candidates.size(); i++) {
+        accum[i] += row.val[i];
+        accumSq[i] += row.val[i] * row.val[i];
+        seen[i]++;
+      }
+      done = s + 1;
+
+      const double elapsed = msSince(start);
+      const double eta = std::min(elapsed / done * (nSamples - done),
+                                  std::max(0.0, budgetMs - elapsed));
+      int bestScore = 0;
+      double bestAcc = -1e18;
+      for (size_t i = 0; i < candidates.size(); i++)
+        if (accum[i] > bestAcc) { bestAcc = accum[i]; bestScore = candidates[i].score; }
+      report("sim", 100.0 * done / nSamples, elapsed, eta, bestScore,
+             "candidates=" + std::to_string(candidates.size()) + " samples=" +
+                 std::to_string(done) + "/" + std::to_string(nSamples));
+      if (elapsed > budgetMs && done >= 3) break;
+    }
+    stats.nodesVisited += worker.nodes;
   }
 
   // Rank by mean − λ·stddev: a move that is usually good but occasionally lets

@@ -29,6 +29,11 @@ test-static: build $(SRC) $(HDR) tests/test_static_l1.cpp
 	$(CXX) $(CXXFLAGS) -o build/test_static_l1 tests/test_static_l1.cpp $(SRC)
 	./build/test_static_l1
 
+# The parallel sample loop's whole contract: same decision at every thread count.
+test-parallel-sim: build $(SRC) $(HDR) tests/test_parallel_sim.cpp
+	$(CXX) $(CXXFLAGS) -o build/test_parallel_sim tests/test_parallel_sim.cpp $(SRC)
+	./build/test_parallel_sim
+
 # Revision 2 request-local work accounting.
 test-work-ledger: build $(SRC) $(HDR) tests/test_work_ledger.cpp
 	$(CXX) $(CXXFLAGS) -o build/test_work_ledger tests/test_work_ledger.cpp
@@ -87,7 +92,8 @@ test-paired-race: build $(SRC) $(HDR) tests/test_paired_race.cpp
 	./build/test_paired_race
 
 test-v2: test-work-ledger test-transition test-root-catalogue test-world-deck \
-	test-opponent-search test-decision-search test-reply-index test-paired-race
+	test-opponent-search test-decision-search test-reply-index test-paired-race \
+	test-parallel-sim
 
 # Measurement-only translation unit: linked into the CLI, deliberately kept out
 # of SRC so it never reaches the WASM bundle or the test binaries.
@@ -124,7 +130,42 @@ wasm: build $(SRC) $(HDR) src/wasm_api.cpp
 		-s EXPORTED_RUNTIME_METHODS=UTF8ToString,stringToUTF8,lengthBytesUTF8 \
 		-s STACK_SIZE=4MB
 
-.PHONY: build test test-bot test-inc test-static test-work-ledger test-transition test-root-catalogue test-world-deck test-opponent-search test-decision-search test-reply-index verify-reply-index test-paired-race test-v2 cli deep-bench deep-credit-curve gate6 gate7 wasm deploy-ui
+# WASM build, threaded. Same engine, same schedule, same move — the sample loop
+# just runs on more than one core (docs/parallel-sample-loop.md).
+#
+# This is a SECOND artifact rather than a replacement, because a -pthread module
+# cannot instantiate at all without SharedArrayBuffer, and that needs the page to
+# be cross-origin isolated (COOP/COEP). The client checks `crossOriginIsolated`
+# and imports whichever module the page can actually run, so a site that has not
+# set the headers keeps working on the single-threaded one.
+#
+# PTHREAD_POOL_SIZE is a JS expression evaluated at startup, not a build-time
+# constant: every pooled worker costs ~13.5 MB resident the moment the module
+# comes up, whether or not it is ever used. Baking in 8 would charge a two-core
+# phone ~97 MB for six workers it will never schedule. `__amathThreads` is set by
+# the host worker just before instantiation, and the same number is sent as the
+# request's `threads`, so the pool and the search can never disagree.
+#
+# POOL_SIZE_STRICT=2 is a guard against asking for more threads than the pool
+# holds. That case should be unreachable — superWorker.ts derives the pool size
+# and the request's `threads` from ONE number — because the browser behaviour of
+# overflowing the pool is the bad kind of unknown: pthread_create needs the host
+# worker's event loop to spawn a Worker, and that loop is blocked inside
+# _engine_handle for the whole search. Node happens to satisfy the overflow and
+# return the right answer, which proves nothing about a browser; the strict flag
+# is there to turn a possible hang into a possible abort, and an abort at least
+# surfaces as worker `onerror` and falls back to the backend engine.
+wasm-mt: build $(SRC) $(HDR) src/wasm_api.cpp
+	$(EMCC) -std=c++20 -O3 -DNDEBUG -o build/amath_engine_mt.mjs src/wasm_api.cpp $(SRC) \
+		-s MODULARIZE=1 -s EXPORT_ES6=1 -s SINGLE_FILE=1 \
+		-s ENVIRONMENT=worker,web -s ALLOW_MEMORY_GROWTH=1 \
+		-s EXPORTED_FUNCTIONS=_engine_handle,_engine_alloc,_engine_free \
+		-s EXPORTED_RUNTIME_METHODS=UTF8ToString,stringToUTF8,lengthBytesUTF8 \
+		-s STACK_SIZE=4MB \
+		-pthread -s PTHREAD_POOL_SIZE='globalThis.__amathThreads||1' \
+		-s PTHREAD_POOL_SIZE_STRICT=2
+
+.PHONY: build test test-bot test-inc test-static test-parallel-sim test-work-ledger test-transition test-root-catalogue test-world-deck test-opponent-search test-decision-search test-reply-index verify-reply-index test-paired-race test-v2 cli deep-bench deep-credit-curve gate6 gate7 wasm wasm-mt deploy-ui
 
 # The browser build is production again: the Super bot runs on the player's
 # device, so this artifact ships. It lands inside EQ-Lab's bundled source tree
@@ -132,5 +173,9 @@ wasm: build $(SRC) $(HDR) src/wasm_api.cpp
 # and it is reached ONLY through a dynamic import inside a Web Worker, so it
 # stays a lazily fetched chunk rather than part of the app's first load.
 # tests/engine-in-browser.test.ts is what holds that line.
-deploy-ui: wasm
+# Both artifacts ship: the client picks between them at runtime on
+# `crossOriginIsolated`, so the single-threaded one is the floor that always
+# works and the threaded one is the upgrade a cross-origin-isolated page gets.
+deploy-ui: wasm wasm-mt
 	cp build/amath_engine.mjs ../EQ-Lab/src/bot/engine/amath_engine.mjs
+	cp build/amath_engine_mt.mjs ../EQ-Lab/src/bot/engine/amath_engine_mt.mjs
