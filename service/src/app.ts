@@ -39,7 +39,7 @@ import {
 import { type Caller, UnauthenticatedError, bearerFrom, createTokenVerifier } from "./auth.js";
 import { seedFor, toEngineRequest, toStudyEngineRequest } from "./adapter.js";
 import { CanonicalStateError, otherSide } from "./canonical.js";
-import { clientSuperAllowedFor, type ServiceConfig } from "./config.js";
+import type { ServiceConfig } from "./config.js";
 import {
   EngineCancelledError,
   EngineFailureError,
@@ -398,18 +398,11 @@ export function createApp(deps: AppDependencies) {
       // operator should never have to read the environment to find out whether
       // it is on. It is off in every normal deployment.
       clientSuper: {
+        // On means every authenticated player computes their own Super moves;
+        // off means they all take the backend path. There is no audience field
+        // beside it because there is no audience to report — signing in is the
+        // whole of the condition.
         enabled: config.clientSideSuper,
-        // WHO actually gets it. `enabled: true` with an audience of 0 serves the
-        // backend path to everybody, which looks like a broken rollout unless
-        // the audience is on the same screen as the switch.
-        audience:
-          !config.clientSideSuper
-            ? "nobody (flag off)"
-            : config.clientSideSuperUserIds.length === 0
-              ? "nobody (no CLIENT_SIDE_SUPER_USER_IDS set)"
-              : config.clientSideSuperUserIds[0] === "*"
-                ? "everyone (general availability)"
-                : `${config.clientSideSuperUserIds.length} champion(s)`,
         engineVersion: SUPER_ENGINE_VERSION,
         weightsVersion: SUPER_WEIGHTS_VERSION,
         adaptiveBudget: config.superAdaptiveBudget ? "ON (reduces Super strength)" : "off",
@@ -794,7 +787,10 @@ export function createApp(deps: AppDependencies) {
   // fetches `v1` for as long as it runs, and for as long as anyone wants to
   // replay it, even after `v2` becomes the default for new games.
   app.get("/v1/bot-config", async (c) => {
-    const caller = await authenticate(c);
+    // Authorisation, in full. Rejects an unsigned caller before any of the
+    // rollout state below is read, and the identity is not needed beyond that:
+    // every authenticated player gets the same answer.
+    await authenticate(c);
     const requested = c.req.query("weightsVersion");
     if (requested !== undefined && !isKnownWeightsVersion(requested)) {
       // Refused, not silently defaulted. A game pinned to a version this
@@ -803,17 +799,18 @@ export function createApp(deps: AppDependencies) {
       // requested version's name is the one outcome pinning exists to prevent.
       throw new BadRequestError(`This deployment does not carry weights version "${requested}".`);
     }
-    // Cacheable for a short while and never shared. This matters more now that
-    // the response varies per CALLER: `private` keeps it in the requesting
-    // browser's own cache, where a shared cache holding one Champion's
-    // `clientSuperEnabled: true` cannot serve it to a general user.
+    // Cacheable for a short while and never shared: the flag is per-deployment
+    // but the response is behind an Authorization header, and a shared cache
+    // holding it would serve one population's rollout state to another.
     c.header("Cache-Control", "private, max-age=300");
     return c.json(
       superClientConfig({
-        // Per-CALLER, not per-deployment. The flag is the master switch and the
-        // allowlist is the audience; a signed-in player who is not a Champion
-        // gets `false` here and plays the backend path, which is untouched.
-        clientSuperEnabled: clientSuperAllowedFor(config, caller.userId),
+        // One deployment-wide switch, for every authenticated caller. The
+        // authorisation happened above, in `authenticate()`: an unsigned request
+        // never reaches this line. Nothing further is checked here on purpose —
+        // who holds an account is the approval process's answer, and a second
+        // list beside it could only ever disagree with the first.
+        clientSuperEnabled: config.clientSideSuper,
         adaptiveBudgetEnabled: config.superAdaptiveBudget,
         ...(requested !== undefined ? { weightsVersion: requested } : {}),
       }),

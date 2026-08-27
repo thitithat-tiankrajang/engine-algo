@@ -97,13 +97,24 @@ export type ServiceConfig = {
   /** Hard ceiling on cached engine results, evicted least-recently-used. */
   jobCacheMax: number;
   /**
-   * Whether Champion clients may run the Super search on their own device.
+   * Whether signed-in players may run the Super search on their own device.
    *
-   * The rollout switch, and deliberately a SERVER-side one: the point of the
-   * client-side path is that it costs this service nothing, so the moment it
-   * misbehaves the fix has to be available without shipping anything to a
-   * browser. Off, every Super turn falls back to the existing backend path,
-   * which is left completely intact.
+   * The ONE switch for the whole client-side rollout, and deliberately a
+   * SERVER-side one: the point of the client-side path is that it costs this
+   * service nothing, so the moment it misbehaves the fix has to be available
+   * without shipping anything to a browser. Off, every Super turn falls back to
+   * the existing backend path, which is left completely intact.
+   *
+   * ── Who gets it, and why there is no list ───────────────────────────────
+   *
+   * Every AUTHENTICATED caller, and nobody else. There is no allowlist here and
+   * there must not be one: this endpoint already runs `authenticate()`, which
+   * rejects an unsigned request before this flag is ever read, and the project's
+   * account-approval process is what decides who holds an account in the first
+   * place. A second list of user ids beside it would be a duplicate permission
+   * system — one more place for the two answers to disagree, and one more thing
+   * to keep in step with approvals for no gain the approval boundary does not
+   * already give.
    *
    * It gates OFFERING the path, not the engine's correctness. A client already
    * mid-game when this is turned off finishes that game on the device it
@@ -111,27 +122,6 @@ export type ServiceConfig = {
    * switching engines mid-match is the one thing pinning exists to prevent.
    */
   clientSideSuper: boolean;
-  /**
-   * WHICH signed-in users may run Super on their own device.
-   *
-   * `clientSideSuper` above is the master switch; this is the audience. Both
-   * must agree before a client is offered the local path, and the audience
-   * defaults to NOBODY — an empty list with the flag on serves the backend path
-   * to everyone.
-   *
-   * That default is the point. The beta is explicitly Champions-only, and the
-   * failure mode of a deployment-wide boolean is silent and total: flip it and
-   * every signed-in player starts computing Super moves on their own laptop,
-   * with no way to tell from the flag alone that it happened. Failing closed
-   * means the blast radius of a mistaken `CLIENT_SIDE_SUPER=true` is zero
-   * players rather than all of them.
-   *
-   * Entries are Supabase user ids (`auth.uid()`), compared case-insensitively.
-   * The single entry `*` means every authenticated user and is how this beta
-   * eventually graduates — spelled out, so general availability is something
-   * somebody typed rather than something an empty variable did by accident.
-   */
-  clientSideSuperUserIds: string[];
   /**
    * EXPERIMENTAL: let the client trade Super's playing strength for latency.
    *
@@ -228,22 +218,6 @@ export function loadConfig(
     throw new Error("ENGINE_ALLOWED_ORIGINS must name origins explicitly; \"*\" is not accepted.");
   }
 
-  // The Champion allowlist. Lowercased once here so the per-request check is a
-  // plain comparison rather than a case fold on every config fetch.
-  const championIds = (env.CLIENT_SIDE_SUPER_USER_IDS ?? "")
-    .split(",")
-    .map((id) => id.trim().toLowerCase())
-    .filter(Boolean);
-  if (championIds.includes("*") && championIds.length > 1) {
-    // Ambiguous, and ambiguity here decides how many people get the beta. `*`
-    // alongside named ids reads as "these Champions, plus everyone", which is
-    // either a mistake or a leftover from graduating the beta — and both want
-    // a human to look rather than a guess.
-    throw new Error(
-      'CLIENT_SIDE_SUPER_USER_IDS may be "*" (everyone) or a list of user ids, not both.',
-    );
-  }
-
   // The CPU allowance the container actually has — the cgroup quota, not the
   // host's core count. See cpu.ts for why those differ and why it matters.
   const cpu = options.cpu ?? detectCpuLimit();
@@ -283,7 +257,6 @@ export function loadConfig(
     botResultTtlMs: integer(env, "ENGINE_BOT_RESULT_TTL_MS", 30 * 60 * 1000),
     jobCacheMax: boundedInteger(env, "ENGINE_JOB_CACHE_MAX", 256, 1, 100_000),
     clientSideSuper: flag(env, "CLIENT_SIDE_SUPER", false),
-    clientSideSuperUserIds: championIds,
     // EXPERIMENTAL, and off unless somebody deliberately turns it on. True
     // makes the client pick a reduced opponent-rack sample budget to fit the
     // latency targets, which is a change to how STRONG the bot plays and not
@@ -292,25 +265,4 @@ export function loadConfig(
     superAdaptiveBudget: flag(env, "SUPER_ADAPTIVE_BUDGET", false),
     validationConcurrency: boundedInteger(env, "ENGINE_VALIDATION_CONCURRENCY", 4, 1, 64),
   };
-}
-
-/**
- * May this signed-in user run Super on their own device?
- *
- * Both halves must agree: the deployment-wide switch must be on AND the user
- * must be in the audience. Deliberately one function rather than two checks at
- * the call site — a rollout gate that can be half-applied is a rollout gate
- * that eventually is.
- */
-export function clientSuperAllowedFor(config: ServiceConfig, userId: string): boolean {
-  if (!config.clientSideSuper) return false;
-  const audience = config.clientSideSuperUserIds;
-  if (audience.length === 0) return false;
-  if (audience.length === 1 && audience[0] === "*") return true;
-  // Folded HERE rather than trusting `loadConfig` to have done it. This function
-  // is exported and takes a plain `ServiceConfig`, so it is reachable with a
-  // hand-built one — and the bug that would cause is a Champion silently
-  // dropped from their own beta because a UUID was pasted in the wrong case.
-  const wanted = userId.trim().toLowerCase();
-  return audience.some((id) => id.trim().toLowerCase() === wanted);
 }

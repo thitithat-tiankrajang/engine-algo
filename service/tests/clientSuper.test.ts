@@ -69,20 +69,9 @@ function harness(overrides: Overrides = {}) {
   return { app, get, validate, runValidation };
 }
 
-/** The user id `fakeVerify` hands back for `Bearer token-1`. */
-const HARNESS_USER_ID = "user-1";
-
-/** A deployment where the calling user IS a Champion — both halves of the gate
- *  agreeing, which is the only combination that serves the local path. */
-function champion(overrides: Overrides = {}) {
-  return harness({
-    ...overrides,
-    config: {
-      clientSideSuper: true,
-      clientSideSuperUserIds: [HARNESS_USER_ID],
-      ...overrides.config,
-    },
-  });
+/** A deployment with the client-side rollout switched on. */
+function rolledOut(overrides: Overrides = {}) {
+  return harness({ ...overrides, config: { clientSideSuper: true, ...overrides.config } });
 }
 
 /** A bot room whose turn belongs to the engine — the only state in which any of
@@ -104,65 +93,55 @@ describe("GET /v1/bot-config", () => {
     const off = await harness().get("/v1/bot-config");
     expect(await off.json()).toMatchObject({ clientSuperEnabled: false });
 
-    const on = await champion().get("/v1/bot-config");
+    const on = await rolledOut().get("/v1/bot-config");
     expect(await on.json()).toMatchObject({ clientSuperEnabled: true });
   });
 
-  // ── who gets the beta ─────────────────────────────────────────────────────
+  // ── who gets the client-side path ────────────────────────────────────────
   //
-  // The rollout is Champions-only, and `clientSuperEnabled` is the single field
-  // that decides whether a browser computes Super moves. These tests are the
-  // guard on the audience, and the reason they are worth having is that the
-  // failure they prevent is silent and total: a deployment-wide boolean, once
-  // flipped, hands the local path to every signed-in player at once and nothing
-  // in the flag itself records that it happened.
+  // Every authenticated caller, and nobody else. The authorisation is the
+  // `authenticate()` call at the top of the route, which is the same boundary
+  // that decides whether the request may touch this service at all.
+  //
+  // An earlier revision added a second gate here — `CLIENT_SIDE_SUPER_USER_IDS`,
+  // a list of Champion user ids — and it was removed as a duplicate permission
+  // system. Who holds an account is already the approval process's answer; a
+  // second list of the same people is one more thing to keep in step, and one
+  // more way for the two answers to disagree without anybody noticing.
 
-  it("refuses a signed-in user who is not a Champion", async () => {
-    const response = await harness({
-      config: { clientSideSuper: true, clientSideSuperUserIds: ["someone-else"] },
-    }).get("/v1/bot-config");
-    // Not an error — a general user is not being refused a game, only the local
-    // engine. They play the backend path, which is untouched.
+  it("refuses an unauthenticated caller outright", async () => {
+    // The whole of the authorisation, and it runs before the flag is read.
+    const { app } = rolledOut();
+    expect((await app.request("/v1/bot-config")).status).toBe(401);
+  });
+
+  it("serves every authenticated caller the same answer", async () => {
+    // No per-user variation anywhere in the document. This is what lets the
+    // client cache it without keying by user.
+    const first = await rolledOut().get("/v1/bot-config");
+    const second = await rolledOut().get("/v1/bot-config");
+    expect(await first.json()).toEqual(await second.json());
+  });
+
+  it("turns the whole rollout off with the one switch", async () => {
+    // The operator's lever when the client-side path misbehaves: no allowlist
+    // to empty, no ids to remove, nothing that could outvote it.
+    const response = await harness({ config: { clientSideSuper: false } }).get("/v1/bot-config");
     expect(await response.json()).toMatchObject({ clientSuperEnabled: false });
   });
 
-  it("serves NOBODY when the flag is on but no audience is set", async () => {
-    // The fail-closed default, and the one most worth pinning down: setting
-    // CLIENT_SIDE_SUPER=true and forgetting the allowlist must reach zero
-    // players, not all of them.
-    const response = await harness({ config: { clientSideSuper: true } }).get("/v1/bot-config");
-    expect(await response.json()).toMatchObject({ clientSuperEnabled: false });
-  });
-
-  it("refuses a Champion when the master switch is off", async () => {
-    // Both halves have to agree. The switch is what an operator reaches for
-    // when the client-side path misbehaves, and an allowlist that could
-    // override it would make that reach useless.
+  it("ignores a leftover allowlist variable", async () => {
+    // A stale `CLIENT_SIDE_SUPER_USER_IDS` in a deployment's environment must
+    // not resurrect the removed gate, and in particular must not narrow the
+    // audience back down to the ids it happens to name.
     const response = await harness({
-      config: { clientSideSuper: false, clientSideSuperUserIds: [HARNESS_USER_ID] },
-    }).get("/v1/bot-config");
-    expect(await response.json()).toMatchObject({ clientSuperEnabled: false });
-  });
-
-  it("matches a Champion id case-insensitively", async () => {
-    // Supabase user ids are UUIDs, which get pasted into a dashboard by hand in
-    // whatever case the source happened to use. A Champion silently left out of
-    // their own beta because someone upper-cased a UUID is a bad afternoon.
-    const response = await harness({
-      config: { clientSideSuper: true, clientSideSuperUserIds: [HARNESS_USER_ID.toUpperCase()] },
-    }).get("/v1/bot-config");
-    expect(await response.json()).toMatchObject({ clientSuperEnabled: true });
-  });
-
-  it("opens the path to everyone only when `*` is spelled out", async () => {
-    const response = await harness({
-      config: { clientSideSuper: true, clientSideSuperUserIds: ["*"] },
+      config: { clientSideSuper: true, clientSideSuperUserIds: ["somebody-else"] },
     }).get("/v1/bot-config");
     expect(await response.json()).toMatchObject({ clientSuperEnabled: true });
   });
 
   it("names the versions a new game will be pinned to", async () => {
-    const response = await champion().get("/v1/bot-config");
+    const response = await rolledOut().get("/v1/bot-config");
     const body = (await response.json()) as Record<string, unknown>;
     expect(body.engineVersion).toBe(SUPER_ENGINE_VERSION);
     expect(body.weightsVersion).toBe(SUPER_WEIGHTS_VERSION);
@@ -405,7 +384,6 @@ describe("/health", () => {
     const body = (await (await app.request("/health")).json()) as {
       clientSuper: {
         enabled: boolean;
-        audience: string;
         engineVersion: string;
         weightsVersion: string;
         adaptiveBudget: string;
@@ -413,10 +391,6 @@ describe("/health", () => {
     };
     expect(body.clientSuper).toEqual({
       enabled: true,
-      // The switch is on and nobody is listed, which is a live misconfiguration
-      // rather than a working rollout — so /health says so in words instead of
-      // reporting a cheerful `enabled: true` that reaches no one.
-      audience: "nobody (no CLIENT_SIDE_SUPER_USER_IDS set)",
       engineVersion: SUPER_ENGINE_VERSION,
       weightsVersion: SUPER_WEIGHTS_VERSION,
       // The one switch that changes how STRONG the client-side bot plays.

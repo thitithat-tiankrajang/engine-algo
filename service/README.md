@@ -354,36 +354,32 @@ Required: `SUPABASE_URL`, `SUPABASE_PUBLISHABLE_KEY`, `ENGINE_ALLOWED_ORIGINS`.
 Recommended: `ENGINE_CONCURRENCY` set explicitly, so the pool size is a decision
 in the dashboard rather than an inference from a file the platform may change.
 
-For the Champion beta, two more — and **both** are required before any browser
-runs Super locally:
+For the client-side Super beta, one more:
 
 | Variable | Value | Effect |
 |---|---|---|
-| `CLIENT_SIDE_SUPER` | `true` | The master switch. Off, every Super turn takes the backend path. |
-| `CLIENT_SIDE_SUPER_USER_IDS` | comma-separated Supabase user ids | The audience. **Empty means nobody**, even with the switch on. |
+| `CLIENT_SIDE_SUPER` | `true` | Every **authenticated** player computes their own Super moves. Off, every Super turn takes the backend path. |
 
-The audience fails closed deliberately. A deployment-wide boolean, once flipped,
-hands the local path to every signed-in player at once, and nothing in the flag
-itself records that it happened — so `CLIENT_SIDE_SUPER=true` with no allowlist
-reaches **zero** players rather than all of them. `*` alone means everyone and is
-how the beta eventually graduates; `*` mixed with named ids is refused at boot
-rather than guessed at.
+One switch, and deliberately only one. Who may use the client-side path is
+"anyone signed in", because `/v1/bot-config` authenticates the caller and the
+project's account-approval process already decides who holds an account. An
+allowlist of user ids beside that would be a second answer to a question the
+platform has answered once, and two lists that must agree about the same people
+is one more thing to keep in step.
 
-Read the result off `/health`, which reports the switch and the audience
-together:
+Read the state off `/health`:
 
 ```json
 "clientSuper": {
   "enabled": true,
-  "audience": "3 champion(s)",
   "engineVersion": "super-v8",
   "weightsVersion": "v1",
   "adaptiveBudget": "off"
 }
 ```
 
-`"audience": "nobody (no CLIENT_SIDE_SUPER_USER_IDS set)"` is the misconfiguration
-to look for: the switch is on and the rollout is reaching no one.
+`"adaptiveBudget"` is the one to check on sight: anything other than `"off"`
+means the bot is playing deliberately weaker than Super.
 `PORT` and `ENGINE_BINARY_PATH` are already correct in the image.
 
 ## Client-side Super (Champion beta)

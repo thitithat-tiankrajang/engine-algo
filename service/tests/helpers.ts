@@ -274,11 +274,6 @@ export function baseConfig(overrides: Record<string, unknown> = {}) {
     // test that forgets gets the backend path, which is the safe direction to
     // be wrong in.
     clientSideSuper: false,
-    // The AUDIENCE, and it is empty for the same reason the flag is off: both
-    // have to be set before anybody gets the client-side path, so a test that
-    // means to exercise it has to say so twice. Fail-closed in the harness
-    // mirrors fail-closed in production.
-    clientSideSuperUserIds: [],
     superAdaptiveBudget: false,
     validationConcurrency: 4,
     ...overrides,

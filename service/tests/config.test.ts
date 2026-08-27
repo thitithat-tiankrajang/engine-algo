@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { clientSuperAllowedFor, loadConfig } from "../src/config.js";
+import { loadConfig } from "../src/config.js";
 
 const minimumEnv = {
   SUPABASE_URL: "https://example.supabase.co",
@@ -161,79 +161,44 @@ describe("reconnect result retention", () => {
   });
 });
 
-describe("the Champion rollout gate", () => {
-  // Two independent switches, and the deployment has to set BOTH before any
-  // browser runs Super locally. The tests below are mostly about what happens
-  // when only one of them is set, because that is the state a half-finished
-  // deployment is actually in.
-
-  it("admits nobody by default", () => {
-    const config = loadConfig(minimumEnv);
-    expect(config.clientSideSuper).toBe(false);
-    expect(config.clientSideSuperUserIds).toEqual([]);
-    expect(clientSuperAllowedFor(config, "user-1")).toBe(false);
+describe("the client-side Super rollout switch", () => {
+  it("is off unless the deployment turns it on", () => {
+    // The safe direction to be wrong in: an operator who sets nothing gets the
+    // backend path, which is the behaviour that predates all of this.
+    expect(loadConfig(minimumEnv).clientSideSuper).toBe(false);
   });
 
-  it("admits nobody when the switch is on but no audience is named", () => {
-    // The important one. CLIENT_SIDE_SUPER=true on its own must reach ZERO
-    // players — an operator who forgets the allowlist gets a no-op rollout,
-    // never a silent general release.
+  it("is the ONE switch — there is no second list beside it", () => {
+    // Deliberately asserted rather than merely absent from the code.
+    //
+    // An earlier revision paired this flag with `CLIENT_SIDE_SUPER_USER_IDS`,
+    // an allowlist of user ids. It was removed because it duplicated a decision
+    // the platform already makes: `/v1/bot-config` authenticates the caller, and
+    // who holds an account at all is the approval process's answer. Two lists
+    // that must agree about the same people is one more thing to keep in step
+    // and one more way to be quietly wrong.
+    //
+    // If a future change reintroduces one, this fails.
     const config = loadConfig({ ...minimumEnv, CLIENT_SIDE_SUPER: "true" });
-    expect(clientSuperAllowedFor(config, "user-1")).toBe(false);
+    expect(config.clientSideSuper).toBe(true);
+
+    // Narrowly scoped on purpose: `allowedOrigins` (CORS) and
+    // `maxAnalysisPerUser` (rate limiting) are unrelated and legitimate. What
+    // must not exist is a SECOND client-side-Super key naming an audience.
+    const audienceKeys = Object.keys(config).filter(
+      (key) => /champion/i.test(key) || (key.startsWith("clientSideSuper") && key !== "clientSideSuper"),
+    );
+    expect(audienceKeys).toEqual([]);
   });
 
-  it("admits nobody when an audience is named but the switch is off", () => {
-    // The switch is what an operator reaches for when the client-side path
-    // misbehaves. An allowlist that could outvote it would make that reach
-    // useless at the exact moment it matters.
-    const config = loadConfig({
-      ...minimumEnv,
-      CLIENT_SIDE_SUPER: "false",
-      CLIENT_SIDE_SUPER_USER_IDS: "user-1",
-    });
-    expect(clientSuperAllowedFor(config, "user-1")).toBe(false);
-  });
-
-  it("admits the named Champions and nobody else", () => {
-    const config = loadConfig({
-      ...minimumEnv,
-      CLIENT_SIDE_SUPER: "true",
-      CLIENT_SIDE_SUPER_USER_IDS: " user-1 , user-2 ",
-    });
-    expect(config.clientSideSuperUserIds).toEqual(["user-1", "user-2"]);
-    expect(clientSuperAllowedFor(config, "user-1")).toBe(true);
-    expect(clientSuperAllowedFor(config, "user-2")).toBe(true);
-    expect(clientSuperAllowedFor(config, "user-3")).toBe(false);
-  });
-
-  it("ignores the case a UUID was pasted in", () => {
+  it("ignores an allowlist variable if one is still set in the environment", () => {
+    // A leftover from the removed design must not resurrect it. Setting the old
+    // variable changes nothing: the flag alone decides.
     const config = loadConfig({
       ...minimumEnv,
       CLIENT_SIDE_SUPER: "true",
-      CLIENT_SIDE_SUPER_USER_IDS: "A1B2C3D4-0000-4000-8000-000000000000",
+      CLIENT_SIDE_SUPER_USER_IDS: "some-old-uuid,another-one",
     });
-    expect(clientSuperAllowedFor(config, "a1b2c3d4-0000-4000-8000-000000000000")).toBe(true);
-  });
-
-  it("opens the path to everyone only when `*` is spelled out alone", () => {
-    const config = loadConfig({
-      ...minimumEnv,
-      CLIENT_SIDE_SUPER: "true",
-      CLIENT_SIDE_SUPER_USER_IDS: "*",
-    });
-    expect(clientSuperAllowedFor(config, "anybody-at-all")).toBe(true);
-  });
-
-  it("refuses `*` mixed with named ids rather than guessing", () => {
-    // "These Champions, plus everyone" is either a mistake or a half-finished
-    // graduation of the beta, and both want a human to look. Refusing at boot
-    // is the loudest available way to ask.
-    expect(() =>
-      loadConfig({
-        ...minimumEnv,
-        CLIENT_SIDE_SUPER: "true",
-        CLIENT_SIDE_SUPER_USER_IDS: "user-1,*",
-      }),
-    ).toThrow(/may be "\*" \(everyone\) or a list of user ids, not both/);
+    expect(config.clientSideSuper).toBe(true);
   });
 });
