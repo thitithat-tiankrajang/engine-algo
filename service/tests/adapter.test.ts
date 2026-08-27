@@ -128,7 +128,7 @@ describe("engine request", () => {
     // budget was advice it was unable to take.
     const staticRequest = toEngineRequest(state, {
       side: "A",
-      difficulty: "easy",
+      difficulty: "static",
       solver: "static",
       budgetMs: 200,
       events: [],
@@ -137,6 +137,24 @@ describe("engine request", () => {
     // Callers that say nothing keep the engine's default (the sampling search),
     // so adding the field changed no existing path.
     expect("solver" in request).toBe(false);
+  });
+
+  it("passes `unlimited` only when the tier asks for it", () => {
+    // The flag has to be ABSENT rather than false for every other tier: the
+    // engine reads presence, and a stray `unlimited: false` on the hot path
+    // would be one more thing to get wrong later.
+    const superRequest = toEngineRequest(state, {
+      side: "A",
+      difficulty: "super",
+      unlimited: true,
+      events: [],
+    });
+    expect(superRequest.unlimited).toBe(true);
+    expect("unlimited" in request).toBe(false);
+    expect(
+      "unlimited" in
+        toEngineRequest(state, { side: "A", difficulty: "max", unlimited: false, events: [] }),
+    ).toBe(false);
   });
 });
 

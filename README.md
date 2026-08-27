@@ -1,8 +1,25 @@
 # amath-engine
 
-Competitive A-Math engine for [EQ-Lab](../EQ-Lab), written in C++20 and shipped
-to the browser as a single-file WASM module running inside a Web Worker.
-No server, no network round-trip: the engine runs on the player's machine.
+Competitive A-Math engine for [EQ-Lab](../EQ-Lab), written in C++20 and compiled
+two ways from one source tree:
+
+- a **native binary** (`amath_cli`) run by the backend engine service
+  ([`service/`](service/)) for turn analysis and for the `medium`/`hard`/`max`
+  bot tiers, and
+- a **single-file WASM module** run in a Web Worker on the player's own machine
+  for the `super` tier ([`docs/client-side-super.md`](docs/client-side-super.md)).
+
+Which one answers a given turn is a deployment decision, not a code difference:
+same search, same evaluator, same move generator, same full 160-sample schedule,
+and the same seed for a given position. The device a Champion happens to own
+changes how long the move takes and nothing about how well it is played.
+
+The split exists because `super` is a search that runs to **completion** rather
+than to a deadline — a measured 180 CPU-seconds a move (p50 197 s, range
+106–213 s over five positions). Centrally, that is 20 Super moves
+an hour per core against the dozen a game needs — one to two concurrent Super
+games. On the player's device it is one player per player. See [the benchmark](docs/client-side-super-benchmark.md) for what that
+costs and what it buys.
 
 ## Design highlights
 
@@ -43,15 +60,28 @@ Native tests and CLI (needs clang++ with C++20):
 make test        # rules + movegen completeness vs brute force
 make test-bot    # endgame exactness vs reference negamax (slow, ~5 min)
 make test-static # Level-1 static path: generation bound, determinism, legality
-make cli         # build/amath_cli: bench | selfplay | golden | request
+make cli         # build/amath_cli: bench | selfplay | golden | request | positions
+```
+
+Latency measurement (see [docs/client-side-super-benchmark.md](docs/client-side-super-benchmark.md)):
+
+```bash
+./build/amath_cli positions 6 20260827 build/positions.jsonl   # corpus from self-play
+node scripts/bench_latency.mjs --engine wasm --tier sample:8 --corpus build/bench_game.jsonl
+node scripts/bench_report.mjs build/bench_*.jsonl
 ```
 
 WASM (needs emscripten):
 
 ```bash
 make wasm        # build/amath_engine.mjs (single file, ES module)
-cp build/amath_engine.mjs ../EQ-Lab/src/bot/amath_engine.mjs
+make deploy-ui   # ...and copy it into EQ-Lab/src/bot/engine/
 ```
+
+The artifact is production code: it is what the `super` tier runs. It is
+reached only through a dynamic import inside a Web Worker, so it stays a lazily
+fetched chunk rather than part of EQ-Lab's first load —
+`EQ-Lab/tests/engine-in-browser.test.ts` asserts that rather than trusting it.
 
 ## Cross-checking against EQ-Lab
 

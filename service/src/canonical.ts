@@ -78,7 +78,7 @@ export class CanonicalStateError extends Error {
   override readonly name = "CanonicalStateError";
 }
 
-const BOARD_SIZE = 15;
+export const BOARD_SIZE = 15;
 
 function isSide(value: unknown): value is Side {
   return value === "A" || value === "B";

@@ -2,7 +2,9 @@ CXX ?= clang++
 CXXFLAGS ?= -std=c++20 -O2 -Wall -Wextra
 EMCC ?= emcc
 
-SRC = src/rules.cpp src/movegen.cpp src/eval.cpp src/engine.cpp
+SRC = src/rules.cpp src/movegen.cpp src/eval.cpp src/decision_search.cpp \
+	src/opponent_search.cpp src/paired_race.cpp src/reply_index.cpp src/root_catalogue.cpp src/state_transition.cpp \
+	src/world_deck.cpp src/engine.cpp
 HDR = $(wildcard src/*.hpp)
 
 build:
@@ -27,8 +29,88 @@ test-static: build $(SRC) $(HDR) tests/test_static_l1.cpp
 	$(CXX) $(CXXFLAGS) -o build/test_static_l1 tests/test_static_l1.cpp $(SRC)
 	./build/test_static_l1
 
-cli: build $(SRC) $(HDR) src/cli.cpp
-	$(CXX) $(CXXFLAGS) -o build/amath_cli src/cli.cpp $(SRC)
+# Revision 2 request-local work accounting.
+test-work-ledger: build $(SRC) $(HDR) tests/test_work_ledger.cpp
+	$(CXX) $(CXXFLAGS) -o build/test_work_ledger tests/test_work_ledger.cpp
+	./build/test_work_ledger
+
+# Revision 2 production-rule state transitions and rollback.
+test-transition: build $(SRC) $(HDR) tests/test_state_transition.cpp
+	$(CXX) $(CXXFLAGS) -o build/test_state_transition tests/test_state_transition.cpp \
+		src/rules.cpp src/state_transition.cpp
+	./build/test_state_transition
+
+# Revision 2 immutable, assignment-aware root catalogue.
+test-root-catalogue: build $(SRC) $(HDR) tests/test_root_catalogue.cpp
+	$(CXX) $(CXXFLAGS) -o build/test_root_catalogue tests/test_root_catalogue.cpp \
+		src/rules.cpp src/movegen.cpp src/root_catalogue.cpp
+	./build/test_root_catalogue
+
+# Revision 2 deterministic shared hidden-world schedule.
+test-world-deck: build $(SRC) $(HDR) tests/test_world_deck.cpp
+	$(CXX) $(CXXFLAGS) -o build/test_world_deck tests/test_world_deck.cpp src/world_deck.cpp
+	./build/test_world_deck
+
+# Revision 2 symmetric endpoint and non-clairvoyant opponent policy.
+test-opponent-search: build $(SRC) $(HDR) tests/test_opponent_search.cpp
+	$(CXX) $(CXXFLAGS) -o build/test_opponent_search tests/test_opponent_search.cpp \
+		src/rules.cpp src/movegen.cpp src/eval.cpp src/root_catalogue.cpp \
+		src/state_transition.cpp src/opponent_search.cpp
+	./build/test_opponent_search
+
+# Revision 2 benchmark reference composed through the DecisionSearch seam.
+test-decision-search: build $(SRC) $(HDR) tests/test_decision_search.cpp
+	$(CXX) $(CXXFLAGS) -o build/test_decision_search tests/test_decision_search.cpp \
+		src/rules.cpp src/movegen.cpp src/eval.cpp src/root_catalogue.cpp \
+		src/state_transition.cpp src/world_deck.cpp src/opponent_search.cpp src/paired_race.cpp src/reply_index.cpp \
+		src/decision_search.cpp
+	./build/test_decision_search
+
+# Revision 2 exact base reply index plus candidate-local delta generation.
+test-reply-index: build $(SRC) $(HDR) tests/test_reply_index.cpp
+	$(CXX) $(CXXFLAGS) -o build/test_reply_index tests/test_reply_index.cpp \
+		src/rules.cpp src/movegen.cpp src/eval.cpp src/root_catalogue.cpp src/reply_index.cpp \
+		src/state_transition.cpp src/opponent_search.cpp
+	./build/test_reply_index
+
+# Long G5 exactness gate. Kept separate from the fast suite so local iteration
+# stays cheap; CI/release qualification runs the required 10,000 triples.
+verify-reply-index: build $(SRC) $(HDR) tests/test_reply_index.cpp
+	$(CXX) $(CXXFLAGS) -o build/test_reply_index tests/test_reply_index.cpp \
+		src/rules.cpp src/movegen.cpp src/eval.cpp src/root_catalogue.cpp src/reply_index.cpp \
+		src/state_transition.cpp src/opponent_search.cpp
+	./build/test_reply_index 10000 20260813
+
+# Revision 2 common-world paired elimination.
+test-paired-race: build $(SRC) $(HDR) tests/test_paired_race.cpp
+	$(CXX) $(CXXFLAGS) -o build/test_paired_race tests/test_paired_race.cpp src/paired_race.cpp
+	./build/test_paired_race
+
+test-v2: test-work-ledger test-transition test-root-catalogue test-world-deck \
+	test-opponent-search test-decision-search test-reply-index test-paired-race
+
+# Measurement-only translation unit: linked into the CLI, deliberately kept out
+# of SRC so it never reaches the WASM bundle or the test binaries.
+BENCH = src/deep_bench.cpp
+
+cli: build $(SRC) $(HDR) src/cli.cpp $(BENCH)
+	$(CXX) $(CXXFLAGS) -o build/amath_cli src/cli.cpp $(BENCH) $(SRC)
+
+# Deep/Max compute-allocation experiments. Long-running measurement, not tests:
+# each prints a table and none of them can change production routing.
+# Results and interpretation live in docs/deep-compute-allocation-report.md.
+deep-bench: cli
+	./build/amath_cli deep-bench 24
+
+deep-credit-curve: cli
+	./build/amath_cli deep-credit-curve 12
+
+# G6 admission recall/regret and G7 uniform-vs-paired at equal credits.
+gate6: cli
+	./build/amath_cli g6 24
+
+gate7: cli
+	./build/amath_cli g7 16
 
 # WASM build: single-file ES module, no threads, deterministic and easy to
 # bundle from Vite (import in a Web Worker).
@@ -42,9 +124,13 @@ wasm: build $(SRC) $(HDR) src/wasm_api.cpp
 		-s EXPORTED_RUNTIME_METHODS=UTF8ToString,stringToUTF8,lengthBytesUTF8 \
 		-s STACK_SIZE=4MB
 
-.PHONY: build test test-bot test-inc test-static cli wasm
+.PHONY: build test test-bot test-inc test-static test-work-ledger test-transition test-root-catalogue test-world-deck test-opponent-search test-decision-search test-reply-index verify-reply-index test-paired-race test-v2 cli deep-bench deep-credit-curve gate6 gate7 wasm deploy-ui
 
+# The browser build is production again: the Super bot runs on the player's
+# device, so this artifact ships. It lands inside EQ-Lab's bundled source tree
+# (src/bot/engine/) rather than in tools/, because Vite has to resolve it —
+# and it is reached ONLY through a dynamic import inside a Web Worker, so it
+# stays a lazily fetched chunk rather than part of the app's first load.
+# tests/engine-in-browser.test.ts is what holds that line.
 deploy-ui: wasm
-	cp build/amath_engine.mjs ../EQ-Lab/tools/engine-wasm/amath_engine.mjs
-
-.PHONY: build test test-bot test-inc test-static cli wasm deploy-ui
+	cp build/amath_engine.mjs ../EQ-Lab/src/bot/engine/amath_engine.mjs

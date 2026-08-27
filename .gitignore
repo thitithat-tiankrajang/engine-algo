@@ -1,6 +1,19 @@
 build/
 *.o
 
+node_modules/
 service/node_modules/
 service/dist/
-service/.env.local
+
+# Every local environment file, including BACKUPS.
+#
+# `service/.env.local` alone was not enough: a `.env.local.bak` sitting beside it
+# carried the same Supabase URL and publishable key and was NOT ignored, so the
+# first `git add -A` would have committed live credentials to a public remote.
+# Backups and variants are exactly the files that get made in a hurry and
+# forgotten, so the pattern covers them rather than naming them one at a time.
+.env
+.env.*
+!.env.example
+
+.DS_Store

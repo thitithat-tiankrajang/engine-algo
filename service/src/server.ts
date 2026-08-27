@@ -27,6 +27,7 @@ const registry = new JobRegistry(queue, {
 const budget = new ComputeBudget({
   perWindow: config.budgetPerWindow,
   windowMs: config.budgetWindowMs,
+  enforced: config.budgetEnforced,
 });
 const analysisSlots = new ConcurrencyLimit(config.maxAnalysisPerUser);
 
@@ -63,6 +64,20 @@ const server = serve({ fetch: app.fetch, port: config.port }, (info) => {
       `concurrency=${config.concurrency} (${config.concurrencySource}), ` +
       `maxWaiting=${config.maxWaiting}, maxQueueWait=${config.maxQueueWaitMs}ms`,
   );
+  console.log(
+    config.budgetEnforced
+      ? `budget: ${config.budgetPerWindow} units per ${Math.round(config.budgetWindowMs / 1000)}s per user`
+      : "budget: OFF — no per-user compute metering (ENGINE_BUDGET_ENFORCED=false)",
+  );
+  if (!config.budgetEnforced) {
+    // Said loudly and every boot. A shared deployment running without metering
+    // is one account away from owning the queue, and the failure looks like
+    // "the engine got slow" rather than like a setting.
+    console.warn(
+      "Per-user compute metering is disabled. That is right for a single-user machine and " +
+        "wrong for anything shared: one caller can hold the queue indefinitely.",
+    );
+  }
   if (config.concurrencySource === "derived" && config.cpu.source === "parallelism") {
     console.warn(
       "No cgroup CPU quota was readable, so concurrency was derived from the affinity mask. " +

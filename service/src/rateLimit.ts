@@ -6,16 +6,19 @@
 //
 // Two independent limits, because they fail differently:
 //
-//   • A cost budget over a sliding window, weighted by how expensive a level
-//     actually is. Asking for `max` analysis repeatedly is what has to be
-//     expensive to do, and charging by wall-clock potential rather than by
-//     request count is the only way to express that.
-//   • A cap on concurrent analysis jobs per user, so a single account cannot
-//     hold several queue slots at once no matter how much budget it has left.
+//   • A cost budget over a sliding window, weighted by how expensive the work
+//     actually is — charging by wall-clock potential rather than by request
+//     count is the only way to express that a `max` search is not one request.
+//   • A cap on concurrent jobs per user, so a single account cannot hold
+//     several queue slots at once no matter how much budget it has left.
 //
-// Bot moves are metered too, but generously: a bot move is a consequence of a
-// game the user is legitimately playing, and the turn structure already limits
-// how often one can be requested.
+// WHO each applies to is `app.ts`'s decision, not this file's. Today the
+// concurrency cap governs analysis — one in flight per account, queued or
+// running — while the budget governs bot turns, generously, because a bot move
+// is a consequence of a game the user is legitimately playing and the turn
+// structure already paces it. Analysis is NOT budgeted unless
+// `ENGINE_ANALYSIS_BUDGETED` says so: serialising a player's requests is fair,
+// running them out of requests mid-game is not. config.ts argues that in full.
 //
 // In-memory and therefore per-instance. That is honest for a single-instance
 // deployment and documented as a limitation for a scaled-out one, where this
@@ -32,14 +35,22 @@ export class ComputeBudget {
   readonly #windowMs: number;
   readonly #windows = new Map<string, Window>();
 
-  constructor(options: { perWindow: number; windowMs: number }) {
+  readonly #enforced: boolean;
+
+  constructor(options: { perWindow: number; windowMs: number; enforced?: boolean }) {
     this.#perWindow = options.perWindow;
     this.#windowMs = options.windowMs;
+    this.#enforced = options.enforced ?? true;
   }
 
   /** Charge `cost` to a user. Rejected charges cost nothing, so a user who is
    *  over budget is not pushed further over by retrying. */
   charge(userId: string, cost: number, now = Date.now()): BudgetDecision {
+    // Handled here rather than at each call site so that every path — charge,
+    // refund, the remaining-budget read, and any path added later — agrees
+    // about whether metering is on. A conditional per call site is how one of
+    // them ends up still charging.
+    if (!this.#enforced) return { allowed: true, remaining: Number.POSITIVE_INFINITY };
     const window = this.#windows.get(userId);
     if (!window || window.resetAt <= now) {
       this.#windows.set(userId, { spent: cost, resetAt: now + this.#windowMs });
@@ -66,6 +77,7 @@ export class ComputeBudget {
    *  Read-only: for diagnostics and for asserting that attaching to an existing
    *  search costs nothing. */
   remaining(userId: string, now = Date.now()): number {
+    if (!this.#enforced) return Number.POSITIVE_INFINITY;
     const window = this.#windows.get(userId);
     if (!window || window.resetAt <= now) return this.#perWindow;
     return Math.max(0, this.#perWindow - window.spent);

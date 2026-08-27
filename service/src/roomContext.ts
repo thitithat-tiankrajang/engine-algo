@@ -13,7 +13,7 @@
 import { createClient } from "@supabase/supabase-js";
 
 import { type CanonicalState, parseCanonical } from "./canonical.js";
-import { type BotTier, isBotTier } from "./levels.js";
+import { type BotTier, resolveBotTier } from "./levels.js";
 
 export type EngineRoomContext = {
   gameId: string;
@@ -42,8 +42,35 @@ export class RoomAccessError extends Error {
 
 export type CommittedCommandRow = { revision: number; command: { kind?: string } };
 
+/** One finished study analysis, in the shape the database stores it. */
+export type StudyAnalysisRecord = {
+  scoreSelf: number;
+  scoreOpponent: number;
+  board: unknown;
+  rack: unknown;
+  oppRackCount: number;
+  bagCount: number;
+  level: string;
+  summary: string;
+  method: unknown;
+  candidates: unknown;
+};
+
+export class StudySaveError extends Error {
+  override readonly name = "StudySaveError";
+}
+
 export interface GameStateSource {
   loadContext(gameId: string, token: string): Promise<EngineRoomContext>;
+  /**
+   * Persist a study analysis as the caller, returning the new record's id.
+   *
+   * Called by the SERVER rather than the browser on purpose: a `super` search
+   * runs for minutes and the client is free to walk away from it. If saving
+   * were the page's job, closing the tab would throw away compute that had
+   * already been spent.
+   */
+  saveStudyAnalysis(record: StudyAnalysisRecord, token: string): Promise<string>;
   /** The tail of the committed command log, ending at `revision`. */
   loadRecentCommands(
     gameId: string,
@@ -135,6 +162,34 @@ export function createSupabaseSource(
   };
 
   return {
+    async saveStudyAnalysis(record, token) {
+      const { data, error } = await clientFor(token).rpc("save_study_analysis", {
+        p_score_self: record.scoreSelf,
+        p_score_opponent: record.scoreOpponent,
+        p_board: record.board,
+        p_rack: record.rack,
+        p_opp_rack_count: record.oppRackCount,
+        p_bag_count: record.bagCount,
+        p_level: record.level,
+        p_summary: record.summary,
+        p_method: record.method,
+        p_candidates: record.candidates,
+      });
+
+      if (error) {
+        if (/save_study_analysis/i.test(error.message)) {
+          throw new StudySaveError(
+            "The study function is missing. Run supabase/study_positions_migration.sql.",
+          );
+        }
+        throw new StudySaveError(error.message);
+      }
+      if (typeof data !== "string" || !data) {
+        throw new StudySaveError("The database did not return a study record id.");
+      }
+      return data;
+    },
+
     async loadContext(gameId, token) {
       const { data, error } = await clientFor(token)
         .rpc("get_live_game_engine_context", { target_game_id: gameId })
@@ -167,7 +222,7 @@ export function createSupabaseSource(
         gameMode: String(row.game_mode ?? "versus"),
         modeKey: row.mode_key == null ? null : String(row.mode_key),
         botSide: row.bot_side === "A" || row.bot_side === "B" ? row.bot_side : null,
-        botDifficulty: isBotTier(row.bot_difficulty) ? row.bot_difficulty : null,
+        botDifficulty: resolveBotTier(row.bot_difficulty),
         activeSide,
         turnNumber: Number(row.turn_number ?? canonical.turnNumber),
         phase: String(row.phase ?? canonical.phase),

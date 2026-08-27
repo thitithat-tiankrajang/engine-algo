@@ -6,6 +6,7 @@
   "description": "HTTP service that runs the A-Math C++ engine server-side for bot moves and turn analysis.",
   "scripts": {
     "dev": "tsx watch src/server.ts",
+    "dev:local": "tsx watch --env-file=.env.local src/server.ts",
     "build": "tsc -b",
     "start": "node dist/server.js",
     "test": "vitest run",

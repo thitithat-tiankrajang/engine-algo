@@ -6,14 +6,18 @@
 #include <cstring>
 #include <fstream>
 #include <iostream>
+#include <map>
 #include <random>
 #include <sstream>
 
 #include "board.hpp"
+#include "decision_search.hpp"
+#include "deep_bench.hpp"
 #include "engine.hpp"
 #include "eval.hpp"
 #include "json.hpp"
 #include "movegen.hpp"
+#include "reply_index.hpp"
 #include "rules.hpp"
 #include "selfplay.hpp"
 
@@ -167,6 +171,324 @@ int runBench() {
   return 0;
 }
 
+DecisionPosition decisionPosition(const GameSim& sim, int side) {
+  DecisionPosition position;
+  position.board = sim.board;
+  position.myRack = sim.racks[side];
+  for (uint8_t kind = 0; kind < KIND_COUNT; kind++) {
+    position.unseen.add(kind, TILE_COUNTS[kind]);
+  }
+  for (const Cell& cell : sim.board.cells) {
+    if (cell.occupied()) position.unseen.sub(cell.kind);
+  }
+  for (uint8_t kind = 0; kind < KIND_COUNT; kind++) {
+    if (sim.racks[side].n[kind]) position.unseen.sub(kind, sim.racks[side].n[kind]);
+  }
+  position.physicalBagCount = static_cast<int>(sim.bag.size());
+  position.opponentRackCount = sim.racks[1 - side].total;
+  position.myScore = sim.scores[side];
+  position.opponentScore = sim.scores[1 - side];
+  position.noScoreStreak = sim.noScoreStreak;
+  position.openingPlacementCompleted = !sim.board.empty();
+  return position;
+}
+
+const char* searchVariantName(SearchVariant variant) {
+  switch (variant) {
+    case SearchVariant::SimV2Reference: return "reference";
+    case SearchVariant::ReplyIndexUniform: return "reply-index";
+    case SearchVariant::PairedReplyIndex: return "paired-reply-index";
+    case SearchVariant::ReplyIndexAdaptiveUniform: return "adaptive-uniform";
+    case SearchVariant::ReplyIndexAdaptivePaired: return "adaptive-paired";
+  }
+  return "unknown";
+}
+
+bool parseSearchVariant(const std::string& text, SearchVariant& variant) {
+  if (text == "reference") {
+    variant = SearchVariant::SimV2Reference;
+    return true;
+  }
+  if (text == "reply-index") {
+    variant = SearchVariant::ReplyIndexUniform;
+    return true;
+  }
+  if (text == "paired" || text == "paired-reply-index") {
+    variant = SearchVariant::PairedReplyIndex;
+    return true;
+  }
+  if (text == "adaptive-uniform") {
+    variant = SearchVariant::ReplyIndexAdaptiveUniform;
+    return true;
+  }
+  if (text == "adaptive-paired" || text == "adaptive") {
+    variant = SearchVariant::ReplyIndexAdaptivePaired;
+    return true;
+  }
+  return false;
+}
+
+const char* searchEffortName(SearchEffort effort) {
+  switch (effort) {
+    case SearchEffort::Instant: return "instant";
+    case SearchEffort::Interactive: return "interactive";
+    case SearchEffort::Strong: return "strong";
+    case SearchEffort::Deep: return "deep";
+  }
+  return "unknown";
+}
+
+bool parseSearchEffort(const std::string& text, SearchEffort& effort) {
+  if (text == "interactive") {
+    effort = SearchEffort::Interactive;
+    return true;
+  }
+  if (text == "strong") {
+    effort = SearchEffort::Strong;
+    return true;
+  }
+  if (text == "deep") {
+    effort = SearchEffort::Deep;
+    return true;
+  }
+  return false;
+}
+
+int runV2Bench(int positions, SearchVariant variant, SearchEffort effort) {
+  GameSim sim(20260813);
+  const GameSim::TierSpec builder{"easy", "static", 200};
+  int side = 0;
+  std::vector<double> latency;
+  long long calls = 0;
+  long long deltaCalls = 0;
+  long long nodes = 0;
+  int measured = 0;
+
+  for (int turn = 0; turn < 80 && !sim.finished && measured < positions; turn++) {
+    if (turn >= 2 && sim.pendingReturn[0].empty() && sim.pendingReturn[1].empty()) {
+      SearchQuery query;
+      query.position = decisionPosition(sim, side);
+      query.effort = effort;
+      const auto start = std::chrono::steady_clock::now();
+      const SearchDecision decision = DecisionSearch::benchmark(query, variant);
+      const double ms = std::chrono::duration<double, std::milli>(
+                            std::chrono::steady_clock::now() - start)
+                            .count();
+      if (!decision.ok) {
+        std::printf("v2 bench failed: %s\n", decision.error.c_str());
+        return 1;
+      }
+      latency.push_back(ms);
+      calls += decision.work.fullGenCalls;
+      deltaCalls += decision.work.deltaGenCalls;
+      nodes += static_cast<long long>(decision.work.movegenNodes);
+      std::printf("v2 %-18s pos %2d: board=%3d candidates=%zu worlds=%u full=%u delta=%u "
+                  "nodes=%llu latency=%.1fms completion=%d\n",
+                  searchVariantName(variant), measured + 1, sim.board.tileCount,
+                  decision.candidates.size(),
+                  decision.worldsCompleted, decision.work.fullGenCalls,
+                  decision.work.deltaGenCalls,
+                  static_cast<unsigned long long>(decision.work.movegenNodes), ms,
+                  static_cast<int>(decision.completion));
+      measured++;
+    }
+
+    const std::string response =
+        handleRequest(sim.requestJson(side, builder, 9000 + static_cast<uint32_t>(turn)));
+    if (!sim.applyResponse(side, response)) {
+      std::printf("v2 bench builder failed: %s\n", sim.endReason.c_str());
+      return 1;
+    }
+    side = 1 - side;
+  }
+
+  if (latency.empty()) return 1;
+  std::sort(latency.begin(), latency.end());
+  auto percentile = [&](double fraction) {
+    return latency[static_cast<size_t>(fraction * (latency.size() - 1))];
+  };
+  double total = 0;
+  for (double value : latency) total += value;
+  std::printf("v2 %s/%s baseline: positions=%d mean=%.1fms p50=%.1fms p95=%.1fms "
+              "fullCalls=%.2f deltaCalls=%.2f nodes=%.0f\n",
+              searchVariantName(variant), searchEffortName(effort), measured,
+              total / latency.size(), percentile(0.50), percentile(0.95),
+              static_cast<double>(calls) / measured,
+              static_cast<double>(deltaCalls) / measured,
+              static_cast<double>(nodes) / measured);
+  return measured == positions ? 0 : 1;
+}
+
+std::map<std::string, int> placementSet(const std::vector<Move>& moves) {
+  std::map<std::string, int> set;
+  for (const Move& move : moves) set[canonicalMoveKey(move)] = move.score;
+  return set;
+}
+
+int runReplyIndexBench(int positions) {
+  GameSim sim(20260814);
+  const GameSim::TierSpec builder{"easy", "static", 200};
+  int side = 0;
+  int measured = 0;
+  uint64_t fullNodesTotal = 0, indexedNodesTotal = 0;
+  double fullMsTotal = 0, indexedMsTotal = 0;
+
+  for (int turn = 0; turn < 100 && !sim.finished && measured < positions; turn++) {
+    if (turn >= 4 && sim.pendingReturn[0].empty() && sim.pendingReturn[1].empty()) {
+      const DecisionPosition position = decisionPosition(sim, side);
+      std::vector<Move> roots;
+      GenStats rootStats;
+      rootStats.nodeLimit = 24'000'000;
+      GenOptions rootOptions;
+      rootOptions.premiumOrder = true;
+      generatePlaceMoves(position.board, position.myRack, roots, &rootStats, rootOptions);
+      if (!rootStats.truncated && !roots.empty()) {
+        const BoardContext context =
+            makeContext(position.board, position.unseen, position.physicalBagCount,
+                        static_cast<float>(position.myScore - position.opponentScore));
+        std::sort(roots.begin(), roots.end(), [&](const Move& a, const Move& b) {
+          const float av = staticEquity(position.board, position.myRack, a, context);
+          const float bv = staticEquity(position.board, position.myRack, b, context);
+          if (av != bv) return av > bv;
+          return canonicalMoveKey(a) < canonicalMoveKey(b);
+        });
+        if (roots.size() > 7) roots.resize(7);
+
+        const WorldDeckResult deck =
+            WorldDeck::build(position.unseen, position.opponentRackCount,
+                             position.physicalBagCount, 0xabc000ULL + measured, 2, 1);
+        if (!deck.ok) return 1;
+        const TileCounts opponentRack = deck.worlds[0].opponentRack;
+
+        std::vector<std::map<std::string, int>> truth;
+        uint64_t fullNodes = 0;
+        bool complete = true;
+        auto start = std::chrono::steady_clock::now();
+        for (const Move& root : roots) {
+          Board after = position.board;
+          for (const Placement& placement : root.placements)
+            after.place(placement.row, placement.col, placement.kind, placement.token);
+          std::vector<Move> replies;
+          GenStats stats;
+          stats.nodeLimit = 24'000'000;
+          generatePlaceMoves(after, opponentRack, replies, &stats);
+          fullNodes += stats.nodesVisited;
+          if (stats.truncated) complete = false;
+          truth.push_back(placementSet(replies));
+        }
+        const double fullMs = std::chrono::duration<double, std::milli>(
+                                  std::chrono::steady_clock::now() - start)
+                                  .count();
+
+        WorkEnvelope envelope;
+        envelope.maxFullGenCalls = 1;
+        envelope.maxDeltaGenCalls = static_cast<uint32_t>(roots.size());
+        envelope.maxMovegenNodes = 200'000'000;
+        WorkLedger ledger(envelope);
+        start = std::chrono::steady_clock::now();
+        const ReplyIndexResult index =
+            ReplyIndex::build(position.board, opponentRack, ledger, 24'000'000);
+        if (!index.complete) complete = false;
+        for (size_t i = 0; i < roots.size(); i++) {
+          Board after = position.board;
+          for (const Placement& placement : roots[i].placements)
+            after.place(placement.row, placement.col, placement.kind, placement.token);
+          const ReplySet replies =
+              ReplyIndex::recover(index, after, roots[i].placements, opponentRack, ledger,
+                                  24'000'000);
+          if (!replies.complete || placementSet(replies.placements) != truth[i]) {
+            std::printf("reply-index set mismatch at position %d candidate %zu\n", measured + 1,
+                        i);
+            return 1;
+          }
+        }
+        const double indexedMs = std::chrono::duration<double, std::milli>(
+                                     std::chrono::steady_clock::now() - start)
+                                     .count();
+        if (complete) {
+          const uint64_t indexedNodes = ledger.report().movegenNodes;
+          const double reduction =
+              fullNodes ? 100.0 * (1.0 - static_cast<double>(indexedNodes) / fullNodes) : 0;
+          std::printf("reply-index pos %2d: candidates=%zu full=%llu nodes/%.1fms "
+                      "indexed=%llu nodes/%.1fms reduction=%.1f%%\n",
+                      measured + 1, roots.size(), static_cast<unsigned long long>(fullNodes),
+                      fullMs, static_cast<unsigned long long>(indexedNodes), indexedMs, reduction);
+          fullNodesTotal += fullNodes;
+          indexedNodesTotal += indexedNodes;
+          fullMsTotal += fullMs;
+          indexedMsTotal += indexedMs;
+          measured++;
+        }
+      }
+    }
+
+    const std::string response =
+        handleRequest(sim.requestJson(side, builder, 12000 + static_cast<uint32_t>(turn)));
+    if (!sim.applyResponse(side, response)) return 1;
+    side = 1 - side;
+  }
+
+  if (measured == 0) return 1;
+  std::printf("reply-index baseline: positions=%d fullNodes=%llu indexedNodes=%llu "
+              "nodeReduction=%.1f%% full=%.1fms indexed=%.1fms latencyReduction=%.1f%%\n",
+              measured, static_cast<unsigned long long>(fullNodesTotal),
+              static_cast<unsigned long long>(indexedNodesTotal),
+              100.0 * (1.0 - static_cast<double>(indexedNodesTotal) / fullNodesTotal),
+              fullMsTotal, indexedMsTotal, 100.0 * (1.0 - indexedMsTotal / fullMsTotal));
+  return measured == positions ? 0 : 1;
+}
+
+// ── position corpus for latency benchmarking ─────────────────────────────────
+//
+// Dumps the engine REQUEST the bot would receive at each turn of a self-played
+// game, one JSON object per line, tagged with the phase signals a latency
+// number has to be read against (turn index, tiles on the board, bag size).
+//
+// The dump deliberately carries NO tier fields — no `solver`, no `budgetMs`,
+// no `unlimited`. A corpus that pinned a tier would only ever measure that
+// tier, and the whole point of this file is to run the SAME positions through
+// `super` natively and `super` in WASM and compare. The harness adds the tier.
+//
+// The games themselves are played at the cheap static tier: how the corpus was
+// reached does not change how long a `super` search on it takes, and playing
+// 25 turns at `super` to produce 25 positions would cost an hour a game.
+int runPositions(int games, uint32_t seed0, const std::string& outPath) {
+  std::ofstream out(outPath);
+  if (!out) {
+    std::fprintf(stderr, "cannot open %s\n", outPath.c_str());
+    return 1;
+  }
+  const GameSim::TierSpec fast = tierFor("easy");  // static solver, one generation
+  int emitted = 0;
+  for (int g = 0; g < games; g++) {
+    GameSim sim(seed0 + static_cast<uint32_t>(g) * 7919u);
+    int side = 0;
+    for (int turn = 0; turn < 60 && !sim.finished; turn++) {
+      int boardTiles = 0;
+      for (int r = 0; r < BOARD_SIZE; r++) {
+        for (int c = 0; c < BOARD_SIZE; c++) {
+          if (sim.board.at(r, c).occupied()) boardTiles++;
+        }
+      }
+      const int unplayed = sim.racks[0].total + sim.racks[1].total +
+                           static_cast<int>(sim.bag.size());
+      out << "{\"game\":" << g << ",\"turn\":" << turn << ",\"side\":" << side
+          << ",\"boardTiles\":" << boardTiles
+          << ",\"bagCount\":" << sim.bag.size()
+          << ",\"unplayed\":" << unplayed
+          << ",\"request\":"
+          << sim.requestJson(side, std::string("super"), seed0 + static_cast<uint32_t>(turn))
+          << "}\n";
+      emitted++;
+      const std::string res = handleRequest(sim.requestJson(side, fast, seed0 + turn));
+      if (!sim.applyResponse(side, res)) break;
+      side = 1 - side;
+    }
+  }
+  std::fprintf(stderr, "wrote %d positions to %s\n", emitted, outPath.c_str());
+  return emitted > 0 ? 0 : 1;
+}
+
 int runGolden(int positions, uint32_t seed, const std::string& outPath) {
   std::ofstream out(outPath);
   if (!out) {
@@ -267,10 +589,19 @@ int main(int argc, char** argv) {
     std::fprintf(stderr,
                  "usage:\n"
                  "  amath_cli bench\n"
+                 "  amath_cli v2-bench [positions] [reference|reply-index|paired|"
+                 "adaptive-uniform|adaptive-paired] [interactive|strong|deep]\n"
+                 "  amath_cli reply-index-bench [positions]\n"
+                 "  amath_cli deep-bench [positions] [label-substring]\n"
+                 "  amath_cli deep-credit-curve [positions]\n"
+                 "  amath_cli g6 [positions]      (admission recall/regret)\n"
+                 "  amath_cli g7 [positions]      (uniform vs paired at equal credits)\n"
                  "  amath_cli selfplay <games> <tierA> <tierB> [seed]\n"
                  "      tiers: easy (static) | easy-sim (pre-static easy) |\n"
                  "             medium | hard | max, or a raw difficulty string\n"
                  "  amath_cli golden <positions> <seed> <out.jsonl>\n"
+                 "  amath_cli positions <games> <seed> <out.jsonl>\n"
+                 "      engine requests from self-play, for latency benchmarking\n"
                  "  amath_cli request   (JSON on stdin)\n"
                  "  amath_cli worker    (JSON on stdin, response on stdout,\n"
                  "                       NDJSON progress on stderr)\n");
@@ -278,12 +609,38 @@ int main(int argc, char** argv) {
   }
   const std::string mode = argv[1];
   if (mode == "bench") return runBench();
+  if (mode == "v2-bench") {
+    SearchVariant variant = SearchVariant::SimV2Reference;
+    if (argc > 3 && !parseSearchVariant(argv[3], variant)) {
+      std::fprintf(stderr, "unknown v2 variant %s\n", argv[3]);
+      return 2;
+    }
+    SearchEffort effort = SearchEffort::Interactive;
+    if (argc > 4 && !parseSearchEffort(argv[4], effort)) {
+      std::fprintf(stderr, "unknown v2 effort %s\n", argv[4]);
+      return 2;
+    }
+    return runV2Bench(argc > 2 ? std::atoi(argv[2]) : 8, variant, effort);
+  }
+  if (mode == "reply-index-bench")
+    return runReplyIndexBench(argc > 2 ? std::atoi(argv[2]) : 8);
+  if (mode == "deep-bench")
+    return runDeepPolicyBench(argc > 2 ? std::atoi(argv[2]) : 16, argc > 3 ? argv[3] : "");
+  if (mode == "deep-credit-curve") return runDeepCreditCurve(argc > 2 ? std::atoi(argv[2]) : 16);
+  if (mode == "g6") return runGate6(argc > 2 ? std::atoi(argv[2]) : 16);
+  if (mode == "g7") return runGate7(argc > 2 ? std::atoi(argv[2]) : 16);
   if (mode == "selfplay") {
     const int games = argc > 2 ? std::atoi(argv[2]) : 4;
     const std::string dA = argc > 3 ? argv[3] : "normal";
     const std::string dB = argc > 4 ? argv[4] : "normal";
     const uint32_t seed = argc > 5 ? std::atoi(argv[5]) : 777;
     return runSelfplay(games, dA, dB, seed);
+  }
+  if (mode == "positions") {
+    const int games = argc > 2 ? std::atoi(argv[2]) : 8;
+    const uint32_t seed = argc > 3 ? static_cast<uint32_t>(std::atoi(argv[3])) : 20260827;
+    const std::string out = argc > 4 ? argv[4] : "build/positions.jsonl";
+    return runPositions(games, seed, out);
   }
   if (mode == "golden") {
     const int positions = argc > 2 ? std::atoi(argv[2]) : 40;

@@ -30,11 +30,62 @@ export type ServiceConfig = {
   /** Largest request body accepted. The API takes identifiers, not positions,
    *  so this is generous by an order of magnitude already. */
   maxBodyBytes: number;
-  /** Per-user compute budget: cost units per window. */
+  /**
+   * Per-user compute budget: cost units per window. Always applies to bot
+   * turns; applies to analysis only when `analysisBudgeted` is on.
+   *
+   * One unit is roughly four engine-seconds (see `cost` in levels.ts), so the
+   * default of 300 is about twice what a single engine process could produce in
+   * the ten-minute window. That is deliberate: one player taking turns cannot
+   * reach it at ANY tier, because the wall clock stops them first — a `max`
+   * move takes 108s, so ten minutes buys about five of them, and five costs
+   * 135. What it does still bound is the thing the budget is actually for:
+   * parallel or scripted use, where nobody is waiting for a move before asking
+   * for the next one.
+   *
+   * The previous 60 was sized as though every request cost the same. It did
+   * not, and a player at `medium` — three seconds a move — was refused after
+   * thirty moves of a game that needs about twenty-five.
+   */
   budgetPerWindow: number;
   budgetWindowMs: number;
-  /** Concurrent analysis jobs one user may hold. */
+  /**
+   * Whether the budget refuses anything at all.
+   *
+   * Off is for a single-user machine, where the ration protects nobody: there
+   * is no other account to be fair to and no shared instance to monopolise. It
+   * is a separate switch rather than an enormous `budgetPerWindow` so that a
+   * deployment cannot arrive at "effectively unlimited" by accident, and so the
+   * boot log can say plainly that metering is off.
+   */
+  budgetEnforced: boolean;
+  /**
+   * Analysis jobs one account may have IN FLIGHT at once — queued or running,
+   * because a job waiting its turn is work this account has already asked for.
+   *
+   * This is the limit that survives, and it is deliberately the shape of "one
+   * at a time" rather than "N per hour": a player may analyse as many times as
+   * they like over a session, but each request waits for the previous one. What
+   * that bounds is how much of the queue one account can occupy at any instant;
+   * what it does not do is run out.
+   */
   maxAnalysisPerUser: number;
+  /**
+   * Whether analysis also spends the sliding-window compute budget above.
+   *
+   * Off by default: a budget is a RATION, and rationing a study aid is the one
+   * thing this service should not do — it fails the player mid-game, on the
+   * turn they actually stopped to think about, and no amount of waiting gets
+   * them an answer. The one-at-a-time cap above expresses the same fairness
+   * without that failure mode: press analyse as often as you like, each one
+   * takes its turn in the queue.
+   *
+   * Bot moves are budgeted either way — those are not paced by a player sitting
+   * and waiting for the answer.
+   *
+   * Set `ENGINE_ANALYSIS_BUDGETED=true` to ration analysis as well.
+   */
+  analysisBudgeted: boolean;
   /** How long a completed analysis result is served from cache. Analysis is a
    *  pure function of an immutable (position, settings), so a returning player
    *  can be shown the answer without paying for the search again. */
@@ -45,6 +96,52 @@ export type ServiceConfig = {
   botResultTtlMs: number;
   /** Hard ceiling on cached engine results, evicted least-recently-used. */
   jobCacheMax: number;
+  /**
+   * Whether signed-in players may run the Super search on their own device.
+   *
+   * The ONE switch for the whole client-side rollout, and deliberately a
+   * SERVER-side one: the point of the client-side path is that it costs this
+   * service nothing, so the moment it misbehaves the fix has to be available
+   * without shipping anything to a browser. Off, every Super turn falls back to
+   * the existing backend path, which is left completely intact.
+   *
+   * ── Who gets it, and why there is no list ───────────────────────────────
+   *
+   * Every AUTHENTICATED caller, and nobody else. There is no allowlist here and
+   * there must not be one: this endpoint already runs `authenticate()`, which
+   * rejects an unsigned request before this flag is ever read, and the project's
+   * account-approval process is what decides who holds an account in the first
+   * place. A second list of user ids beside it would be a duplicate permission
+   * system — one more place for the two answers to disagree, and one more thing
+   * to keep in step with approvals for no gain the approval boundary does not
+   * already give.
+   *
+   * It gates OFFERING the path, not the engine's correctness. A client already
+   * mid-game when this is turned off finishes that game on the device it
+   * started on — the versions are pinned to the game (superConfig.ts), and
+   * switching engines mid-match is the one thing pinning exists to prevent.
+   */
+  clientSideSuper: boolean;
+  /**
+   * EXPERIMENTAL: let the client trade Super's playing strength for latency.
+   *
+   * When true the client may cap the opponent-rack sample schedule to fit the
+   * served latency targets, so a slower device plays a WEAKER bot rather than
+   * a later one. That is a product decision nobody has taken and an effect
+   * nobody has measured, which is why it is a flag and why the flag is off.
+   *
+   * The default path gives every device the identical full schedule and lets
+   * the slow ones wait. See `superConfig.ts`.
+   */
+  superAdaptiveBudget: boolean;
+  /**
+   * Simultaneous legality validations. Tiny, and separate from
+   * `concurrency` on purpose: a validation is a few microseconds of rules
+   * arithmetic with no search in it, and making it queue behind a five-minute
+   * analysis would mean a client that computed its own move in ten seconds then
+   * waited minutes for permission to play it.
+   */
+  validationConcurrency: number;
 };
 
 function required(env: NodeJS.ProcessEnv, name: string): string {
@@ -84,6 +181,17 @@ function boundedInteger(
     throw new Error(`${name} must be between ${minimum} and ${maximum}, got "${raw}".`);
   }
   return value;
+}
+
+/** A switch, read strictly. An unrecognised spelling is refused rather than
+ *  quietly taken as `false`: a typo that silently turns metering off is the
+ *  kind of degradation this file exists to prevent. */
+function flag(env: NodeJS.ProcessEnv, name: string, fallback: boolean): boolean {
+  const raw = env[name]?.trim().toLowerCase();
+  if (raw === undefined || raw === "") return fallback;
+  if (raw === "1" || raw === "true" || raw === "yes" || raw === "on") return true;
+  if (raw === "0" || raw === "false" || raw === "no" || raw === "off") return false;
+  throw new Error(`${name} must be true or false, got "${env[name]}".`);
 }
 
 export type LoadConfigOptions = {
@@ -140,11 +248,21 @@ export function loadConfig(
     maxWaiting: boundedInteger(env, "ENGINE_MAX_WAITING", derivedMaxWaiting, 1, 1024),
     maxQueueWaitMs: integer(env, "ENGINE_MAX_QUEUE_WAIT_MS", 120_000),
     maxBodyBytes: integer(env, "ENGINE_MAX_BODY_BYTES", 8 * 1024),
-    budgetPerWindow: integer(env, "ENGINE_BUDGET_PER_WINDOW", 60),
+    budgetPerWindow: integer(env, "ENGINE_BUDGET_PER_WINDOW", 300),
     budgetWindowMs: integer(env, "ENGINE_BUDGET_WINDOW_MS", 10 * 60 * 1000),
+    budgetEnforced: flag(env, "ENGINE_BUDGET_ENFORCED", true),
     maxAnalysisPerUser: integer(env, "ENGINE_MAX_ANALYSIS_PER_USER", 1),
+    analysisBudgeted: flag(env, "ENGINE_ANALYSIS_BUDGETED", false),
     analysisResultTtlMs: integer(env, "ENGINE_ANALYSIS_RESULT_TTL_MS", 30 * 60 * 1000),
     botResultTtlMs: integer(env, "ENGINE_BOT_RESULT_TTL_MS", 30 * 60 * 1000),
     jobCacheMax: boundedInteger(env, "ENGINE_JOB_CACHE_MAX", 256, 1, 100_000),
+    clientSideSuper: flag(env, "CLIENT_SIDE_SUPER", false),
+    // EXPERIMENTAL, and off unless somebody deliberately turns it on. True
+    // makes the client pick a reduced opponent-rack sample budget to fit the
+    // latency targets, which is a change to how STRONG the bot plays and not
+    // merely to how long it takes. There is no measurement of what that costs
+    // in playing strength, so it must never become a default.
+    superAdaptiveBudget: flag(env, "SUPER_ADAPTIVE_BUDGET", false),
+    validationConcurrency: boundedInteger(env, "ENGINE_VALIDATION_CONCURRENCY", 4, 1, 64),
   };
 }

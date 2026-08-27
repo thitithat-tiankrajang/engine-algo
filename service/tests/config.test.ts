@@ -124,10 +124,81 @@ describe("queue bounds", () => {
   });
 });
 
+describe("analysis metering", () => {
+  it("serialises analysis per account without rationing it", () => {
+    const config = loadConfig(minimumEnv, { cpu: oneCpu });
+    // One in flight at a time — and no budget to run out of.
+    expect(config.maxAnalysisPerUser).toBe(1);
+    expect(config.analysisBudgeted).toBe(false);
+  });
+
+  it("lets an operator ration analysis as well", () => {
+    for (const spelling of ["true", "1", "on", "YES"]) {
+      const config = loadConfig(
+        { ...minimumEnv, ENGINE_ANALYSIS_BUDGETED: spelling },
+        { cpu: oneCpu },
+      );
+      expect(config.analysisBudgeted).toBe(true);
+    }
+    expect(
+      loadConfig({ ...minimumEnv, ENGINE_ANALYSIS_BUDGETED: "false" }, { cpu: oneCpu })
+        .analysisBudgeted,
+    ).toBe(false);
+  });
+
+  it("refuses a spelling it does not understand rather than reading it as off", () => {
+    expect(() =>
+      loadConfig({ ...minimumEnv, ENGINE_ANALYSIS_BUDGETED: "ture" }, { cpu: oneCpu }),
+    ).toThrow("ENGINE_ANALYSIS_BUDGETED must be true or false");
+  });
+});
+
 describe("reconnect result retention", () => {
   it("keeps completed work long enough for a player to return from another app", () => {
     const config = loadConfig(minimumEnv, { cpu: oneCpu });
     expect(config.analysisResultTtlMs).toBe(30 * 60 * 1000);
     expect(config.botResultTtlMs).toBe(30 * 60 * 1000);
+  });
+});
+
+describe("the client-side Super rollout switch", () => {
+  it("is off unless the deployment turns it on", () => {
+    // The safe direction to be wrong in: an operator who sets nothing gets the
+    // backend path, which is the behaviour that predates all of this.
+    expect(loadConfig(minimumEnv).clientSideSuper).toBe(false);
+  });
+
+  it("is the ONE switch — there is no second list beside it", () => {
+    // Deliberately asserted rather than merely absent from the code.
+    //
+    // An earlier revision paired this flag with `CLIENT_SIDE_SUPER_USER_IDS`,
+    // an allowlist of user ids. It was removed because it duplicated a decision
+    // the platform already makes: `/v1/bot-config` authenticates the caller, and
+    // who holds an account at all is the approval process's answer. Two lists
+    // that must agree about the same people is one more thing to keep in step
+    // and one more way to be quietly wrong.
+    //
+    // If a future change reintroduces one, this fails.
+    const config = loadConfig({ ...minimumEnv, CLIENT_SIDE_SUPER: "true" });
+    expect(config.clientSideSuper).toBe(true);
+
+    // Narrowly scoped on purpose: `allowedOrigins` (CORS) and
+    // `maxAnalysisPerUser` (rate limiting) are unrelated and legitimate. What
+    // must not exist is a SECOND client-side-Super key naming an audience.
+    const audienceKeys = Object.keys(config).filter(
+      (key) => /champion/i.test(key) || (key.startsWith("clientSideSuper") && key !== "clientSideSuper"),
+    );
+    expect(audienceKeys).toEqual([]);
+  });
+
+  it("ignores an allowlist variable if one is still set in the environment", () => {
+    // A leftover from the removed design must not resurrect it. Setting the old
+    // variable changes nothing: the flag alone decides.
+    const config = loadConfig({
+      ...minimumEnv,
+      CLIENT_SIDE_SUPER: "true",
+      CLIENT_SIDE_SUPER_USER_IDS: "some-old-uuid,another-one",
+    });
+    expect(config.clientSideSuper).toBe(true);
   });
 });

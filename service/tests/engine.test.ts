@@ -11,12 +11,13 @@ import { existsSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 
-import { toEngineRequest } from "../src/adapter.js";
+import { toEngineRequest, toStudyEngineRequest } from "../src/adapter.js";
 import { buildAnalysis } from "../src/analysis.js";
 import { parseCanonical, rackTokens } from "../src/canonical.js";
 import { EngineTimeoutError, runEngine } from "../src/engineRunner.js";
 import { ANALYSIS_LEVEL_CONFIG, BOT_TIER_CONFIG } from "../src/levels.js";
 import { EngineQueue } from "../src/queue.js";
+import { parseStudyPosition } from "../src/study.js";
 import { buildCanonicalPayload } from "./helpers.js";
 
 const ENGINE = fileURLToPath(new URL("../../build/amath_cli", import.meta.url));
@@ -66,27 +67,27 @@ suite("the real engine", () => {
     expect(response.candidates?.length).toBeGreaterThan(0);
   }, 120_000);
 
-  it("runs the easy tier on the static path: one generation, and the same move every time", async () => {
-    // The whole point of the tier. Before this, `easy` sent budgetMs=200 and
-    // took ~2.9 s, because the sampling search will not return before three
-    // complete opponent-rack samples — roughly 385 move generations a turn.
+  it("runs the static solver in one generation, and plays the same move every time", async () => {
+    // No shipped tier uses this path any more — the 200 ms `easy` tier it was
+    // built for is retired — but the engine still offers it and the CLI's
+    // gauntlets still measure against it, so its contract stays under test:
+    // one root generation, no sampling, and a move that does not depend on the
+    // seed.
     const state = parseCanonical(position());
-    const tier = BOT_TIER_CONFIG.easy;
-    expect(tier.solver).toBe("static");
 
     const build = (salt: string) =>
       toEngineRequest(state, {
         side: "A",
-        difficulty: "easy",
-        solver: tier.solver,
-        ...(tier.budgetMs != null ? { budgetMs: tier.budgetMs } : {}),
+        difficulty: "static",
+        solver: "static",
+        budgetMs: 200,
         events: [],
         seedSalt: salt,
       });
 
     const first = await runEngine({ binaryPath: ENGINE, request: build(""), timeoutMs: 30_000 });
     expect(["place", "exchange", "pass"]).toContain(first.type);
-    // One root generation. This is the bound the tier is sold on, checked
+    // One root generation. This is the bound the path is sold on, checked
     // through the real service path rather than only in the C++ test.
     expect(first.stats.genCalls).toBe(1);
     expect(first.stats.samples).toBe(0);
@@ -104,6 +105,80 @@ suite("the real engine", () => {
         timeoutMs: 30_000,
       });
       expect(identity(again)).toBe(identity(first));
+    }
+  }, 120_000);
+
+  it("runs the super tier until the schedule is finished, not until a clock says stop", async () => {
+    const state = parseCanonical(position());
+    const tier = BOT_TIER_CONFIG.super;
+    expect(tier.unlimited).toBe(true);
+    expect(tier.budgetMs).toBeNull();
+
+    // The tier's real schedule is 160 samples and takes minutes on an open
+    // board. `sampleCap` shortens the SCHEDULE without putting a clock back on
+    // the search, which is exactly the distinction under test.
+    const build = (bound: { unlimited?: boolean; budgetMs?: number }) =>
+      toEngineRequest(state, {
+        side: "A",
+        difficulty: "super",
+        solver: tier.solver,
+        sampleCap: 6,
+        topN: 8,
+        events: [],
+        ...bound,
+      });
+
+    const unlimited = await runEngine({
+      binaryPath: ENGINE,
+      request: build({ unlimited: true }),
+      timeoutMs: 180_000,
+    });
+    expect(["place", "exchange", "pass"]).toContain(unlimited.type);
+    // Every planned sample, not "as many as fitted".
+    expect(unlimited.stats.samples).toBe(6);
+
+    // The same schedule under a deadline stops at the sampler's floor of three
+    // complete samples. This is the behaviour `super` exists to remove, and
+    // asserting it here is what keeps the tier from quietly becoming `max`.
+    const deadlined = await runEngine({
+      binaryPath: ENGINE,
+      request: build({ budgetMs: 1 }),
+      timeoutMs: 180_000,
+    });
+    expect(deadlined.stats.samples).toBeLessThan(unlimited.stats.samples);
+  }, 400_000);
+
+  it("accepts a study position built from raw input, not from a room", async () => {
+    // The study path builds its request from a position the caller typed rather
+    // than from stored state, so the seam most likely to break is whether the
+    // engine accepts what that builder produces at all.
+    const position = parseStudyPosition({
+      scoreSelf: 40,
+      scoreOpponent: 55,
+      board: [
+        { r: 7, c: 6, kind: "2", token: "2" },
+        { r: 7, c: 7, kind: "+", token: "+" },
+        { r: 7, c: 8, kind: "3", token: "3" },
+        { r: 7, c: 9, kind: "=", token: "=" },
+        { r: 7, c: 10, kind: "5", token: "5" },
+      ],
+      rack: ["1", "2", "3", "+", "=", "5", "9"],
+    });
+
+    const request = toStudyEngineRequest(position, {
+      difficulty: "medium",
+      solver: "sim",
+      budgetMs: 1_000,
+      topN: 12,
+    });
+    const response = await runEngine({ binaryPath: ENGINE, request, timeoutMs: 60_000 });
+
+    expect(["place", "exchange", "pass"]).toContain(response.type);
+    expect((response.candidates ?? []).length).toBeGreaterThan(0);
+    // The rack it reasoned about is the one that was typed: nothing else was
+    // available to it.
+    for (const placement of response.placements) {
+      expect(position.rack).toContain(placement.kind);
     }
   }, 120_000);
 

@@ -330,8 +330,47 @@ export class AnalysisUnavailableError extends Error {
   override readonly name = "AnalysisUnavailableError";
 }
 
-export function buildAnalysis(input: BuildAnalysisInput): AnalysisResult {
-  const { response } = input;
+/** The part of an analysis that is about the SEARCH rather than about the game
+ *  it came from. Shared by room analysis and study, so the two can never drift
+ *  into describing the same engine output differently. */
+/**
+ * What `POST /v1/study/analysis` answers with.
+ *
+ * Deliberately not an `AnalysisResult`: there is no game id, no revision and no
+ * side on move to report, and filling those in with zeroes would invite a
+ * client to treat a made-up position as a game. What it adds instead is the
+ * position it was asked about — so a result can be read on its own, without the
+ * request that produced it — and the id of the record that was written.
+ */
+export type StudyAnalysisResponse = {
+  /** The permanent record, or `null` when the search succeeded but the write
+   *  did not. The ranking is still returned in that case: the compute is spent
+   *  either way, and losing it to a database hiccup helps nobody. */
+  recordId: string | null;
+  saveError: string | null;
+  level: string;
+  position: {
+    scoreSelf: number;
+    scoreOpponent: number;
+    board: Array<{ r: number; c: number; kind: string; token: string }>;
+    rack: string[];
+    oppRackCount: number;
+    bagCount: number;
+  };
+  /** Ranked best-first, capped at `STUDY_TOP_N`. */
+  candidates: AnalysisCandidate[];
+  summary: string;
+  method: AnalysisResult["method"];
+};
+
+export type SearchDescription = {
+  /** Ranked best-first; the engine's own chosen move is always first. */
+  candidates: AnalysisCandidate[];
+  summary: string;
+  method: AnalysisResult["method"];
+};
+
+function describeSearch(response: EngineResponse, requestedSamples: number): SearchDescription {
   const rows = response.candidates ?? [];
   if (rows.length === 0) {
     // Every solver path fills the candidate report, so an empty one means the
@@ -347,8 +386,7 @@ export function buildAnalysis(input: BuildAnalysisInput): AnalysisResult {
   const best = rows.find((row) => row.chosen) ?? rows[0];
   if (!best) throw new AnalysisUnavailableError("The engine reported no chosen move.");
 
-  const complete =
-    response.solver !== "sim" || response.stats.samples >= input.requestedSamples;
+  const complete = response.solver !== "sim" || response.stats.samples >= requestedSamples;
 
   const toCandidate = (row: EngineCandidate, index: number): AnalysisCandidate => {
     const factors = factorsFor(row, response.solver);
@@ -375,18 +413,9 @@ export function buildAnalysis(input: BuildAnalysisInput): AnalysisResult {
   };
 
   const ordered = [best, ...rows.filter((row) => row !== best)];
-  const candidates = ordered.map(toCandidate);
-  const recommendation = candidates[0];
-  if (!recommendation) throw new AnalysisUnavailableError("The engine reported no chosen move.");
 
   return {
-    level: input.level,
-    gameId: input.gameId,
-    revision: input.revision,
-    turnNumber: input.turnNumber,
-    side: input.side,
-    recommendation,
-    alternatives: candidates.slice(1),
+    candidates: ordered.map(toCandidate),
     summary: summaryFor(best, ordered[1], response, complete),
     method: {
       solver: response.solver,
@@ -399,4 +428,43 @@ export function buildAnalysis(input: BuildAnalysisInput): AnalysisResult {
       complete,
     },
   };
+}
+
+export function buildAnalysis(input: BuildAnalysisInput): AnalysisResult {
+  const described = describeSearch(input.response, input.requestedSamples);
+  const [recommendation, ...alternatives] = described.candidates;
+  if (!recommendation) throw new AnalysisUnavailableError("The engine reported no chosen move.");
+
+  return {
+    level: input.level,
+    gameId: input.gameId,
+    revision: input.revision,
+    turnNumber: input.turnNumber,
+    side: input.side,
+    recommendation,
+    alternatives,
+    summary: described.summary,
+    method: described.method,
+  };
+}
+
+/**
+ * The same description, for a position that is not a game.
+ *
+ * Two differences from `buildAnalysis`, both deliberate. There is no game
+ * identity to report — no room, no revision, no side on move — so none is
+ * invented. And the ranking is TRUNCATED here rather than at the database:
+ * `limit` is what the study record promises to hold, and a list that says "top
+ * 10" while carrying twenty-four is a record nobody can reason about later.
+ */
+export function buildStudyAnalysis(input: {
+  response: EngineResponse;
+  requestedSamples: number;
+  limit: number;
+}): SearchDescription {
+  const described = describeSearch(input.response, input.requestedSamples);
+  if (described.candidates.length === 0) {
+    throw new AnalysisUnavailableError("The engine reported no chosen move.");
+  }
+  return { ...described, candidates: described.candidates.slice(0, input.limit) };
 }
