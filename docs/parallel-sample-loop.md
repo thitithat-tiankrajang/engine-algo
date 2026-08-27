@@ -70,23 +70,39 @@ process at a time.
 | 6 | 25.8 s | 3.80× |
 | 8 | 21.5 s | **4.55×** |
 
-### WASM (`-O3`, Node 26 — same V8 and same Wasm compiler as Chrome)
+### WASM, in a real browser
 
-| threads | wall | speedup |
-|---:|---:|---:|
-| 1 | 133.3 s | 1.00× |
-| 4 | 52.5 s | **2.54×** |
-| 8 | 35.8 s | **3.72×** |
+Chromium, cross-origin isolated, the chunks Vite actually built, one module
+instance per page load — instantiating several in one page leaves every earlier
+pool's workers alive and turns the later runs into a measurement of contention.
+
+| threads | module | wall | speedup |
+|---:|---|---:|---:|
+| 1 | `amath_engine.mjs` | 130.5 s | 1.00× |
+| 4 | `amath_engine_mt.mjs` | 54.0 s | **2.42×** |
+| 8 | `amath_engine_mt.mjs` | 27.9 s | **4.68×** |
+
+Equity `2.26314` and 853,222,467 nodes at all three, which is the same move and
+the same work the native engine reports for this position.
 
 Scaled onto the published full-Super p50 of 225 s, four threads put the reference
-device at roughly 90 s a move and eight at roughly 60 s — which would move this
-machine out of the `SLOW` recommendation band and into `GOOD` (≤ 120 s) without
-touching a single search parameter.
+device at roughly 93 s a move and eight at roughly 48 s — which moves this machine
+out of the `SLOW` recommendation band and into `GOOD` (≤ 120 s) without touching a
+single search parameter.
 
-**Scaling is sub-linear and stays that way.** 8 threads returns 4.55× natively,
-not 8×, because half of this machine's cores are E-cores. A phone with two big
-and four little cores should be read as ~2.5–3×, and a phone that thermally
-throttles through a four-minute move will give back part of even that.
+Node 26 was measured too (133.3 s / 52.5 s / 35.8 s, so 2.54× and 3.72×) and is
+kept only as a note: it runs the same V8 and the same Wasm compiler but its
+worker_threads are not Web Workers, and on the 4→8 step it disagrees with the
+browser by enough to matter. The browser rows are the ones to quote.
+
+**Scaling is sub-linear and the shape of that is not settled.** Natively, 8
+threads returns 4.55× and the 4→8 step is worth only 1.46× — this machine has
+four P-cores and four much slower E-cores. In the browser the same step is worth
+1.94×. Both were measured on the same laptop and they do not agree; the browser
+number may be the more relevant one, or the native 8-thread run may have been
+thermally limited late in a long benchmarking session. Either way a phone with
+two big and four little cores should be read as considerably less than eight, and
+a phone that throttles through a minutes-long move gives back more.
 
 ## Cost
 
@@ -116,9 +132,25 @@ safe, but visible.
 
 ### Bundle
 
-263,021 → 376,541 bytes for the `SINGLE_FILE` module: **+113 KB**. It is a
-separate lazily-imported chunk, so it is not first-load cost, but it is the
-download before Super's first move on a threaded device.
+Bigger than the artifact sizes suggest, because Vite emits the threaded module
+twice. Emscripten's pthread startup spawns its workers from the module's own URL,
+and the bundler turns that into a second, separate worker chunk:
+
+| built chunk | size | fetched by |
+|---|---:|---|
+| `amath_engine-*.js` | 334.6 KB | the host worker, single-threaded devices |
+| `amath_engine_mt-*.js` | 437.2 KB | the host worker, threaded devices |
+| `amath_engine_mt-*.js` (worker copy) | 437.2 KB | every pooled pthread |
+
+So a threaded device downloads ~874 KB before Super's first move against ~335 KB
+today. It is a lazily-imported chunk either way — nobody pays it who never plays
+Super — and the second copy is fetched once and then served from cache to all
+eight workers, but it is not the +113 KB the raw artifacts imply.
+
+The single-threaded module also grew, 263,021 → 281,921 bytes (**+19 KB**), and
+that one is paid by every device including the ones that will never thread: the
+refactor links `<thread>` and `<atomic>` machinery that its own path never
+enters. It could be compiled out, and has not been.
 
 ### Wasted work
 
@@ -167,10 +199,13 @@ ordered reduction after the join.
   `bench_super.jsonl` #2 on one M3. The sweep has not been run across the phase
   mix, and the opening — the widest and most expensive board a game contains —
   is not in it.
-- **Node, not a browser.** Same V8 and same Wasm compiler, but no tab throttling,
-  no thermal ceiling, and Node's worker_threads are not Web Workers. The memory
-  table in particular should be re-measured in a browser before it is trusted for
-  a device policy.
+- **The memory table is Node, not a browser.** The latency rows are now measured
+  in Chromium, but the resident-memory rows are not: Node's worker_threads each
+  carry a V8 isolate and a Web Worker's cost is not the same number. The ~12 MB
+  per worker that `superThreads.ts` budgets against should be re-measured in a
+  browser before it is trusted as a device policy.
+- **One browser, on a desktop.** Chromium on the reference laptop, mains power,
+  nothing else in the tab. No tab throttling, no thermal ceiling, no phone.
 - **Absolute times drifted late in the session.** Repeat runs of the same
   configuration varied by ~10% after the machine had been benchmarking for a
   while, almost certainly thermal. The ratios held; the absolute seconds should
