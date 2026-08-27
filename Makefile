@@ -89,8 +89,28 @@ test-paired-race: build $(SRC) $(HDR) tests/test_paired_race.cpp
 test-v2: test-work-ledger test-transition test-root-catalogue test-world-deck \
 	test-opponent-search test-decision-search test-reply-index test-paired-race
 
-cli: build $(SRC) $(HDR) src/cli.cpp
-	$(CXX) $(CXXFLAGS) -o build/amath_cli src/cli.cpp $(SRC)
+# Measurement-only translation unit: linked into the CLI, deliberately kept out
+# of SRC so it never reaches the WASM bundle or the test binaries.
+BENCH = src/deep_bench.cpp
+
+cli: build $(SRC) $(HDR) src/cli.cpp $(BENCH)
+	$(CXX) $(CXXFLAGS) -o build/amath_cli src/cli.cpp $(BENCH) $(SRC)
+
+# Deep/Max compute-allocation experiments. Long-running measurement, not tests:
+# each prints a table and none of them can change production routing.
+# Results and interpretation live in docs/deep-compute-allocation-report.md.
+deep-bench: cli
+	./build/amath_cli deep-bench 24
+
+deep-credit-curve: cli
+	./build/amath_cli deep-credit-curve 12
+
+# G6 admission recall/regret and G7 uniform-vs-paired at equal credits.
+gate6: cli
+	./build/amath_cli g6 24
+
+gate7: cli
+	./build/amath_cli g7 16
 
 # WASM build: single-file ES module, no threads, deterministic and easy to
 # bundle from Vite (import in a Web Worker).
@@ -104,7 +124,13 @@ wasm: build $(SRC) $(HDR) src/wasm_api.cpp
 		-s EXPORTED_RUNTIME_METHODS=UTF8ToString,stringToUTF8,lengthBytesUTF8 \
 		-s STACK_SIZE=4MB
 
-.PHONY: build test test-bot test-inc test-static test-work-ledger test-transition test-root-catalogue test-world-deck test-opponent-search test-decision-search test-reply-index verify-reply-index test-paired-race test-v2 cli wasm deploy-ui
+.PHONY: build test test-bot test-inc test-static test-work-ledger test-transition test-root-catalogue test-world-deck test-opponent-search test-decision-search test-reply-index verify-reply-index test-paired-race test-v2 cli deep-bench deep-credit-curve gate6 gate7 wasm deploy-ui
 
+# The browser build is production again: the Super bot runs on the player's
+# device, so this artifact ships. It lands inside EQ-Lab's bundled source tree
+# (src/bot/engine/) rather than in tools/, because Vite has to resolve it —
+# and it is reached ONLY through a dynamic import inside a Web Worker, so it
+# stays a lazily fetched chunk rather than part of the app's first load.
+# tests/engine-in-browser.test.ts is what holds that line.
 deploy-ui: wasm
-	cp build/amath_engine.mjs ../EQ-Lab/tools/engine-wasm/amath_engine.mjs
+	cp build/amath_engine.mjs ../EQ-Lab/src/bot/engine/amath_engine.mjs

@@ -1,0 +1,583 @@
+# Practical Value Extension — adversarial review
+
+Date: 2026-08-27
+Status: **supersedes** [practical-value-extension-design.md](practical-value-extension-design.md)
+Method: re-read the production path, then compiled a measurement probe against the
+real engine sources for every claim that reading could not settle. All numbers
+below are measured in this tree.
+
+---
+
+## 0. Verdict
+
+The previous design is wrong in three load-bearing places, redundant in a fourth,
+and its central mechanism is **measurably worth about 0.2 points per position** —
+an order of magnitude below the candidate gaps it was meant to break.
+
+| Component | Verdict |
+|---|---|
+| Human-difficulty logistic (`D`, 9 features) | **CUT.** Unvalidatable by the only instrument available; one feature provably contaminated; central hypothesis has an unestablished sign. |
+| `access(C)` from anchors | **WRONG.** 24.5% of anchors on real boards cannot hold any tile. |
+| `g = tanh(scoreDiff / 80)` | **WRONG SCALE** and wrong normalizer. Saturates at the *median* in-game score gap. |
+| Corridor `gain` as a value term | **CUT.** Measured expected value ≈ 0.2 pts/position. ×27 never reachable once in 339 positions. |
+| Compile-time corridor table | Correct, free — but nothing left worth spending it on. |
+| Score-gap as a continuous modifier of existing terms | **SURVIVES**, and is the only genuinely-absent thing in the whole brief. |
+
+**The recommendation changes shape completely.** The highest-value change is one
+line restoring `defensePenalty` to `simulate()`. The second is fixing the sampling
+noise. The third is a two-line score-gap modifier on terms that already exist.
+There is no new subsystem, no corridor model, and no difficulty model.
+
+---
+
+## 1. Measurements
+
+A probe was compiled against the engine sources and run over 16 self-play games
+(339 positions, `static` solver).
+
+### 1.1 A-Math legality is far tighter than the design assumed
+
+```
+legal 2-token runs:     0 / 676          (0.0000%)
+legal 3-token runs:    21 / 17,576       (0.1195%)
+legal 4-token runs:    22 / 456,976      (0.0048%)
+```
+
+**No two-token run is ever a legal equation.** It either ends with `=`
+(`EndsWithOperator`) or begins with one (empty side → `CannotEvaluate`). This is
+the dominant fact about placement legality on this board, and the previous design
+did not know it.
+
+### 1.2 `access(C)` from anchors is therefore wrong
+
+Two positions built and measured directly:
+
+```
+(0,4), directly above a COMPLETE legal vertical equation 8−3=5 in rows 1..5:
+   anchor = 1   crossV.has = 1   crossV.mask = 0x00000000   → UNPLAYABLE
+   tokens legal at (0,4) in a horizontal play: 0 of 26
+
+(0,7) — an EX3 — directly above a single tile at (1,7):
+   anchor = 1   crossV.has = 1   crossV.mask = 0x00000000   → UNPLAYABLE
+```
+
+Across the corpus:
+
+```
+anchors seen: 21,310
+anchors where BOTH cross masks are empty (no tile can ever go there): 5,217 (24.48%)
+```
+
+A quarter of all anchors are dead cells. The previous design's
+`access = fraction of span cells that are anchors or contact-1` scores both
+positions above as accessible. They are not.
+
+This bites hardest on exactly the corridors the design was built around. The only
+orthogonal neighbours of row 0 are row 1, so a horizontal play along row 0 must
+connect through some occupied `(1,c)`, which forces the vertical run through
+`(0,c)` to be length ≥2 — and length 2 is never legal, so it must be ≥3 *and*
+still balance after our token is added. **The edge lines carrying every ×27 and
+every span-8 ×9 are the hardest cells on the board to reach legally.**
+
+### 1.3 Corridor liveness — the number that ends the corridor model
+
+Per position, averaged over 339 real positions:
+
+| multiplier | E-cells still empty | span fillable in ≤8 tiles | **legally playable** |
+|---|---:|---:|---:|
+| ×2 | 17.59 | 17.59 | 0.00 |
+| ×3 | 10.80 | 10.80 | 0.00 |
+| ×4 | 7.51 | 1.04 | 0.00 |
+| ×9 | 7.82 | 4.14 | **0.01** |
+| ×27 | 1.96 | **0.00** | 0.00 |
+
+- **A ×27 corridor was never once reachable within a rack** across 339 positions.
+  Not rare — absent.
+- ×9 corridors are geometrically reachable 4.14 times per position, but survive the
+  cross-mask legality gate **0.01** times per position: roughly one live ×9 per
+  100 positions, i.e. **once every five games**.
+- The middle column is pure geometry and unbiased. The right column is a *lower
+  bound* — it requires perpendicular contact inside the span, and a real move
+  could connect outside it — but the 400× collapse from 4.14 to 0.01 is not an
+  artifact of that bias.
+
+**Expected value of the whole corridor term:** 0.01 live ×9 per position × a
+generous 20% chance of converting × ~115 points of multiplier gain ≈ **0.2 points
+per position**. Candidate value gaps on this path are 1–4 points. The term is an
+order of magnitude too small to matter, and two orders below the sampling noise.
+
+### 1.4 Independent replication on a stronger search path
+
+The corridor measurement was repeated on a second corpus generated by the **`sim`
+solver at full budget** rather than `static` — a materially stronger player, 12
+games, 299 positions. It replicates, and the corridor conclusion is slightly
+stronger:
+
+| metric | run A (`static`, 339 pos) | run B (`sim`, 299 pos) |
+|---|---:|---:|
+| dead anchors (both cross masks empty) | 24.5% | **26.9%** |
+| ×27 corridors reachable in ≤8 tiles | 0.00 | **0.00** |
+| ×9 corridors reachable in ≤8 tiles | 4.14 | 3.82 |
+| **×9 corridors legally playable** | 0.01 | **0.00** |
+| ×4 corridors legally playable | 0.00 | 0.00 |
+| median in-game \|scoreDiff\| | 63 | 73 |
+| final score per side, p50 | 470 | 452 |
+
+Two constants widen slightly as a result and should be quoted as ranges:
+**dead-anchor rate ≈ 25% (24.5–26.9%)** and **median in-game score gap ≈ 63–73**.
+Neither changes any conclusion — at a 73-point median gap, `tanh(73/80) = 0.75`,
+so the `G = 80` critique is if anything sharper. The per-side score constant
+(4.84, CI [4.52, 5.17]) covers run B's 452 as well.
+
+The important point is that **a stronger engine did not find the corridors either**:
+across 299 positions of full-strength play, not one ×9 corridor was ever legally
+live and not one ×27 was ever reachable.
+
+### 1.5 Score and phase distributions
+
+```
+16 games, mean total 968 pts/game, mean 484 pts per side
+final score per side:   p10=357  p50=470  p90=576  max=783
+final |margin|:         p25=59   p50=85   p75=175  p90=242
+in-game |scoreDiff|:    p25=17   p50=63   p75=121  p90=182  p99=344
+games run 15–25 turns total, i.e. ~8–12 moves per side
+```
+
+Realized score per raw tile point (`premiumFactor`) ≈ **6.0** (968 points from
+~90% of 180 raw tile points). Equivalently **≈ 5.4 realized points per remaining
+tile, per side.** This is the constant the score-gap normalizer needs, and it was
+not derivable from the layout.
+
+### 1.6 One of my own attacks fails — reporting it
+
+I expected `meanUnseenPoint × cells` to badly overestimate a run, since legal
+equations force cheap operators (1.30 pts mean) between numbers (2.13 pts mean).
+Measured: an 8-cell run holds ≤4 numbers → **13.7 points structurally vs 14.4
+naive**. The naive estimate is 5% high, not 45%. `runEstimate`'s arithmetic was
+sound. What was wrong was the previous design's *worked example*, which used
+2.5 pts/tile instead of the true 1.80 and so inflated `gain` by 39% — making the
+`wSpace = 0.15` derivation invalid.
+
+---
+
+## 2. The human-difficulty model
+
+### 2.1 `oppTypical` measures generator duplicates, not opponent alternatives
+
+The model's boundedness argument rests on `(oppBest − oppTypical)` being small
+when the opponent has genuine alternatives. The diagnosis measured the reply set
+directly (§4.2):
+
+| position | replies simulated | genuinely distinct evaluations |
+|---|---:|---:|
+| pos 0 | 60 | 15 |
+| pos 1 | 60 | **3** |
+| pos 2 | 60 | 35 |
+| pos 3 | 60 | 48 |
+
+The top of a reply list is dominated by near-duplicates of one equation at one
+anchor. `oppBest − oppTypical` is therefore small mainly when **movegen emitted
+variants** and large mainly when it did not. The bound is not the bound claimed.
+
+### 2.2 `f_rank` is provably contaminated
+
+The design justified `f_rank` as "movegen is premium-ordered, so emission order
+proxies obviousness." Reading [movegen.cpp:469](../src/movegen.cpp), `premiumOrder`
+sorts *anchors* by the best premium reachable within `rack.total` cells forward.
+Within an anchor, order is start-cell then tile-kind — and tile-kind order is the
+`TileCounts` array index, i.e. the enum's numeric order.
+
+`f_rank` therefore measures approximately *"does this reply use low-numbered tiles
+at a low-premium anchor."* That is a property of an enum and a sort. It would also
+invert the moment anchor ordering changes — which the previous design itself
+proposed. **Delete.**
+
+### 2.3 The central hypothesis has an unestablished sign
+
+The model asserts: unique best reply ⇒ harder for a human. But in A-Math the
+best reply is usually a multiplier hit, and multiplier squares are *visually
+salient* — a human hunts there first. A unique best reply sitting on the ×3
+everyone is staring at is **easy**. `f_uniq` calls it hard, with the largest
+weight in the table (1.2). I have no evidence for the sign in either direction.
+
+### 2.4 It cannot be validated by the only instrument that exists
+
+The sole automated quality measure here is self-play, where the opponent is the
+engine — which has no human fallibility. Against a perfect replier the discount is
+pure bias, so **self-play A/B will always drive `W_hd → 0`.** The feature is
+unfalsifiable by the apparatus available.
+
+### 2.5 The honest half is already computed
+
+Strip the cognitive claim. The defensible reading of "hard to punish" is *the
+punishment requires specific tiles the opponent may not hold* — which is exactly
+what averaging `oppBest` over sampled opponent racks already computes. If the
+killer reply needs the single unseen `19`, most sampled worlds lack it and
+`mean_s(oppBest)` prices that correctly today.
+
+The residual — *they hold the tiles and still don't see it* — is the only new
+information, and it is the part that needs human data.
+
+### 2.6 Human data may exist, but has not been examined
+
+EQ-Lab persists immutable game snapshots (`GAME_RECORDS_ARCHITECTURE.md`), and
+[`export_turns.mts`](../../EQ-Lab/export_turns.mts) shows each turn carries
+`boardBefore`, `rackBefore`, the move played, and `finalScore`. The architecture
+doc names `completion_kind = 'natural'` as "the only supported bot-training
+filter."
+
+So the status is not *impossible* — it is **"requires an offline study nobody has
+run."** See E5.
+
+### 2.7 Verdict and the honest rename
+
+**Cut the term. Do not ship it at `W_hd = 0` either** — dead weighted code invites
+someone to enable it. Keep only a zero-cost `replyConcentration` diagnostic in
+`CandidateDiag` so the data to decide later starts accumulating now.
+
+If a term is ever justified, do not call it human difficulty:
+
+| Candidate name | Measurable now? | Adds info beyond sampling? |
+|---|---|---|
+| Counterplay uniqueness | Yes, but duplicate-contaminated | Little |
+| Counterplay concentration | Yes, if over *disjoint* cell sets | Some |
+| Opponent response entropy | Yes | Same contamination |
+| Gap between best and typical | Yes | Measures duplicates (§2.1) |
+| **Rack-contingency of the punishment** | **Already is `stddev_s(oppBest)`** | **None — already there** |
+
+The last row is the point: the concept the requirement reaches for is already in
+the evaluator as the variance term. It is merely computed badly (E2).
+
+---
+
+## 3. The board-space model
+
+### 3.1 What `runEstimate` is, point by point
+
+| Question | Answer |
+|---|---|
+| Based on legal equation generation? | **No.** Geometry × an average tile. |
+| Accounts for the current rack? | Only via `fit`, a counter ratio. |
+| Likely future racks? | Only via `meanUnseenPoint`. |
+| Entry points? | Was supposed to, via `access` — **§1.2 proves that wrong**. |
+| Who accesses first? | Only a constant `δ = 0.55`. |
+| Blocking? | Implicitly, via the delta. |
+| Existing anchors? | Yes — and that was the error. |
+| Knows long corridors aren't exploitable? | Only by tile count, not legality. |
+| **Can a huge ×27 be worthless?** | **Yes. All four. Always. §1.3.** |
+
+### 3.2 The model undervalues where A-Math scoring actually lives
+
+Tile points run 0–7 and the heavies are singletons: one `19` (7), one `13`, one
+`17` (6 each). A `19` on a PX3 scores 21 in the main run **and 21 again in a
+cross run** — 42 points from one tile, no equation multiplier involved.
+(`validatePlaceMove` calls `scoreRun` once per run, and the premium applies in
+each.)
+
+The corridor model gives PX3 nothing but a `pointWeight` entry *inside an
+E-corridor span*. `(7,7)` — the centre star, the most-played cell on the board —
+sits only in span-15 corridors whose `proximity` is ~0. **The single most
+important premium cell scores approximately zero in the proposed model.**
+
+That is the deepest error: the design assumed compound *equation* multipliers are
+where the value is, because they are the mathematically interesting structure. The
+measured board says the value is in tile multipliers and cross runs.
+
+### 3.3 Compound valuation: the scale was right, the probability was not
+
+`gain = runEstimate · (multiplier − 1)` gives ×27 a ratio of 26/8 = 3.25 over ×9.
+Conditional on realization that is exactly right, and the `−1` correctly removes
+the run you would have scored anyway. It omits the **bingo (+40)** that a one-turn
+×27 necessarily also earns. But the fatal issue is not the scale — it is that
+`P(realize ×27)` measured **0.00 across 339 positions**.
+
+---
+
+## 4. Is "corridor" the right abstraction?
+
+| | **A** static corridors | **B** legal future placements | **C** generate from board+rack | **D** geometry + legality gate |
+|---|---|---|---|---|
+| Accuracy | Low (§1.2, §1.3) | High | **Exact at horizon 1** | Medium |
+| Cost | ~300 ops/candidate | Very high | **Already paid** | ~1k ops/candidate |
+| Captures ×4/×9/×27 | Proxy | Yes | **Exactly, via `scoreRun`** | Proxy |
+| Captures open/close | Yes | Yes | Only within its node cap | Yes |
+| Needs rack info | Weakly | Yes | Yes | Weakly |
+| Double-counting risk | **High** | High | N/A — it *is* the existing term | Medium |
+| Incremental | Yes | No | No | Yes |
+| **Measured value** | **≈0.2 pts/position** | — | in place | ≈0.2 pts/position |
+
+**Model C is already implemented.** `bestPlaceScore(boardAfter, refilled)` is
+Model C for us at horizon 1; `oppBest` is Model C for the opponent at horizon 1.
+Both call `scoreRun`, which does `mult *= 3` per new EX3 — so **×9 and ×27 are
+already valued exactly and nonlinearly for every move the generator produces.**
+
+A and D can only add compounds *nobody can reach this turn*. §1.3 measured that
+residual at ~0.2 points. **Recommend none of them.**
+
+Corroborating evidence from the neighbouring domain: strong Scrabble engines
+(Quackle, Macondo) carry no multi-cell premium-geometry feature; their strength
+comes from simulation depth, leave tables, and inference.
+
+---
+
+## 5. Score-gap weighting
+
+### 5.1 `/80` saturates at the median
+
+There is no justification for 80 in the design or the code — I chose it. Measured,
+the median in-game `|scoreDiff|` is **63** and p90 is **182**:
+
+| G | tanh(63/G) at the median | tanh(182/G) at p90 |
+|---:|---:|---:|
+| **80** | **0.66** | **0.98** |
+| 200 | 0.30 | 0.72 |
+| 540 | 0.12 | 0.32 |
+
+At `G = 80` the tilt is at two-thirds of maximum in *half of all positions*, and
+effectively pinned at p90. Concretely: turn 2 after a 60-point opener gives
+`g = −0.64` and the bot enters comeback weighting on move two — which is normal
+variance, not a deficit.
+
+### 5.2 The normalizer should be remaining score, not a constant
+
+```
+remainingTiles  = bagSize + myRack.total + opponentRackCount
+expectedPerSide ≈ 5.4 · remainingTiles          (measured, §1.4)
+g = tanh( scoreDiff / max(FLOOR, c · 5.4 · remainingTiles) )      FLOOR ≈ 20
+```
+
+Self-normalizing across phases, with no separate `phase` multiplier:
+
+| moment | remainingTiles | denominator | 63-pt gap → g | 63-pt gap at G=80 |
+|---|---:|---:|---:|---:|
+| game start | 100 | 540 | **0.12** | 0.66 |
+| midgame | 40 | 216 | **0.28** | 0.66 |
+| bag 4, full racks | 20 | 108 | **0.54** | 0.66 |
+
+The same point lead correctly means more as the game shortens. `c` remains
+**UNKNOWN — set it from E0**, but the shape is now empirically grounded.
+
+### 5.3 Two endgame positions where the tilt is backwards
+
+**Ahead should not always mean safer.** Bag 0, leading by 30, rack
+`{19, 13, =, ×}` = 15 points. Going out adds 2× the opponent's remainder to me;
+being caught with those heavies hands the same swing back. Leading should push
+toward **dumping tiles** — keeping the board open enough to place heavies.
+`g → +1` pushing toward closure is inverted.
+
+**Behind should not always mean opening.** Bag 2, trailing by 30, both racks near
+full. Opening when the opponent moves next and can bingo out hands over the game.
+
+Both live in the **bag 2–5 window**, which is currently unowned: the exact solver
+declines it (`endgameExactBagMax = 1`, `endgameExactTilesMax = 13`) and the
+sampler is weakest there. **Gate the tilt off below a bag threshold** and treat
+that window as separate work.
+
+---
+
+## 6. Double-counting dependency map
+
+| Existing term | Opponent counterplay | Board space | Multiplier access | ×4/×9/×27 | Future scoring |
+|---|---|---|---|---|---|
+| `move.score` | — | — | realized, exact | **exact** | — |
+| `oppBest` | **exact at 1 ply**, avg over racks | implicit, exact | **exact** | **exact** | opponent, 1 turn |
+| `β · bestPlaceScore` | — | implicit, exact | **exact** | **exact** | ours, 1 turn |
+| `leave` | — | only via `mobility` | — | — | rack quality |
+| `defensePenalty` (**`staticEquity` only**) | linear radius-1 proxy | crude | per-cell, linear | **no** | — |
+| `λ · stddev` | rack-contingency of punishment | — | — | — | — |
+
+What each proposed term would add:
+
+| Proposed term | New information |
+|---|---|
+| `oppSpace` at horizon 1 | **None.** Inside `oppBest`. |
+| `ourSpace` at horizon 1 | **None.** Inside `bestPlaceScore`. |
+| ×9/×27 recognition for reachable moves | **None.** `scoreRun` is exact. |
+| Compounds unreachable this turn | **≈0.2 pts/position** (§1.3). Not worth code. |
+| Backstop for truncation (33.5% / 40.2%) | Some — but the direct fix is raising node caps. |
+| Human difficulty | **None measurable.** §2. |
+| **Score-gap modifier** | **Genuinely new** — `scoreDiff` currently reaches only the exchange nudge and `λ`. |
+
+**Of the four requested feature groups: compound nonlinearity is already
+implemented exactly; our-space and their-space at horizon 1 are already
+implemented exactly; human difficulty cannot be validated; and score-gap
+weighting is the one real gap.** It is also the smallest and least glamorous.
+
+---
+
+## 7. Adversarial positions
+
+1. **Huge ×27, useless.** All four, always — 0.00 reachable in 339 positions.
+2. **Small multiplier, critical.** PX3 at `(7,7)`; or any PX3 reachable with the
+   single `19` — up to 42 points across two runs. Corridor model scores it ≈ 0.
+3. **Opens a huge corridor for both.** Filling row 3 between `(3,3)` and `(3,11)`.
+   Both space terms jump; the sign rests entirely on `fit`, the crudest component.
+4. **Appears to close, opens another route.** A tile at `(3,7)` shortens row 3's
+   ×4 while creating a new anchor in column 7. The net's sign rests on two `fit`
+   estimates.
+5. **`oppBest` huge, irrelevant.** One sampled rack holds the only unseen `19`
+   plus a blank → `oppBest` = 120 in that world. With **3 samples** that moves the
+   mean ~40 points. Argues for more samples, not a new term.
+6. **`oppBest` modest, unavoidable.** A 35-point hook at six different cells;
+   nothing blocks it, `stddev ≈ 0`. Under `mean − λ·stddev` this scores *better*
+   than case 5 despite being a certain loss.
+7. **Difficulty rewards a worse move.** Giving up 3 equity to leave one "unique"
+   answer. With `W_hd` uncalibrated the risk is unbounded, and "one hard answer"
+   is often "one devastating answer".
+8. **Ahead, should not close.** §5.3.
+9. **Behind, should not open.** §5.3.
+10. **Score gap picks wrong.** Turn 2 after a 60-point opener: `g = −0.64` at
+    `G = 80`. §5.1.
+
+Cases 3 and 4 are the ones the corridor model handles worst — and both hinge on
+`fit`, which is a counter ratio with no legality content.
+
+---
+
+## 8. Consumption is double counted
+
+The previous design claimed all seven open/close verbs fall out of
+`spaceAfter − spaceBefore`. One does not.
+
+Move A covers an EX3 and scores 60; move B ignores it and scores 55. `Δspace`
+credits A for removing the opponent's corridor — but A's 60 **already contains the
+×3 it took**. Counting the opponent's loss on top is double counting, and the
+design's "never re-credited as points" claim was hand-waving.
+
+Had the corridor model survived, the fix would be to exclude corridors whose
+E-cells the move itself covers, pricing only *opening* and *closing*. It does not
+survive, so this is recorded as a defect found rather than a change made.
+
+---
+
+## 9. The measurability trap
+
+This governs everything above.
+
+Candidate value gaps on the production path are **1–4 points** (diagnosis §2.4).
+Sampling `stddev` is **37–77 points from 3 samples**.
+
+- Size a term at ~3.6 points (the previous `wSpace = 0.15`) and it **decides**
+  most positions rather than breaking ties — violating the explicit requirement
+  that objective strength stay dominant.
+- Size it at ~1 point and it is far below the noise floor of the only instrument
+  that could validate it.
+
+**No evaluation term of tiebreaker magnitude can be A/B tested until the sampling
+noise comes down.** Shipping one before that means shipping untestable code. This
+is why E2 is a prerequisite, not an improvement.
+
+---
+
+## 10. Recommendation
+
+### A. Survives unchanged
+- The existing search, selection, and candidate admission. Untouched.
+- Score gap as a **continuous** scalar, never a `LEADING`/`LOSING` state.
+- The band-pass principle: price only what the 1-ply terms cannot reach.
+
+### B. Needs modification
+- Score-gap normalizer → remaining expected score (§5.2), with `c` from E0.
+- Score-gap tilt gated off in the bag 2–5 window (§5.3).
+- `λ` → paired differences instead of unpaired `stddev` (E2).
+
+### C. Remove
+- The human-difficulty logistic, `oppTypical`, `f_rank`, `f_uniq` — all of §2.
+- The corridor model, `runEstimate`, `gain`, `fit`, `access`, `proximity`,
+  `SpaceWeights`, and both proposed new translation units. §1.3 and §4.
+- The claim that the engine needs a compound-multiplier model at all. It has one:
+  `scoreRun`.
+
+### D. Cannot currently be measured
+- Human cognition — needs E5.
+- Sign of `f_uniq` — needs E5.
+- `premiumFactor` was UNKNOWN; it is now **measured at ≈6.0** (§1.4).
+- Whether the bag 2–5 window is being played competently at all.
+
+### E. Implement first — in this order
+
+**E0 — constants (hours, no engine change).** Confirm `premiumFactor` and the
+`|scoreDiff|` distribution on a larger corpus and on the `sim` path, not just
+`static`.
+
+**E1 — restore the defensive term (one line).**
+```
+myVal = scoreComp[i] + sampLeave + sampPot − defensePenalty(board, cand.placements);
+```
+Re-run the diagnosis's own A/B (`hard` vs `easy`, seeds 4242 and 31337).
+Prediction: the 2–16 record moves toward parity. This is the single largest
+evidenced win available — the diagnosis measured `sim` opening 14% more premium
+cells and scoring 2.1 fewer points per move than `static`, ≈105 points per game,
+matching the observed −85 to −132 margins.
+
+**E2 — fix the instrument.** Deduplicate candidates by evaluation before
+simulating (95% of the budget went to duplicates in one measured position), and
+switch `λ` to paired differences. Without this nothing else can be tested.
+
+**E3 — score-gap tilt.** Only after E0 and E2.
+
+**E5 — human-difficulty feasibility study (offline, no engine change).** Replay
+`public_game_snapshots` with `completion_kind = 'natural'`; for each human turn
+reconstruct `boardBefore`/`rackBefore`, run the engine at `max`, record the rank
+and equity gap of the move the human actually played. Regress "human found the top
+move" on candidate features. Needs ≥500 human turns to fit even 5 features. Only
+features with a significant coefficient may enter anything, and the output should
+be a **single miss-rate `p`**, not a 9-feature logistic.
+
+### F. Revised value formula
+
+```
+                                                          ── unchanged ──
+rowVal = move.score
+       + leaveValue(refilled, ctx)
+       + β · bestPlaceScore(boardAfter, refilled)
+       − oppBest
+
+                                                          ── E1: restore ──
+       − W_def(g) · defensePenalty(board, cand.placements)
+
+value  = mean_s(rowVal) − λ · stddev_paired(rowVal)       ── E2: paired ──
+```
+
+with
+
+```
+W_def(g) = 1 + κ · g                        κ ≈ 0.5, so W_def ∈ [0.5, 1.5]
+g        = tanh( scoreDiff / max(20, c · 5.4 · remainingTiles) )
+g        = 0 when bagSize is inside the endgame window
+```
+
+Three changed lines. Two new scalars (`κ`, `c`). No new files, no new subsystem,
+no new decision layer, and every function called already exists.
+
+This satisfies the original brief as follows: **compound-multiplier nonlinearity
+is already exact in `scoreRun`; our-space and opponent-space at the horizon that
+matters are already exact in `bestPlaceScore` and `oppBest`; and the score gap now
+continuously modulates an existing evaluation term rather than switching a mode** —
+which is precisely what the brief asked for in its own words ("make the score
+difference influence the numerical value of these existing/new evaluation terms").
+
+---
+
+## 11. Confidence
+
+| Decision | Confidence | Why |
+|---|---|---|
+| 2-token runs never legal; 24.5% of anchors dead | **HIGH** | Exhaustive enumeration + 21,310 measured anchors |
+| `access` from anchors is wrong | **HIGH** | Direct consequence, demonstrated on an EX3 |
+| `scoreRun` already values ×9/×27 exactly | **HIGH** | Read directly: `mult *= 3` per new EX3 |
+| Corridors add nothing at horizon 1 | **HIGH** | Follows from the two rows above |
+| ×27 corridors are practically unreachable | **HIGH** | 0.00 per position over 339 positions |
+| Corridor term ≈ 0.2 pts/position | **MEDIUM-HIGH** | Liveness measured; the 20% conversion factor is a generous estimate, not measured |
+| `simulate()` has no defensive term | **HIGH** | Read directly; diagnosis quantified the cost |
+| E1 is the best first change | **MEDIUM-HIGH** | Strong indirect evidence; not yet an A/B on this exact change |
+| `premiumFactor ≈ 6.0` | **MEDIUM-HIGH** | 16 games, `static` solver only — re-measure on `sim` |
+| Score-gap normalizer should be remaining score | **MEDIUM-HIGH** | Shape follows from §1.4; **`c` is UNKNOWN — E0** |
+| `G = 80` is wrong | **HIGH** | Saturates at the measured median gap |
+| Bag 2–5 tilt is backwards | **MEDIUM** | Reasoned from rack-out scoring, not measured |
+| `runEstimate` arithmetic sound | **MEDIUM-HIGH** | Structural estimate within 5% of naive |
+| Human-difficulty measurement | **UNKNOWN — requires E5** | No human corpus examined; self-play cannot validate it |
+| Sign of `f_uniq` | **UNKNOWN — requires E5** | Salience and uniqueness are orthogonal |
+| `oppTypical` as a difficulty signal | **LOW → reject** | Measures generator duplicate density |
+| Bag 2–5 play quality | **UNKNOWN** | Owned by neither the exact solver nor a strong sampler |
+| The corpus generalizes | **MEDIUM** | 16 games, one solver, self-play only — not human games |

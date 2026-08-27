@@ -16,7 +16,11 @@
 // Every request passes four gates, in this order, cheapest first:
 //
 //   1. AUTHENTICATION   a verified Supabase access token (auth.ts)
-//   2. METERING         per-user compute budget and concurrency (rateLimit.ts)
+//   2. METERING         per-user concurrency and compute budget (rateLimit.ts).
+//                       An account holds ONE analysis at a time (queued counts
+//                       as held), and that is the whole of the analysis limit:
+//                       the sliding-window budget applies to bot turns, and to
+//                       analysis only under ENGINE_ANALYSIS_BUDGETED.
 //   3. AUTHORIZATION    what Postgres says this user may do here (roomContext.ts)
 //   4. TURN RULES       enforced below, and only below — the UI's copy of these
 //                       rules is a convenience, never the decision
@@ -25,11 +29,17 @@ import { type Context, Hono } from "hono";
 import { cors } from "hono/cors";
 import { streamSSE } from "hono/streaming";
 
-import { type AnalysisResult, AnalysisUnavailableError, buildAnalysis } from "./analysis.js";
+import {
+  type AnalysisResult,
+  type StudyAnalysisResponse,
+  AnalysisUnavailableError,
+  buildAnalysis,
+  buildStudyAnalysis,
+} from "./analysis.js";
 import { type Caller, UnauthenticatedError, bearerFrom, createTokenVerifier } from "./auth.js";
-import { toEngineRequest } from "./adapter.js";
+import { seedFor, toEngineRequest, toStudyEngineRequest } from "./adapter.js";
 import { CanonicalStateError, otherSide } from "./canonical.js";
-import type { ServiceConfig } from "./config.js";
+import { clientSuperAllowedFor, type ServiceConfig } from "./config.js";
 import {
   EngineCancelledError,
   EngineFailureError,
@@ -37,13 +47,19 @@ import {
   type EngineProgress,
   type EngineResponse,
   runEngine,
+  runEngineValidation,
 } from "./engineRunner.js";
 import {
   ANALYSIS_LEVEL_CONFIG,
   BOT_PRIORITY,
+  BOT_REPORT_TOP_N,
+  BOT_TIERS,
   BOT_TIER_CONFIG,
+  STUDY_PRIORITY,
+  STUDY_TOP_N,
   type AnalysisLevel,
   isAnalysisLevel,
+  isBotTier,
 } from "./levels.js";
 import {
   EngineQueue,
@@ -54,6 +70,13 @@ import {
 } from "./queue.js";
 import { JobRegistry, type JobKind, type JobObserver, type JobParams } from "./jobRegistry.js";
 import { ComputeBudget, ConcurrencyLimit } from "./rateLimit.js";
+import { StudyPositionError, parseStudyPosition, studyFingerprint } from "./study.js";
+import {
+  SUPER_ENGINE_VERSION,
+  SUPER_WEIGHTS_VERSION,
+  isKnownWeightsVersion,
+  superClientConfig,
+} from "./superConfig.js";
 import {
   RoomAccessError,
   loadContextAndCommands,
@@ -64,6 +87,23 @@ import {
 /** How many trailing commands to read for the scoreless-turn streak. The rule
  *  ends a game at six, so anything beyond this cannot change the answer. */
 const STREAK_LOOKBACK = 24;
+
+/** Default and maximum page size for the bot reasoning report. The report is
+ *  read a page at a time so opening the panel costs one small response rather
+ *  than the whole ranking. */
+const REASONING_PAGE_DEFAULT = 6;
+const REASONING_PAGE_MAX = 24;
+
+/**
+ * How far behind the current revision a reasoning report may be requested.
+ *
+ * The panel only ever asks about the bot move that is still the latest one on
+ * the board — one revision back, or the same revision when the move has been
+ * computed but not yet committed. The small window absorbs a client that is a
+ * beat behind (a refill commit, a resync landing mid-read) without turning this
+ * into a way to walk the result cache backwards through a game.
+ */
+const REASONING_LOOKBACK = 4;
 
 /**
  * Whether the caller wants progress streamed.
@@ -115,6 +155,23 @@ class RequestTiming {
   }
 }
 
+/**
+ * Read one paging number off the query string, clamped into range.
+ *
+ * Clamped rather than refused: a pager that 400s on an out-of-range page is a
+ * pager the client has to predict the bounds of, and the bounds (how many
+ * candidates the engine actually reported) are only knowable from the response.
+ * What was actually served comes back in `page`, so a clamped request is
+ * self-describing rather than silently wrong. A value that is not a number at
+ * all is a different thing — that is a caller mistake, and it takes the default.
+ */
+function pageNumber(raw: string | undefined, fallback: number, min: number, max: number): number {
+  if (raw === undefined || raw === "") return Math.min(Math.max(fallback, min), max);
+  const value = Number(raw);
+  if (!Number.isInteger(value)) return Math.min(Math.max(fallback, min), max);
+  return Math.min(Math.max(value, min), max);
+}
+
 export type AppDependencies = {
   config: ServiceConfig;
   source: GameStateSource;
@@ -127,6 +184,9 @@ export type AppDependencies = {
   /** Injectable so tests can drive the whole request path without a compiler
    *  or a several-second search. */
   runEngine?: typeof runEngine;
+  /** Injectable for the same reason, and separately: a legality check is a
+   *  different question with a different answer shape. */
+  runValidation?: typeof runEngineValidation;
   verifyToken?: (token: string) => Promise<Caller>;
 };
 
@@ -172,7 +232,10 @@ export type RunHooks = {
 function streamResult<T>(
   c: Context,
   start: (hooks: RunHooks) => Promise<EngineResponse>,
-  present: (response: EngineResponse) => T,
+  /** May be async: the study endpoint persists the ranking before it is sent,
+   *  so a record exists whether or not the client is still listening. A failure
+   *  here lands in the same catch as an engine failure and is reported as one. */
+  present: (response: EngineResponse) => T | Promise<T>,
   onFailure: () => void,
   onSettled?: () => void,
 ) {
@@ -211,7 +274,7 @@ function streamResult<T>(
           });
         },
       });
-      send("result", present(response));
+      send("result", await present(response));
       await chain;
     } catch (error) {
       onFailure();
@@ -263,6 +326,14 @@ function describeStreamError(error: unknown): Record<string, unknown> {
 export function createApp(deps: AppDependencies) {
   const { config, source, queue, budget, analysisSlots } = deps;
   const engine = deps.runEngine ?? runEngine;
+  const validateWithEngine = deps.runValidation ?? runEngineValidation;
+  // Per-account, and tiny. A validation is microseconds of rules arithmetic, so
+  // this is not a CPU protection — it is the bound that stops one account
+  // spawning processes in a loop. It is deliberately NOT the search queue:
+  // making a move submission wait behind a five-minute analysis would mean a
+  // player who computed their bot move in ten seconds then waited minutes for
+  // permission to play it.
+  const validationSlots = new ConcurrencyLimit(config.validationConcurrency);
   const verify = deps.verifyToken ?? createTokenVerifier(config.supabaseUrl);
   const registry =
     deps.registry ??
@@ -312,6 +383,52 @@ export function createApp(deps: AppDependencies) {
       retention: {
         analysisResultTtlMs: config.analysisResultTtlMs,
         botResultTtlMs: config.botResultTtlMs,
+      },
+      // The rollout switch and what it would hand out, so an operator can read
+      // the client-side Super state off the same page as the queue rather than
+      // inferring it from an environment they cannot see. Enabled here does not
+      // mean every Super turn left this instance: a client whose browser cannot
+      // run a worker, or that failed to fetch its config, falls back to the
+      // backend path and shows up in the queue like any other bot turn. Being
+      // SLOW is not among the reasons — a slow device runs full Super locally
+      // and simply takes longer over it.
+      //
+      // `adaptiveBudget` is surfaced because it is the one switch that changes
+      // how STRONG the client-side bot plays rather than how fast, and an
+      // operator should never have to read the environment to find out whether
+      // it is on. It is off in every normal deployment.
+      clientSuper: {
+        enabled: config.clientSideSuper,
+        // WHO actually gets it. `enabled: true` with an audience of 0 serves the
+        // backend path to everybody, which looks like a broken rollout unless
+        // the audience is on the same screen as the switch.
+        audience:
+          !config.clientSideSuper
+            ? "nobody (flag off)"
+            : config.clientSideSuperUserIds.length === 0
+              ? "nobody (no CLIENT_SIDE_SUPER_USER_IDS set)"
+              : config.clientSideSuperUserIds[0] === "*"
+                ? "everyone (general availability)"
+                : `${config.clientSideSuperUserIds.length} champion(s)`,
+        engineVersion: SUPER_ENGINE_VERSION,
+        weightsVersion: SUPER_WEIGHTS_VERSION,
+        adaptiveBudget: config.superAdaptiveBudget ? "ON (reduces Super strength)" : "off",
+      },
+      // How analysis load is bounded changes how the numbers above should be
+      // read: a deployment that rations analysis sheds load a deployment that
+      // only serialises it will instead put in this queue. Stated here rather
+      // than inferred from a dashboard.
+      metering: {
+        analysisInFlight: config.maxAnalysisPerUser,
+        // `botBudget` used to be the literal string "rationed" whatever the
+        // configuration said. An operator checking whether metering is on got
+        // "yes" either way.
+        analysisBudget:
+          config.budgetEnforced && config.analysisBudgeted ? "rationed" : "unlimited",
+        botBudget: config.budgetEnforced ? "rationed" : "unlimited",
+        ...(config.budgetEnforced
+          ? { budgetPerWindow: config.budgetPerWindow, budgetWindowMs: config.budgetWindowMs }
+          : {}),
       },
     }),
   );
@@ -393,6 +510,17 @@ export function createApp(deps: AppDependencies) {
     timeoutMs: number;
     signal: AbortSignal;
     hooks: RunHooks;
+    /**
+     * Re-checked at the moment the job actually starts, if it waited in the
+     * queue. Defaults to the game rule: the room must still be at the revision
+     * the request was admitted against, or the answer would be about a position
+     * the game has already left.
+     *
+     * Study passes a no-op. A made-up position cannot go stale — there is no
+     * room to move on — and the default would try to load a game id that does
+     * not exist.
+     */
+    revalidate?: () => Promise<void>;
     /** Called with `true` when this request joined an existing search instead of
      *  starting one, so the caller can undo metering it did not earn. */
     onReused?: () => void;
@@ -412,9 +540,12 @@ export function createApp(deps: AppDependencies) {
         params: options.params,
         run: async ({ signal, waited, onProgress }) => {
           if (waited) {
-            const fresh = await source.loadContext(options.gameId, options.caller.token);
-            if (fresh.revision !== options.admittedRevision) {
-              throw new StaleRevisionError(fresh.revision, options.admittedRevision);
+            if (options.revalidate) await options.revalidate();
+            else {
+              const fresh = await source.loadContext(options.gameId, options.caller.token);
+              if (fresh.revision !== options.admittedRevision) {
+                throw new StaleRevisionError(fresh.revision, options.admittedRevision);
+              }
             }
             if (signal.aborted) throw new EngineCancelledError();
           }
@@ -558,7 +689,7 @@ export function createApp(deps: AppDependencies) {
     }
 
     const tier = BOT_TIER_CONFIG[context.botDifficulty];
-    const cost = context.botDifficulty === "max" ? 8 : 2;
+    const cost = tier.cost;
     const charged = budget.charge(caller.userId, cost);
     if (!charged.allowed) throw new BudgetError(charged.retryAfterMs, charged.remaining);
     timing.mark("gates");
@@ -577,13 +708,20 @@ export function createApp(deps: AppDependencies) {
       difficulty: context.botDifficulty,
       solver: tier.solver,
       ...(tier.budgetMs != null ? { budgetMs: tier.budgetMs } : {}),
+      ...(tier.unlimited ? { unlimited: true } : {}),
+      // Ask for a full ranking rather than the engine's default handful. This
+      // changes nothing about the search or the move — see BOT_REPORT_TOP_N —
+      // and it is what the reasoning endpoint below pages through.
+      topN: BOT_REPORT_TOP_N,
       events,
     });
 
-    // Only the move goes back. The candidate report is the engine's reasoning
-    // about the BOT's rack, and the player on the other side is not entitled to
-    // it — it would name tiles the bot holds. `mapBotResponse` in the client
-    // needs the move and nothing else.
+    // Only the move goes back on THIS response. The candidate report describes
+    // the bot's own rack, so it is not shipped alongside a move the opponent's
+    // client applies; it is served separately, one page at a time, by
+    // `GET .../bot-move/reasoning` — same room, same controller, and only after
+    // the move it explains has been played. `mapBotResponse` in the client needs
+    // the move and nothing else.
     const present = (response: EngineResponse) => ({
       revision: context.revision,
       gameId,
@@ -639,6 +777,137 @@ export function createApp(deps: AppDependencies) {
     }
   });
 
+  // ── GET /v1/bot-config ─────────────────────────────────────────────────────
+  //
+  // What a client-side Super engine is supposed to be running, and whether it
+  // is allowed to run at all.
+  //
+  // Authenticated, because the flag is a rollout decision about a signed-in
+  // population and there is no reason to publish it wider. It is NOT secret:
+  // the weights it carries are served in plain JSON to a browser that will hand
+  // them to a WASM module the player could read anyway. Guarding them would buy
+  // nothing and cost the one thing this endpoint exists for — being able to
+  // retune the bot without shipping a new engine to everybody.
+  //
+  // `?weightsVersion=` asks for a SPECIFIC version rather than the current one.
+  // That is what makes a finished game reproducible: a game pinned to `v1`
+  // fetches `v1` for as long as it runs, and for as long as anyone wants to
+  // replay it, even after `v2` becomes the default for new games.
+  app.get("/v1/bot-config", async (c) => {
+    const caller = await authenticate(c);
+    const requested = c.req.query("weightsVersion");
+    if (requested !== undefined && !isKnownWeightsVersion(requested)) {
+      // Refused, not silently defaulted. A game pinned to a version this
+      // deployment no longer carries must fail loudly and fall back to the
+      // backend engine, because answering with DIFFERENT weights under the
+      // requested version's name is the one outcome pinning exists to prevent.
+      throw new BadRequestError(`This deployment does not carry weights version "${requested}".`);
+    }
+    // Cacheable for a short while and never shared. This matters more now that
+    // the response varies per CALLER: `private` keeps it in the requesting
+    // browser's own cache, where a shared cache holding one Champion's
+    // `clientSuperEnabled: true` cannot serve it to a general user.
+    c.header("Cache-Control", "private, max-age=300");
+    return c.json(
+      superClientConfig({
+        // Per-CALLER, not per-deployment. The flag is the master switch and the
+        // allowlist is the audience; a signed-in player who is not a Champion
+        // gets `false` here and plays the backend path, which is untouched.
+        clientSuperEnabled: clientSuperAllowedFor(config, caller.userId),
+        adaptiveBudgetEnabled: config.superAdaptiveBudget,
+        ...(requested !== undefined ? { weightsVersion: requested } : {}),
+      }),
+    );
+  });
+
+  // ── POST /v1/games/:gameId/bot-move/validate ───────────────────────────────
+  //
+  // Is this move legal from the position this server is holding?
+  //
+  // That is the WHOLE claim. It is deliberately not "is this the move the
+  // engine would have played" — proving that means running the Super search
+  // again, which is precisely the CPU cost the client-side path exists to
+  // remove. For a trusted Champion beta, legality is the useful half: it
+  // catches an engine bug, a desynced rack and a stale position, which are the
+  // three ways a client-computed move actually goes wrong.
+  //
+  // Everything the verdict is computed against comes from canonical state at a
+  // revision the caller had to name correctly. The submitted move is the only
+  // thing the caller contributes, so a caller cannot make an illegal move legal
+  // by also describing a board on which it would be.
+  app.post("/v1/games/:gameId/bot-move/validate", async (c) => {
+    const timing = new RequestTiming();
+    const caller = await authenticate(c);
+    timing.mark("auth");
+    const gameId = c.req.param("gameId");
+    const body = await readBody(c);
+
+    const move = body.move;
+    if (!move || typeof move !== "object") {
+      throw new BadRequestError("A move is required.");
+    }
+
+    const { context, events } = await loadContextAndCommands(
+      source,
+      gameId,
+      caller.token,
+      Number(body.expectedRevision),
+      STREAK_LOOKBACK,
+    );
+    timing.mark("context");
+    requireRevision(context, body.expectedRevision);
+    requirePlayable(context);
+
+    if (!context.botSide || !context.botDifficulty) {
+      throw new TurnRuleError("This game has no engine player.");
+    }
+    if (context.activeSide !== context.botSide) {
+      throw new TurnRuleError("It is not the engine's turn.");
+    }
+    if (!context.callerControlsActiveSide) {
+      throw new ForbiddenError("You do not control this game.");
+    }
+
+    if (!validationSlots.tryAcquire(caller.userId)) {
+      // Not budget_exhausted: nothing was rationed and nothing was spent. The
+      // caller simply has more of these in flight than one account needs, and
+      // the honest answer is to retry immediately.
+      c.header("Retry-After", "1");
+      throw new BadRequestError("Too many move validations in flight. Retry.");
+    }
+    timing.mark("gates");
+    try {
+      // Built by the SERVER from canonical state, exactly as a bot search is —
+      // then given a mode instead of a budget. No search runs.
+      const request = {
+        ...toEngineRequest(context.canonical, {
+          side: context.botSide,
+          difficulty: context.botDifficulty,
+          events,
+        }),
+        mode: "validate",
+        move,
+      };
+      const verdict = await validateWithEngine({
+        binaryPath: config.enginePath,
+        request,
+        // Generous for something that takes microseconds. It is a reaper for a
+        // wedged process, not a bound on the work.
+        timeoutMs: 5_000,
+        signal: c.req.raw.signal,
+      });
+      timing.applyTo(c);
+      return c.json({
+        revision: context.revision,
+        gameId,
+        side: context.botSide,
+        ...verdict,
+      });
+    } finally {
+      validationSlots.release(caller.userId);
+    }
+  });
+
   // ── POST /v1/games/:gameId/analysis ────────────────────────────────────────
 
   app.post("/v1/games/:gameId/analysis", async (c) => {
@@ -687,10 +956,26 @@ export function createApp(deps: AppDependencies) {
 
     const key = `analysis:${gameId}:${context.revision}:${level}`;
 
+    // ── metering ──────────────────────────────────────────────────────────────
+    //
+    // ONE AT A TIME, not N per hour. An account may hold `maxAnalysisPerUser`
+    // analyses in flight — and "in flight" includes QUEUED, because a job
+    // waiting its turn is work this account has already asked for and is about
+    // to be given. So while the analysis of one game is still in the queue,
+    // asking about a different game is refused until that one is done; the
+    // first is not cancelled, hurried, or moved — it keeps its place in line.
+    //
+    // What this deliberately is NOT is a ration. There is no per-window quota
+    // on analysis by default (`analysisBudgeted` in config.ts): a player may
+    // press analyse as often as they like, for as long as they like, and each
+    // press waits for the previous one rather than being told they are out.
+    // Rationing fails a player mid-game on the turn they stopped to think
+    // about, and nothing they do — including waiting — produces the answer.
+    //
     // Joining a search that already exists for this exact position and level is
-    // not a second analysis. Metering it as one is how a returning player, or a
-    // second tab, got refused for work they had already paid for — the cap
-    // exists to bound CONCURRENT SEARCHES, not observers of one.
+    // not a second analysis and takes no slot: that is one search with two
+    // observers, and refusing the second is how a returning player, or a second
+    // tab, got told to wait for work that was already theirs.
     const alreadyRunning = registry.inspect(key) !== null;
     let holdsSlot = false;
     if (!alreadyRunning) {
@@ -700,15 +985,17 @@ export function createApp(deps: AppDependencies) {
       holdsSlot = true;
     }
 
-    const charged = budget.charge(caller.userId, tier.cost);
-    if (!charged.allowed) {
-      if (holdsSlot) analysisSlots.release(caller.userId);
-      throw new BudgetError(charged.retryAfterMs, charged.remaining);
+    if (config.analysisBudgeted) {
+      const charged = budget.charge(caller.userId, tier.cost);
+      if (!charged.allowed) {
+        if (holdsSlot) analysisSlots.release(caller.userId);
+        throw new BudgetError(charged.retryAfterMs, charged.remaining);
+      }
     }
     timing.mark("gates");
     let refunded = false;
     const refund = () => {
-      if (refunded) return;
+      if (!config.analysisBudgeted || refunded) return;
       refunded = true;
       budget.refund(caller.userId, tier.cost);
     };
@@ -834,6 +1121,121 @@ export function createApp(deps: AppDependencies) {
 
     const key = `bot:${gameId}:${context.revision}:${context.botDifficulty}`;
     return streamReconnect(c, key, present);
+  });
+
+  // ── GET /v1/games/:gameId/bot-move/reasoning ───────────────────────────────
+  //
+  // "Why did the bot play that?" — the engine's own ranking for a bot move that
+  // has already been played, read A PAGE AT A TIME.
+  //
+  // ### Why this is a separate endpoint
+  //
+  // The move response is applied to the board by a client that is mid-turn, and
+  // it must stay small and arrive fast. The candidate report is the opposite
+  // kind of payload: dozens of rows with a full value decomposition, wanted by
+  // one player, occasionally, after the fact. Shipping it with every move would
+  // pay for it on every turn whether or not anyone opened the panel. So it is
+  // read on demand and in pages, and nothing is recomputed to serve it — the
+  // registry already holds the completed search for `botResultTtlMs`.
+  //
+  // ### What this widens, and what it does not
+  //
+  // The candidate report describes the BOT's rack: the alternatives it weighed
+  // name tiles it holds. This endpoint therefore serves it only to the one
+  // caller who is already entitled to that rack — the player who controls this
+  // bot room, the same person the POST above requires. A spectator is refused
+  // here exactly as they are refused there, and a human-vs-human room has no
+  // engine player to explain.
+  //
+  // (Within THIS deployment the incremental exposure is nil in any case:
+  // `get_live_game_snapshot` already returns the full inventory, both racks
+  // included, to anyone who can read the game. That is a pre-existing property
+  // documented in ENGINE_BACKEND.md §5 and is not relied on here — the gate
+  // below stands on its own.)
+  //
+  // Never starts a search, never spends a budget, and answers only about a move
+  // that has already been made.
+  app.get("/v1/games/:gameId/bot-move/reasoning", async (c) => {
+    const caller = await authenticate(c);
+    const gameId = c.req.param("gameId");
+
+    // A SELECT gated on `can_read_live_game`: no read access is a 404 here, as
+    // everywhere else, and says nothing about whether the room exists.
+    const context = await source.loadContext(gameId, caller.token);
+    if (!context.botSide || !context.botDifficulty) {
+      throw new TurnRuleError("This game has no engine player.");
+    }
+    if (!context.callerControlsActiveSide) {
+      throw new ForbiddenError("You do not control this game.");
+    }
+
+    // Deliberately NOT `requirePlayable`, and deliberately not `requireRevision`.
+    //
+    // The move being explained is in the past: by the time the panel opens, the
+    // game has advanced past the revision the search was admitted at, and it may
+    // have ENDED on that very move. Refusing either case would hide the report
+    // for the one position players most want it — the last one.
+    const requested = c.req.query("revision");
+    if (requested === undefined) throw new BadRequestError("revision is required.");
+    const revision = Number(requested);
+    if (!Number.isInteger(revision) || revision < 0) {
+      throw new BadRequestError("revision must be a whole number.");
+    }
+    if (revision > context.revision || context.revision - revision > REASONING_LOOKBACK) {
+      throw new StaleRevisionError(context.revision, revision);
+    }
+
+    const snapshot = registry.inspect(`bot:${gameId}:${revision}:${context.botDifficulty}`);
+    if (!snapshot) {
+      // Nothing is held for this position. Retention is bounded and in-memory,
+      // so an old move or a restarted service is an ordinary, expected outcome —
+      // said plainly rather than dressed up as a failure.
+      throw new ReasoningUnavailableError(
+        "The engine no longer holds its reasoning for that move.",
+      );
+    }
+    if (snapshot.status !== "completed") {
+      throw new ReasoningUnavailableError("That search has not finished yet.");
+    }
+
+    const result = snapshot.result;
+    // Ranked by value, chosen move first among equals — the engine's own order,
+    // preserved. Paging is a window onto it, never a re-sort.
+    const ranked = result.candidates ?? [];
+    const offset = pageNumber(c.req.query("offset"), 0, 0, Math.max(0, ranked.length));
+    const limit = pageNumber(c.req.query("limit"), REASONING_PAGE_DEFAULT, 1, REASONING_PAGE_MAX);
+    const chosenIndex = ranked.findIndex((candidate) => candidate.chosen);
+
+    return c.json({
+      gameId,
+      revision,
+      side: context.botSide,
+      difficulty: context.botDifficulty,
+      solver: result.solver,
+      endgameSolved: result.endgameSolved,
+      ...(result.expectedFinalDiff != null ? { expectedFinalDiff: result.expectedFinalDiff } : {}),
+      score: result.score,
+      equity: result.equity,
+      stats: {
+        moves: result.stats.moves,
+        nodes: result.stats.nodes,
+        elapsedMs: Math.round(result.stats.elapsedMs),
+        candidates: result.stats.candidates,
+        samples: result.stats.samples,
+        ...(result.stats.genCalls != null ? { genCalls: result.stats.genCalls } : {}),
+      },
+      page: { offset, limit, total: ranked.length },
+      candidates: ranked.slice(offset, offset + limit),
+      // The two rows every page needs regardless of which page it is: the
+      // chosen move anchors the Δ column, and the runner-up is the comparison
+      // the summary sentence is about. Repeating two rows per page is what lets
+      // a client render any page without having fetched page one.
+      chosenIndex: chosenIndex >= 0 ? chosenIndex : null,
+      ...(chosenIndex >= 0 ? { chosen: ranked[chosenIndex] } : {}),
+      ...(ranked.length > 1
+        ? { runnerUp: ranked[chosenIndex === 0 || chosenIndex < 0 ? 1 : 0] }
+        : {}),
+    });
   });
 
   // ── GET /v1/games/:gameId/analysis  (reconnect) ────────────────────────────
@@ -968,6 +1370,183 @@ export function createApp(deps: AppDependencies) {
   // response says what the caller can do about it and nothing about the game
   // they were refused.
 
+  // ── POST /v1/study/analysis ────────────────────────────────────────────────
+  //
+  // Analyse a position the caller invented. No room, no revision, no turn: the
+  // body IS the position, which is why `study.ts` validates it against the
+  // physical tile set before anything downstream believes it.
+  //
+  // Three things make this safe to accept as input where a game position never
+  // would be:
+  //
+  //   • There is nothing to leak. The only rack in the request is the caller's
+  //     own, and they typed it. The hidden-information rule that shapes every
+  //     other endpoint has no subject here.
+  //   • There is nothing to go stale. A made-up position has no game moving on
+  //     underneath it, so there is no revision to check and none is invented.
+  //   • It cannot reach a real game. It takes a position, not a game id, so
+  //     there is no identifier a caller could substitute to have the server
+  //     read a board it is not entitled to.
+  //
+  // It is metered exactly like the compute it is: a bot tier's cost, and the
+  // same one-at-a-time slot analysis uses. It queues BEHIND every analysis
+  // level and every bot turn, because a study aid must never make somebody's
+  // live game wait.
+  app.post("/v1/study/analysis", async (c) => {
+    const timing = new RequestTiming();
+    const caller = await authenticate(c);
+    timing.mark("auth");
+    const body = await readBody(c);
+
+    if (!isBotTier(body.level)) {
+      throw new BadRequestError(
+        `level must be one of ${BOT_TIERS.join(", ")}; got "${String(body.level)}".`,
+      );
+    }
+    const level = body.level;
+    const tier = BOT_TIER_CONFIG[level];
+
+    let position;
+    try {
+      position = parseStudyPosition(body);
+    } catch (error) {
+      if (error instanceof StudyPositionError) throw new BadRequestError(error.message);
+      throw error;
+    }
+    timing.mark("context");
+
+    // Same shape as analysis: one in flight per account, queued included. A
+    // second identical study joins the first instead of taking a slot.
+    const key = `study:${seedFor(studyFingerprint(position, level), 0)}:${level}`;
+    const alreadyRunning = registry.inspect(key) !== null;
+    let holdsSlot = false;
+    if (!alreadyRunning) {
+      if (!analysisSlots.tryAcquire(caller.userId)) {
+        throw new TooManyAnalysesError(analysisSlots.heldBy(caller.userId));
+      }
+      holdsSlot = true;
+    }
+
+    const charged = budget.charge(caller.userId, tier.cost);
+    if (!charged.allowed) {
+      if (holdsSlot) analysisSlots.release(caller.userId);
+      throw new BudgetError(charged.retryAfterMs, charged.remaining);
+    }
+    timing.mark("gates");
+
+    let refunded = false;
+    const refund = () => {
+      if (refunded) return;
+      refunded = true;
+      budget.refund(caller.userId, tier.cost);
+    };
+    const releaseSlot = () => {
+      if (!holdsSlot) return;
+      holdsSlot = false;
+      analysisSlots.release(caller.userId);
+    };
+
+    let streamOwnsSlot = false;
+    try {
+      const request = toStudyEngineRequest(position, {
+        difficulty: level,
+        solver: tier.solver,
+        ...(tier.budgetMs != null ? { budgetMs: tier.budgetMs } : {}),
+        ...(tier.unlimited ? { unlimited: true } : {}),
+        // Ask for more than the ten that are kept, so the ten are the top of a
+        // real ranking rather than everything the engine happened to report.
+        topN: BOT_REPORT_TOP_N,
+      });
+
+      const start = (hooks: RunHooks) =>
+        runQueued({
+          key,
+          priority: STUDY_PRIORITY,
+          kind: "analysis",
+          gameId: key,
+          params: { difficulty: level },
+          caller,
+          admittedRevision: 0,
+          request,
+          timeoutMs: tier.timeoutMs,
+          signal: c.req.raw.signal,
+          hooks,
+          // Nothing to re-check: see `revalidate` on runQueued.
+          revalidate: async () => {},
+          onReused: () => {
+            refund();
+            releaseSlot();
+          },
+        });
+
+      const present = async (response: EngineResponse): Promise<StudyAnalysisResponse> => {
+        const described = buildStudyAnalysis({
+          response,
+          // Bot tiers bound time, not samples, so "did it finish the schedule"
+          // is the engine's own sample count against the full one.
+          requestedSamples: response.stats.samples,
+          limit: STUDY_TOP_N,
+        });
+
+        // The answer is worth returning even if the archive write fails: the
+        // compute is already spent, and losing the ranking over a database
+        // hiccup would be the one failure the player cannot retry cheaply.
+        let recordId: string | null = null;
+        let saveError: string | null = null;
+        try {
+          recordId = await source.saveStudyAnalysis(
+            {
+              scoreSelf: position.scoreSelf,
+              scoreOpponent: position.scoreOpponent,
+              board: position.board,
+              rack: position.rack,
+              oppRackCount: position.oppRackCount,
+              bagCount: position.bagCount,
+              level,
+              summary: described.summary,
+              method: described.method,
+              candidates: described.candidates,
+            },
+            caller.token,
+          );
+        } catch (error) {
+          saveError = error instanceof Error ? error.message : "The result could not be saved.";
+          console.error("study save failed", saveError);
+        }
+
+        return {
+          recordId,
+          saveError,
+          level,
+          position: {
+            scoreSelf: position.scoreSelf,
+            scoreOpponent: position.scoreOpponent,
+            board: position.board,
+            rack: position.rack,
+            oppRackCount: position.oppRackCount,
+            bagCount: position.bagCount,
+          },
+          candidates: described.candidates,
+          summary: described.summary,
+          method: described.method,
+        };
+      };
+
+      timing.applyTo(c);
+      if (wantsStream(c)) {
+        streamOwnsSlot = true;
+        return streamResult(c, start, present, refund, releaseSlot);
+      }
+      return c.json(await present(await start({})));
+    } catch (error) {
+      if (error instanceof BudgetError) throw error;
+      refund();
+      throw error;
+    } finally {
+      if (!streamOwnsSlot) releaseSlot();
+    }
+  });
+
   app.onError((error, c) => {
     if (error instanceof UnauthenticatedError) {
       return c.json(fail("unauthenticated", error.message), 401);
@@ -996,6 +1575,12 @@ export function createApp(deps: AppDependencies) {
     }
     if (error instanceof TurnRuleError) {
       return c.json(fail("turn_rule", error.message), 409);
+    }
+    if (error instanceof ReasoningUnavailableError) {
+      // Retention expired, or the service restarted. Nothing is wrong and
+      // nothing can be retried into existence; the caller shows the honest
+      // sentence rather than an empty table.
+      return c.json(fail("reasoning_unavailable", error.message), 404);
     }
     if (error instanceof BadRequestError) {
       return c.json(fail("bad_request", error.message), 400);
@@ -1069,6 +1654,12 @@ export class AnalysisNotAllowedError extends Error {
 }
 export class TurnRuleError extends Error {
   override readonly name = "TurnRuleError";
+}
+/** The engine's reasoning for a move is no longer held — retention lapsed, or
+ *  the process restarted. Not a fault: the result cache is bounded and in
+ *  memory by design, and the move itself was applied long ago. */
+export class ReasoningUnavailableError extends Error {
+  override readonly name = "ReasoningUnavailableError";
 }
 export class StaleRevisionError extends Error {
   override readonly name = "StaleRevisionError";

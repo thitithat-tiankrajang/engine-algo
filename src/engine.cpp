@@ -19,6 +19,12 @@ namespace {
 
 ProgressFn g_progress = nullptr;
 
+// How many weight overrides the CURRENT request supplied. Request-scoped like
+// the move-generation counter, and reported back so a caller can verify that
+// the weights version it published is the one the engine actually ran — a
+// weights document that silently applied nothing is the failure this reports.
+int g_weightsApplied = 0;
+
 using Clock = std::chrono::steady_clock;
 
 double msSince(Clock::time_point start) {
@@ -64,6 +70,17 @@ struct Request {
   // which algorithm to run, and conflating the two is what hid the problem.
   std::string solver = "sim";
   double budgetMs = 0;
+  // Remove every wall-clock ceiling for this request: the mid-game budget, the
+  // end-game budget, and the root-generation budget alike.
+  //
+  // This is not "a very large budget". It is the statement that the SCHEDULE,
+  // not the clock, decides when the search is done — the sim runs all of its
+  // planned opponent-rack samples and the progress line reaches a true 100%
+  // instead of stopping at whichever sample the deadline happened to land on.
+  // The work is still finite (`simSamples` samples over a capped candidate set,
+  // and an end-game node budget), so this terminates; it just terminates when
+  // it has finished rather than when time ran out.
+  bool unlimited = false;
   uint32_t seed = 1;
   bool forceHidden = false;  // test hook: route eligible endgames through the hidden solver
   // How many ranked alternatives to report. Reporting is a pure read-out of the
@@ -83,6 +100,128 @@ struct Request {
   // the response reports fewer samples than asked and the caller can say so.
   int sampleCap = 0;
 };
+
+// ── tunable weights, supplied with the request ───────────────────────────────
+//
+// Every constant in `LeaveWeights` is hand-set domain knowledge, and changing
+// one used to mean rebuilding the engine. That is workable while the engine
+// runs on one server. It is not workable once it runs in every player's
+// browser: a weight change would mean reshipping a 250 KB WASM module to
+// everyone, and a finished game could never be replayed under the weights it
+// was actually played with.
+//
+// So the weights travel WITH the request. Two rules keep that from becoming a
+// source of silent drift:
+//
+//  1. RESET FIRST. `g_leave` is a global and the browser instantiates the WASM
+//     module ONCE, answering every turn of the game from that instance. Without
+//     a reset, one request's weights would leak into the next — and into the
+//     next game.
+//  2. REJECT WHAT IS NOT UNDERSTOOD. An unknown key is an error, never a no-op.
+//     A typo in a published weights version that quietly changes nothing is the
+//     worst outcome available: the A/B test would report a difference the
+//     engine never made.
+//
+// `kindValue` is keyed by TOKEN STRING ("13", "?", "+/-"), not by array index.
+// The index is an implementation detail of this build; the token is what the
+// game is about, and a weights document written against one engine version has
+// to keep meaning the same thing in the next.
+int applyWeights(const json::Value& obj, std::string& error) {
+  int applied = 0;
+  auto scalar = [&](const char* key, float& slot) {
+    if (auto v = obj.get(key)) {
+      if (!v->isNumber()) {
+        error = std::string("weight ") + key + " must be a number";
+        return false;
+      }
+      slot = static_cast<float>(v->asDouble(slot));
+      applied++;
+    }
+    return true;
+  };
+
+  static const std::pair<const char*, float LeaveWeights::*> kScalars[] = {
+      {"zeroMulDivSynergy", &LeaveWeights::zeroMulDivSynergy},
+      {"zeroNoMulDivPenalty", &LeaveWeights::zeroNoMulDivPenalty},
+      {"heavyBurden", &LeaveWeights::heavyBurden},
+      {"operatorRatio", &LeaveWeights::operatorRatio},
+      {"operatorStarvation", &LeaveWeights::operatorStarvation},
+      {"noOperatorPenalty", &LeaveWeights::noOperatorPenalty},
+      {"heavyFlankPenalty", &LeaveWeights::heavyFlankPenalty},
+      {"duplicatePenalty", &LeaveWeights::duplicatePenalty},
+      {"balancePenalty", &LeaveWeights::balancePenalty},
+      {"exposeEx3", &LeaveWeights::exposeEx3},
+      {"exposeEx2", &LeaveWeights::exposeEx2},
+      {"exposePx3", &LeaveWeights::exposePx3},
+      {"exchangeConsiderBar", &LeaveWeights::exchangeConsiderBar},
+      {"leadDumpPenalty", &LeaveWeights::leadDumpPenalty},
+      {"trailFishBonus", &LeaveWeights::trailFishBonus},
+      {"exchangeTempoCost", &LeaveWeights::exchangeTempoCost},
+      {"nextTurnPotentialWeight", &LeaveWeights::nextTurnPotentialWeight},
+      {"riskAversionBase", &LeaveWeights::riskAversionBase},
+      {"riskAversionLeadPer50", &LeaveWeights::riskAversionLeadPer50},
+  };
+
+  for (const auto& [key, member] : kScalars) {
+    if (!scalar(key, g_leave.*member)) return -1;
+  }
+
+  if (auto kv = obj.get("kindValue")) {
+    if (kv->type != json::Value::Type::Object) {
+      error = "weight kindValue must be an object keyed by token";
+      return -1;
+    }
+    for (const auto& [token, value] : kv->obj) {
+      const int kind = tileKindFromString(token);
+      if (kind < 0) {
+        error = "weight kindValue names no such tile: " + token;
+        return -1;
+      }
+      if (!value->isNumber()) {
+        error = "weight kindValue." + token + " must be a number";
+        return -1;
+      }
+      g_leave.kindValue[kind] = static_cast<float>(value->asDouble(0));
+      applied++;
+    }
+  }
+
+  if (auto es = obj.get("equalsSchedule")) {
+    if (es->type != json::Value::Type::Array ||
+        es->arr.size() != static_cast<size_t>(RACK_SIZE) + 1) {
+      error = "weight equalsSchedule must be an array of " + std::to_string(RACK_SIZE + 1) +
+              " numbers";
+      return -1;
+    }
+    for (size_t i = 0; i < es->arr.size(); i++) {
+      if (!es->arr[i]->isNumber()) {
+        error = "weight equalsSchedule must contain only numbers";
+        return -1;
+      }
+      g_leave.equalsSchedule[i] = static_cast<float>(es->arr[i]->asDouble(0));
+    }
+    applied++;
+  }
+
+  // Anything left is a key this build does not know. Refuse it: a weights
+  // version whose keys silently do nothing is indistinguishable from one that
+  // works, and the whole point of versioning them is to be able to tell.
+  static const char* kKnown[] = {"kindValue", "equalsSchedule"};
+  for (const auto& [key, unused] : obj.obj) {
+    (void)unused;
+    bool known = false;
+    for (const char* n : kKnown) known = known || key == n;
+    for (const auto& [n, member] : kScalars) {
+      (void)member;
+      known = known || key == n;
+    }
+    if (!known) {
+      error = "unknown weight: " + key;
+      return -1;
+    }
+  }
+  return applied;
+}
 
 bool parseRequest(const std::string& text, Request& req, std::string& error) {
   json::ValuePtr root = json::parse(text);
@@ -145,12 +284,29 @@ bool parseRequest(const std::string& text, Request& req, std::string& error) {
     }
   }
   if (auto b = root->get("budgetMs")) req.budgetMs = b->asDouble(0);
+  if (auto u = root->get("unlimited")) req.unlimited = u->asBool();
   if (auto s = root->get("seed")) req.seed = static_cast<uint32_t>(s->asInt(1));
   if (auto n = root->get("topN")) {
     req.topN = std::clamp(static_cast<int>(n->asInt(16)), 1, 64);
   }
   if (auto n = root->get("sampleCap")) {
     req.sampleCap = std::clamp(static_cast<int>(n->asInt(0)), 0, 4096);
+  }
+
+  // Reset to the compiled defaults on EVERY request, whether or not this one
+  // carries weights. A browser worker instantiates the module once and answers
+  // every turn of every game from that instance, so without this a single tuned
+  // request would silently retune the rest of the session.
+  g_leave = LeaveWeights{};
+  g_weightsApplied = 0;
+  if (auto w = root->get("weights")) {
+    if (w->type != json::Value::Type::Object) {
+      error = "weights must be an object";
+      return false;
+    }
+    const int applied = applyWeights(*w, error);
+    if (applied < 0) return false;
+    g_weightsApplied = applied;
   }
   return true;
 }
@@ -160,6 +316,12 @@ bool parseRequest(const std::string& text, Request& req, std::string& error) {
 // One model, one strength: the strongest the resources allow. Budgets are
 // generous (RAM stays bounded by dedup + a capped TT, so only time grows). The
 // `difficulty` field is ignored; a single configuration is always used.
+
+// A finite stand-in for "no wall-clock ceiling" (~31 years), used when a
+// request sets `unlimited`. Deliberately not infinity: the budget is arithmetic
+// (`budgetMs * 0.9`, `budgetMs - elapsed`) and it feeds the ETA that goes out as
+// JSON, where an inf or a nan is not a number any client can read.
+constexpr double UNLIMITED_BUDGET_MS = 1e12;
 
 struct Config {
   int simTopK = 60;                       // placement candidates carried into sim
@@ -1435,8 +1597,101 @@ std::string respond(const Move& move, float equity, const std::string& solver, b
   // everything else in the evaluation is under a microsecond. The static path
   // is contractually 1 (see STATIC_MAX_GEN_CALLS in engine.hpp).
   st->obj["genCalls"] = json::makeInt(moveGenCalls());
+  // Confirmation, not decoration: it is how a caller tells "the weights version
+  // I pinned was applied" from "the engine ignored a document it did not
+  // understand". 0 means the compiled defaults ran.
+  st->obj["weightsApplied"] = json::makeInt(g_weightsApplied);
   o->obj["stats"] = st;
   if (candidateReport) o->obj["candidates"] = candidateReport;
+  return json::stringify(o);
+}
+
+// ── device calibration ───────────────────────────────────────────────────────
+//
+// Answers ONE question, on the player's own machine, in well under a second on
+// anything modern: how fast does this device search?
+//
+// It deliberately does NOT run a Super search. A Super search is the thing we
+// are trying to predict the cost of; running one to find out how long one takes
+// would cost the player the very minutes the calibration exists to warn them
+// about.
+//
+// What it runs instead is the single most expensive primitive the Super search
+// performs — root move generation — on a fixed position, stopped at a fixed
+// node count. Two properties follow, and both matter:
+//
+//   • DETERMINISTIC WORK. The node cap binds well below this position's
+//     complete generation (~10.2M nodes), so every device visits EXACTLY
+//     `kCalibrationNodes` nodes. Nothing about the device, the load, or the
+//     clock changes the amount of work; only the time to do it differs. A
+//     throughput number computed from a variable amount of work would be a
+//     measurement of the position, not of the machine.
+//   • REPRESENTATIVE. It is the real generator, over a real position, through
+//     the same code the bot runs — not a synthetic loop whose relationship to
+//     the search is a guess. A Super decision is generation-bound: it issues
+//     roughly candidates × samples × 2 generations, and every heuristic between
+//     them costs under a microsecond.
+//
+// The position is a real turn-3 board from self-play (`amath_cli positions`),
+// embedded rather than described in the request so that every device — and
+// every future version of the client — measures the same thing.
+constexpr long long kCalibrationNodes = 2'000'000;
+constexpr const char* kCalibrationBenchmark = "gen-nodes-v1";
+
+struct CalibrationCell {
+  int r, c;
+  const char* kind;
+  const char* token;
+};
+
+const CalibrationCell kCalibrationBoard[] = {
+    {7, 7, "7", "7"},   {7, 8, "0", "0"},   {7, 9, "=", "="},     {7, 10, "1", "1"},
+    {7, 11, "4", "4"},  {7, 12, "0", "0"},  {7, 13, "x//", "÷"},  {7, 14, "2", "2"},
+};
+const char* const kCalibrationRack[] = {"3", "6", "8", "9", "16", "x//", "=", "?"};
+
+std::string runCalibration() {
+  Board board;
+  for (const CalibrationCell& cell : kCalibrationBoard) {
+    board.place(cell.r, cell.c, static_cast<uint8_t>(tileKindFromString(cell.kind)),
+                static_cast<uint8_t>(assignedTokenFromString(cell.token)));
+  }
+  TileCounts rack;
+  for (const char* token : kCalibrationRack) {
+    rack.add(static_cast<uint8_t>(tileKindFromString(token)));
+  }
+
+  // Compiled defaults, always. Calibration measures the DEVICE; running it
+  // under whatever weights the last request left behind would make the number
+  // depend on tuning that has nothing to do with how fast the machine is.
+  g_leave = LeaveWeights{};
+
+  GenStats stats;
+  stats.nodeLimit = kCalibrationNodes;
+  GenOptions opts;
+  opts.dedup = true;
+  opts.premiumOrder = true;
+  std::vector<Move> moves;
+
+  const auto started = Clock::now();
+  generatePlaceMoves(board, rack, moves, &stats, opts);
+  const double elapsedMs = msSince(started);
+
+  auto o = json::makeObject();
+  o->obj["mode"] = json::makeString("calibrate");
+  o->obj["benchmark"] = json::makeString(kCalibrationBenchmark);
+  o->obj["nodes"] = json::makeInt(stats.nodesVisited);
+  o->obj["elapsedMs"] = json::makeDouble(elapsedMs);
+  o->obj["nodesPerSec"] =
+      json::makeDouble(elapsedMs > 0 ? static_cast<double>(stats.nodesVisited) * 1000.0 / elapsedMs
+                                     : 0.0);
+  o->obj["moves"] = json::makeInt(static_cast<long long>(moves.size()));
+  // True when the cap bound, which is the condition under which the node count
+  // is the SAME on every device and the throughput number is comparable. If a
+  // future engine ever generates this position completely inside the cap, this
+  // goes false and the caller must stop comparing across builds rather than
+  // quietly compare two different amounts of work.
+  o->obj["capBound"] = json::makeBool(stats.nodesVisited >= kCalibrationNodes);
   return json::stringify(o);
 }
 
@@ -1450,7 +1705,115 @@ std::string respondError(const std::string& message) {
 
 void setProgressCallback(ProgressFn fn) { g_progress = fn; }
 
+// ── move validation ──────────────────────────────────────────────────────────
+//
+// Legality, and nothing else. No search, no evaluation, no sampling — a few
+// microseconds against the seconds a decision costs.
+//
+// This exists because the Super search moved to the player's device. The
+// backend no longer computes the bot's move, so the only thing it can still say
+// about one is whether it is a move the rules allow from the position the
+// server is holding. That is a smaller claim than "this is what the engine
+// would have played", and deliberately so: proving the latter means running the
+// search again, which is exactly the CPU cost the client-side path exists to
+// remove.
+//
+// The board and rack come from the SERVER's canonical state, never from the
+// submitting client (see service/src/adapter.ts). A caller therefore cannot
+// make an illegal move legal by describing a board on which it would be.
+std::string runValidation(const std::string& requestJson, const json::Value& root) {
+  Request req;
+  std::string error;
+  if (!parseRequest(requestJson, req, error)) return respondError(error);
+
+  auto move = root.get("move");
+  if (!move || move->type != json::Value::Type::Object) {
+    return respondError("validate needs a move object");
+  }
+  const std::string type = move->get("type") ? move->get("type")->asString() : "";
+
+  auto verdict = [](bool valid, int score, const std::string& reason) {
+    auto o = json::makeObject();
+    o->obj["mode"] = json::makeString("validate");
+    o->obj["valid"] = json::makeBool(valid);
+    o->obj["score"] = json::makeInt(score);
+    if (!valid) o->obj["reason"] = json::makeString(reason);
+    return json::stringify(o);
+  };
+
+  // Every branch first checks that the tiles named are tiles the side on move
+  // actually holds. A move can be perfectly legal on the board and still be one
+  // this player cannot make, and the rack is the half a client is most likely
+  // to be wrong about after a resync.
+  if (type == "pass") return verdict(true, 0, "");
+
+  if (type == "exchange") {
+    auto kinds = move->get("exchange");
+    if (!kinds || kinds->type != json::Value::Type::Array || kinds->arr.empty()) {
+      return verdict(false, 0, "an exchange must name at least one tile");
+    }
+    if (!req.exchangeAllowed) {
+      return verdict(false, 0, "the position does not allow an exchange");
+    }
+    TileCounts held = req.rack;
+    for (const auto& t : kinds->arr) {
+      const int kind = tileKindFromString(t->asString());
+      if (kind < 0) return verdict(false, 0, "no such tile: " + t->asString());
+      if (held.n[kind] == 0) return verdict(false, 0, "not holding tile: " + t->asString());
+      held.sub(static_cast<uint8_t>(kind));
+    }
+    if (static_cast<int>(kinds->arr.size()) > req.bagCount) {
+      return verdict(false, 0, "cannot exchange more tiles than are unseen");
+    }
+    return verdict(true, 0, "");
+  }
+
+  if (type != "place") return verdict(false, 0, "unknown move type: " + type);
+
+  auto cells = move->get("placements");
+  if (!cells || cells->type != json::Value::Type::Array || cells->arr.empty()) {
+    return verdict(false, 0, "a placement must place at least one tile");
+  }
+  std::vector<Placement> placements;
+  TileCounts held = req.rack;
+  for (const auto& cell : cells->arr) {
+    const int r = static_cast<int>(cell->get("r") ? cell->get("r")->asInt(-1) : -1);
+    const int c = static_cast<int>(cell->get("c") ? cell->get("c")->asInt(-1) : -1);
+    const int kind = tileKindFromString(cell->get("kind") ? cell->get("kind")->asString() : "");
+    const int token =
+        assignedTokenFromString(cell->get("token") ? cell->get("token")->asString() : "");
+    if (!inBounds(r, c) || kind < 0 || token < 0) return verdict(false, 0, "bad placement cell");
+    if (req.board.at(r, c).occupied()) return verdict(false, 0, "that square is already taken");
+    if (held.n[kind] == 0) {
+      return verdict(false, 0, "not holding tile: " + tileKindToString(static_cast<uint8_t>(kind)));
+    }
+    held.sub(static_cast<uint8_t>(kind));
+    Placement p;
+    p.row = static_cast<uint8_t>(r);
+    p.col = static_cast<uint8_t>(c);
+    p.kind = static_cast<uint8_t>(kind);
+    p.token = static_cast<uint8_t>(token);
+    placements.push_back(p);
+  }
+
+  const MoveValidation v = validatePlaceMove(req.board, placements);
+  return verdict(v.valid, v.valid ? v.score : 0, v.error);
+}
+
 std::string handleRequest(const std::string& requestJson) {
+  // Calibration is answered before anything else and needs no position: it is
+  // a question about the DEVICE, not about a game.
+  if (json::ValuePtr probe = json::parse(requestJson);
+      probe && probe->type == json::Value::Type::Object) {
+    if (auto mode = probe->get("mode"); mode && mode->asString() == "calibrate") {
+      return runCalibration();
+    }
+    // Legality against a server-held position. Microseconds, no search.
+    if (auto mode = probe->get("mode"); mode && mode->asString() == "validate") {
+      return runValidation(requestJson, *probe);
+    }
+  }
+
   const auto start = Clock::now();
   // Per-decision accounting, so `stats.genCalls` counts THIS request. The
   // service runs one request per process, so this is belt-and-braces there; it
@@ -1462,7 +1825,9 @@ std::string handleRequest(const std::string& requestJson) {
   if (!parseRequest(requestJson, req, error)) return respondError(error);
 
   const Config cfg = configFor(req.difficulty);
-  const double budgetMs = req.budgetMs > 0 ? req.budgetMs : cfg.defaultBudgetMs;
+  const double budgetMs = req.unlimited        ? UNLIMITED_BUDGET_MS
+                          : req.budgetMs > 0  ? req.budgetMs
+                                              : cfg.defaultBudgetMs;
   std::mt19937 rng(req.seed);
 
   // Judge tiles against the live board: openness, the real unseen pool, phase
@@ -1492,7 +1857,10 @@ std::string handleRequest(const std::string& requestJson) {
   if (staticSolver) {
     stats.nodeLimit = cfg.rootNodeLimit;
   } else {
-    genOpts.budgetMs = cfg.genBudgetMs;
+    // 0 is the generator's own spelling of "no deadline" (see `hasDeadline` in
+    // movegen.cpp). An unlimited request enumerates the whole root rather than
+    // whatever 40 seconds reached, so `rootComplete` can be honestly true.
+    genOpts.budgetMs = req.unlimited ? 0 : cfg.genBudgetMs;
   }
   generatePlaceMoves(req.board, req.rack, moves, &stats, genOpts);
   const int rootMoves = static_cast<int>(moves.size());
@@ -1502,7 +1870,9 @@ std::string handleRequest(const std::string& requestJson) {
   if (req.forceHidden && req.oppRackCount > 0 &&
       req.unseen.total == req.oppRackCount + req.bagCount &&
       req.bagCount <= cfg.endgameExactBagMax) {
-    const double egBudget = req.budgetMs > 0 ? req.budgetMs : cfg.endgameBudgetMs;
+    const double egBudget = req.unlimited       ? UNLIMITED_BUDGET_MS
+                            : req.budgetMs > 0 ? req.budgetMs
+                                               : cfg.endgameBudgetMs;
     const HiddenResult hr = solveHiddenEndgame(req, cfg.endgameNodeBudget, egBudget * 0.9,
                                                cfg.endgameMaxAssignments);
     if (!hr.found) return respondError("hidden_no_result");
@@ -1517,7 +1887,9 @@ std::string handleRequest(const std::string& requestJson) {
   // proof is only attempted when this is small enough to finish in budget;
   // otherwise the request falls through to sampling (see endgameExactTilesMax).
   const int endgameTilesLeft = req.rack.total + req.oppRackCount + req.bagCount;
-  const double egBudget = req.budgetMs > 0 ? req.budgetMs : cfg.endgameBudgetMs;  // 5-min ceiling
+  const double egBudget = req.unlimited       ? UNLIMITED_BUDGET_MS
+                          : req.budgetMs > 0 ? req.budgetMs
+                                             : cfg.endgameBudgetMs;  // 5-min ceiling
 
   // ── nearly-empty bag (bag ≤ endgameExactBagMax): exact endgame proof ───────
   // Once the bag is (nearly) empty the game is a finite tree; we solve it EXACTLY

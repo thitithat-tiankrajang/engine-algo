@@ -2,7 +2,11 @@
 // the service does not own — the database and the engine process.
 import { TILE_TOKENS, type AmathToken, type Side, type TilePlacement } from "../src/canonical.js";
 import type { EngineResponse } from "../src/engineRunner.js";
-import type { EngineRoomContext, GameStateSource } from "../src/roomContext.js";
+import type {
+  EngineRoomContext,
+  GameStateSource,
+  StudyAnalysisRecord,
+} from "../src/roomContext.js";
 import type { Caller } from "../src/auth.js";
 
 export const GAME_ID = "11111111-2222-3333-4444-555555555555";
@@ -111,6 +115,9 @@ export function fakeSource(
   /** Every `loadRecentCommands` call, so a test can prove the command window was
    *  opened once and at the right revision. */
   commandWindows: number[];
+  /** Every study record the service persisted, so a test can prove the top ten
+   *  reached the database and in what shape. */
+  savedStudies: StudyAnalysisRecord[];
   advanceTo(revision: number): void;
 } {
   let revision = options.revision ?? 7;
@@ -118,6 +125,7 @@ export function fakeSource(
   const state = {
     calls: 0,
     commandWindows: [] as number[],
+    savedStudies: [] as StudyAnalysisRecord[],
     /** Model the game moving on underneath a request that is already queued. */
     advanceTo(next: number) {
       revision = next;
@@ -146,6 +154,10 @@ export function fakeSource(
     async loadRecentCommands(_gameId: string, _token: string, atRevision: number) {
       state.commandWindows.push(atRevision);
       return options.commands ?? [{ kind: "place" }];
+    },
+    async saveStudyAnalysis(record: StudyAnalysisRecord) {
+      state.savedStudies.push(record);
+      return `study-${state.savedStudies.length}`;
     },
   };
   return state;
@@ -241,12 +253,34 @@ export function baseConfig(overrides: Record<string, unknown> = {}) {
     // clock. Tests that mean to exercise the deadline set it themselves.
     maxQueueWaitMs: 60_000,
     maxBodyBytes: 8 * 1024,
+    // Deliberately smaller than production so a budget test can reach the limit
+    // in a handful of requests. Every assertion about what is left derives from
+    // this number rather than restating it.
     budgetPerWindow: 60,
     budgetWindowMs: 600_000,
+    // Metering ON, as in production. A harness that quietly ran unmetered would
+    // make every budget test pass for the wrong reason.
+    budgetEnforced: true,
     maxAnalysisPerUser: 1,
+    // Production default: analysis is serialised per account but never
+    // rationed. The budget tests turn this on explicitly, so what they assert
+    // is what an operator who asked for rationing actually gets.
+    analysisBudgeted: false,
     analysisResultTtlMs: 5 * 60 * 1000,
     botResultTtlMs: 60 * 1000,
     jobCacheMax: 256,
+    // The rollout flag defaults OFF here exactly as it does in production, so a
+    // test that means to exercise the client-side path has to say so — and a
+    // test that forgets gets the backend path, which is the safe direction to
+    // be wrong in.
+    clientSideSuper: false,
+    // The AUDIENCE, and it is empty for the same reason the flag is off: both
+    // have to be set before anybody gets the client-side path, so a test that
+    // means to exercise it has to say so twice. Fail-closed in the harness
+    // mirrors fail-closed in production.
+    clientSideSuperUserIds: [],
+    superAdaptiveBudget: false,
+    validationConcurrency: 4,
     ...overrides,
   };
 }

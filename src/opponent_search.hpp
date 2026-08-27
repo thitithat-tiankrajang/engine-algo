@@ -33,6 +33,13 @@ class OpponentPolicyEvaluator {
  public:
   static OpponentInformationSet project(const SearchState& state);
   static int32_t evaluate(const OpponentInformationSet& info, const Move& move);
+
+  // The board context is a property of the information set, not of the move
+  // being scored, so a ranking loop builds it once. `evaluate` above is the
+  // same function with the context built inline, kept for single-move callers.
+  static BoardContext context(const OpponentInformationSet& info);
+  static int32_t evaluate(const OpponentInformationSet& info, const BoardContext& context,
+                          const Move& move);
 };
 
 struct OpponentSearchResult {

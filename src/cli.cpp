@@ -12,6 +12,7 @@
 
 #include "board.hpp"
 #include "decision_search.hpp"
+#include "deep_bench.hpp"
 #include "engine.hpp"
 #include "eval.hpp"
 #include "json.hpp"
@@ -197,6 +198,8 @@ const char* searchVariantName(SearchVariant variant) {
     case SearchVariant::SimV2Reference: return "reference";
     case SearchVariant::ReplyIndexUniform: return "reply-index";
     case SearchVariant::PairedReplyIndex: return "paired-reply-index";
+    case SearchVariant::ReplyIndexAdaptiveUniform: return "adaptive-uniform";
+    case SearchVariant::ReplyIndexAdaptivePaired: return "adaptive-paired";
   }
   return "unknown";
 }
@@ -212,6 +215,14 @@ bool parseSearchVariant(const std::string& text, SearchVariant& variant) {
   }
   if (text == "paired" || text == "paired-reply-index") {
     variant = SearchVariant::PairedReplyIndex;
+    return true;
+  }
+  if (text == "adaptive-uniform") {
+    variant = SearchVariant::ReplyIndexAdaptiveUniform;
+    return true;
+  }
+  if (text == "adaptive-paired" || text == "adaptive") {
+    variant = SearchVariant::ReplyIndexAdaptivePaired;
     return true;
   }
   return false;
@@ -427,6 +438,57 @@ int runReplyIndexBench(int positions) {
   return measured == positions ? 0 : 1;
 }
 
+// ── position corpus for latency benchmarking ─────────────────────────────────
+//
+// Dumps the engine REQUEST the bot would receive at each turn of a self-played
+// game, one JSON object per line, tagged with the phase signals a latency
+// number has to be read against (turn index, tiles on the board, bag size).
+//
+// The dump deliberately carries NO tier fields — no `solver`, no `budgetMs`,
+// no `unlimited`. A corpus that pinned a tier would only ever measure that
+// tier, and the whole point of this file is to run the SAME positions through
+// `super` natively and `super` in WASM and compare. The harness adds the tier.
+//
+// The games themselves are played at the cheap static tier: how the corpus was
+// reached does not change how long a `super` search on it takes, and playing
+// 25 turns at `super` to produce 25 positions would cost an hour a game.
+int runPositions(int games, uint32_t seed0, const std::string& outPath) {
+  std::ofstream out(outPath);
+  if (!out) {
+    std::fprintf(stderr, "cannot open %s\n", outPath.c_str());
+    return 1;
+  }
+  const GameSim::TierSpec fast = tierFor("easy");  // static solver, one generation
+  int emitted = 0;
+  for (int g = 0; g < games; g++) {
+    GameSim sim(seed0 + static_cast<uint32_t>(g) * 7919u);
+    int side = 0;
+    for (int turn = 0; turn < 60 && !sim.finished; turn++) {
+      int boardTiles = 0;
+      for (int r = 0; r < BOARD_SIZE; r++) {
+        for (int c = 0; c < BOARD_SIZE; c++) {
+          if (sim.board.at(r, c).occupied()) boardTiles++;
+        }
+      }
+      const int unplayed = sim.racks[0].total + sim.racks[1].total +
+                           static_cast<int>(sim.bag.size());
+      out << "{\"game\":" << g << ",\"turn\":" << turn << ",\"side\":" << side
+          << ",\"boardTiles\":" << boardTiles
+          << ",\"bagCount\":" << sim.bag.size()
+          << ",\"unplayed\":" << unplayed
+          << ",\"request\":"
+          << sim.requestJson(side, std::string("super"), seed0 + static_cast<uint32_t>(turn))
+          << "}\n";
+      emitted++;
+      const std::string res = handleRequest(sim.requestJson(side, fast, seed0 + turn));
+      if (!sim.applyResponse(side, res)) break;
+      side = 1 - side;
+    }
+  }
+  std::fprintf(stderr, "wrote %d positions to %s\n", emitted, outPath.c_str());
+  return emitted > 0 ? 0 : 1;
+}
+
 int runGolden(int positions, uint32_t seed, const std::string& outPath) {
   std::ofstream out(outPath);
   if (!out) {
@@ -527,13 +589,19 @@ int main(int argc, char** argv) {
     std::fprintf(stderr,
                  "usage:\n"
                  "  amath_cli bench\n"
-                 "  amath_cli v2-bench [positions] [reference|reply-index|paired] "
-                 "[interactive|strong|deep]\n"
+                 "  amath_cli v2-bench [positions] [reference|reply-index|paired|"
+                 "adaptive-uniform|adaptive-paired] [interactive|strong|deep]\n"
                  "  amath_cli reply-index-bench [positions]\n"
+                 "  amath_cli deep-bench [positions] [label-substring]\n"
+                 "  amath_cli deep-credit-curve [positions]\n"
+                 "  amath_cli g6 [positions]      (admission recall/regret)\n"
+                 "  amath_cli g7 [positions]      (uniform vs paired at equal credits)\n"
                  "  amath_cli selfplay <games> <tierA> <tierB> [seed]\n"
                  "      tiers: easy (static) | easy-sim (pre-static easy) |\n"
                  "             medium | hard | max, or a raw difficulty string\n"
                  "  amath_cli golden <positions> <seed> <out.jsonl>\n"
+                 "  amath_cli positions <games> <seed> <out.jsonl>\n"
+                 "      engine requests from self-play, for latency benchmarking\n"
                  "  amath_cli request   (JSON on stdin)\n"
                  "  amath_cli worker    (JSON on stdin, response on stdout,\n"
                  "                       NDJSON progress on stderr)\n");
@@ -556,12 +624,23 @@ int main(int argc, char** argv) {
   }
   if (mode == "reply-index-bench")
     return runReplyIndexBench(argc > 2 ? std::atoi(argv[2]) : 8);
+  if (mode == "deep-bench")
+    return runDeepPolicyBench(argc > 2 ? std::atoi(argv[2]) : 16, argc > 3 ? argv[3] : "");
+  if (mode == "deep-credit-curve") return runDeepCreditCurve(argc > 2 ? std::atoi(argv[2]) : 16);
+  if (mode == "g6") return runGate6(argc > 2 ? std::atoi(argv[2]) : 16);
+  if (mode == "g7") return runGate7(argc > 2 ? std::atoi(argv[2]) : 16);
   if (mode == "selfplay") {
     const int games = argc > 2 ? std::atoi(argv[2]) : 4;
     const std::string dA = argc > 3 ? argv[3] : "normal";
     const std::string dB = argc > 4 ? argv[4] : "normal";
     const uint32_t seed = argc > 5 ? std::atoi(argv[5]) : 777;
     return runSelfplay(games, dA, dB, seed);
+  }
+  if (mode == "positions") {
+    const int games = argc > 2 ? std::atoi(argv[2]) : 8;
+    const uint32_t seed = argc > 3 ? static_cast<uint32_t>(std::atoi(argv[3])) : 20260827;
+    const std::string out = argc > 4 ? argv[4] : "build/positions.jsonl";
+    return runPositions(games, seed, out);
   }
   if (mode == "golden") {
     const int positions = argc > 2 ? std::atoi(argv[2]) : 40;

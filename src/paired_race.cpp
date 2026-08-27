@@ -36,8 +36,58 @@ bool PairedRace::commitBatch(
 
   for (const auto& [candidate, value] : observations) values_[candidate].push_back(value);
   completedBatches_++;
+  const size_t before = expected.size();
   if (completedBatches_ >= config_.minimumBatches) eliminateSeparatedCandidates();
+  const size_t after = activeIndices().size();
+  if (after < before) eliminationRounds_++;
+  activeCountHistory_.push_back(static_cast<uint32_t>(after));
   return true;
+}
+
+PairedGap PairedRace::gapAgainstLeader(size_t candidate) const {
+  return gapAgainst(candidate, leader());
+}
+
+PairedGap PairedRace::gapAgainst(size_t candidate, size_t best) const {
+  PairedGap gap;
+  if (best >= active_.size() || candidate >= values_.size() || candidate == best) return gap;
+
+  const size_t count = std::min(values_[candidate].size(), values_[best].size());
+  if (count == 0) return gap;
+
+  double sum = 0.0;
+  for (size_t i = 0; i < count; i++) sum += values_[candidate][i] - values_[best][i];
+  const double pairedMean = sum / count;
+  double variance = 0.0;
+  if (count > 1) {
+    for (size_t i = 0; i < count; i++) {
+      const double difference = values_[candidate][i] - values_[best][i];
+      variance += (difference - pairedMean) * (difference - pairedMean);
+    }
+    variance /= count - 1;
+  }
+  gap.ok = true;
+  gap.candidate = candidate;
+  gap.observations = static_cast<uint32_t>(count);
+  gap.mean = pairedMean;
+  gap.standardError = std::sqrt(variance / count);
+  gap.bound = pairedMean + config_.standardErrorMultiplier * gap.standardError;
+  gap.upper = gap.bound + config_.modelAllowance;
+  return gap;
+}
+
+// The active candidate whose paired difference is least separated from the
+// leader: the one another world is most likely to be decided by.
+PairedGap PairedRace::closestChallenger() const {
+  PairedGap closest;
+  const size_t best = leader();
+  for (size_t candidate = 0; candidate < active_.size(); candidate++) {
+    if (!active_[candidate] || candidate == best) continue;
+    const PairedGap gap = gapAgainstLeader(candidate);
+    if (!gap.ok) continue;
+    if (!closest.ok || gap.upper > closest.upper) closest = gap;
+  }
+  return closest;
 }
 
 std::vector<size_t> PairedRace::activeIndices() const {
@@ -77,26 +127,13 @@ void PairedRace::eliminateSeparatedCandidates() {
   const size_t best = leader();
   if (best >= active_.size()) return;
 
+  // Only non-leaders are deactivated, so `best` remains the leader throughout
+  // and every candidate in this round is judged against the same baseline.
   for (size_t candidate = 0; candidate < active_.size(); candidate++) {
     if (!active_[candidate] || candidate == best) continue;
-    const size_t count = std::min(values_[candidate].size(), values_[best].size());
-    if (count < config_.minimumBatches) continue;
-
-    double sum = 0.0;
-    for (size_t i = 0; i < count; i++) sum += values_[candidate][i] - values_[best][i];
-    const double pairedMean = sum / count;
-    double variance = 0.0;
-    if (count > 1) {
-      for (size_t i = 0; i < count; i++) {
-        const double difference = values_[candidate][i] - values_[best][i];
-        variance += (difference - pairedMean) * (difference - pairedMean);
-      }
-      variance /= count - 1;
-    }
-    const double standardError = std::sqrt(variance / count);
-    const double upper = pairedMean + config_.standardErrorMultiplier * standardError +
-                         config_.modelAllowance;
-    if (upper < 0.0) active_[candidate] = false;
+    const PairedGap gap = gapAgainst(candidate, best);
+    if (!gap.ok || gap.observations < config_.minimumBatches) continue;
+    if (gap.upper < 0.0) active_[candidate] = false;
   }
 }
 

@@ -112,7 +112,18 @@ const DEFAULT_MAX_RESPONSE_BYTES = 4 * 1024 * 1024;
  *  only covers a process that is already wedged. */
 const KILL_GRACE_MS = 2_000;
 
-export async function runEngine(options: RunOptions): Promise<EngineResponse> {
+/**
+ * Run one engine process and return whatever JSON it produced.
+ *
+ * Everything about spawning, timing out, cancelling, bounding the response and
+ * reading progress lives here. What the response is SUPPOSED to look like does
+ * not: the engine answers three different questions on this protocol — a
+ * search, a device calibration and a legality check — and each has its own idea
+ * of a well-formed answer. Keeping the shape check out of the transport is what
+ * lets a validation reuse every one of those guarantees without pretending to
+ * be a move.
+ */
+export async function runEngineRaw(options: RunOptions): Promise<unknown> {
   const maxBytes = options.maxResponseBytes ?? DEFAULT_MAX_RESPONSE_BYTES;
 
   if (options.signal?.aborted) throw new EngineCancelledError();
@@ -225,17 +236,47 @@ export async function runEngine(options: RunOptions): Promise<EngineResponse> {
     );
   }
 
-  let parsed: EngineResponse;
+  let parsed: unknown;
   try {
-    parsed = JSON.parse(stdout.trim()) as EngineResponse;
+    parsed = JSON.parse(stdout.trim());
   } catch {
     throw new EngineFailureError("The engine produced output that is not a response.");
   }
-  if (parsed.error) {
-    throw new EngineFailureError(`The engine rejected the position: ${parsed.error}`);
+  const failure = (parsed as { error?: string } | null)?.error;
+  if (failure) {
+    throw new EngineFailureError(`The engine rejected the position: ${failure}`);
   }
+  return parsed;
+}
+
+export async function runEngine(options: RunOptions): Promise<EngineResponse> {
+  const parsed = (await runEngineRaw(options)) as EngineResponse;
   if (parsed.type !== "place" && parsed.type !== "exchange" && parsed.type !== "pass") {
     throw new EngineFailureError("The engine returned a move of no known kind.");
   }
   return parsed;
+}
+
+/** The engine's verdict on one submitted move. No search: the engine ran the
+ *  rules and nothing else. */
+export type EngineValidation = { valid: boolean; score: number; reason?: string };
+
+/**
+ * Ask the engine whether a move is legal from a position.
+ *
+ * Separate from `runEngine` because the answer is a different KIND of thing —
+ * `valid: false` is a successful call reporting an illegal move, not a failed
+ * one, and collapsing the two would turn "the bot suggested something the rules
+ * reject" into "the engine broke".
+ */
+export async function runEngineValidation(options: RunOptions): Promise<EngineValidation> {
+  const parsed = (await runEngineRaw(options)) as Partial<EngineValidation> & { mode?: string };
+  if (parsed.mode !== "validate" || typeof parsed.valid !== "boolean") {
+    throw new EngineFailureError("The engine returned no legality verdict.");
+  }
+  return {
+    valid: parsed.valid,
+    score: typeof parsed.score === "number" ? parsed.score : 0,
+    ...(parsed.reason ? { reason: parsed.reason } : {}),
+  };
 }

@@ -127,6 +127,88 @@ static void testPairedCheckpointHasCompleteRows() {
         !decision.rootScopeFingerprint.empty());
 }
 
+// The adaptive envelope is a ceiling on work, not a schedule to run to the end,
+// so what has to hold is: it never overspends the credits, it always says why
+// it stopped, and it gives the same answer twice.
+static void testAdaptiveStaysInsideItsCreditEnvelope() {
+  SearchQuery query;
+  query.position = openingPosition();
+  query.effort = SearchEffort::Strong;
+  SearchOverrides overrides;
+  overrides.searchCostCredits = 20'000'000;
+
+  for (SearchVariant variant : {SearchVariant::ReplyIndexAdaptiveUniform,
+                                SearchVariant::ReplyIndexAdaptivePaired}) {
+    const SearchDecision first = DecisionSearch::benchmark(query, variant, overrides);
+    const SearchDecision second = DecisionSearch::benchmark(query, variant, overrides);
+    CHECK(first.ok && second.ok);
+    CHECK(first.costCredits == overrides.searchCostCredits);
+    CHECK(canonicalMoveKey(first.move) == canonicalMoveKey(second.move));
+    CHECK(first.value == second.value);
+    CHECK(first.modeledCost == second.modeledCost);
+    CHECK(first.worldsCompleted == second.worldsCompleted);
+    CHECK(first.work.movegenNodes == second.work.movegenNodes);
+    CHECK(!first.work.invariantFailure);
+
+    // The screening prefix is charged before any credit check, so the bound is
+    // the envelope plus that prefix, not the envelope alone.
+    CHECK(first.modeledCost <= 4 * overrides.searchCostCredits);
+    CHECK(first.worldsCompleted <= first.worldsPlanned);
+    CHECK(first.stopReason != StopReason::ScheduleComplete);
+    // Only complete batches are ever committed.
+    for (const CandidateEvidence& candidate : first.candidates)
+      CHECK(candidate.observations <= first.worldsCompleted);
+  }
+}
+
+// More credits must buy more search, never less, and eliminating candidates
+// must let the survivors be measured on MORE worlds than the uniform arm
+// manages with the same credits. That reallocation is the whole point: a race
+// that only stops early is a cheaper search, not a better one.
+static void testMoreCreditsBuyMoreWorldsAndPairingConcentrates() {
+  SearchQuery query;
+  query.position = openingPosition();
+  query.effort = SearchEffort::Deep;
+
+  SearchOverrides small;
+  small.searchCostCredits = 20'000'000;
+  small.disableIndifferenceStop = true;
+  SearchOverrides large = small;
+  large.searchCostCredits = 120'000'000;
+
+  const SearchDecision cheap =
+      DecisionSearch::benchmark(query, SearchVariant::ReplyIndexAdaptiveUniform, small);
+  const SearchDecision rich =
+      DecisionSearch::benchmark(query, SearchVariant::ReplyIndexAdaptiveUniform, large);
+  CHECK(cheap.ok && rich.ok);
+  CHECK(rich.worldsCompleted >= cheap.worldsCompleted);
+  CHECK(rich.modeledCost >= cheap.modeledCost);
+
+  const SearchDecision uniform =
+      DecisionSearch::benchmark(query, SearchVariant::ReplyIndexAdaptiveUniform, large);
+  const SearchDecision paired =
+      DecisionSearch::benchmark(query, SearchVariant::ReplyIndexAdaptivePaired, large);
+  CHECK(uniform.ok && paired.ok);
+  CHECK(paired.worldsCompleted >= uniform.worldsCompleted);
+  CHECK(paired.activeCandidatesFinal <= uniform.activeCandidatesFinal);
+  CHECK(uniform.eliminationRounds == 0);
+}
+
+// Benchmark overrides must not be reachable from the product route.
+static void testOverridesDoNotLeakIntoTheProductRoute() {
+  SearchQuery query;
+  query.position = openingPosition();
+  query.effort = SearchEffort::Deep;
+  const SearchDecision product = DecisionSearch::decide(query);
+  const SearchDecision plain =
+      DecisionSearch::benchmark(query, SearchVariant::SimV2Reference);
+  CHECK(product.ok && plain.ok);
+  CHECK(product.variant == SearchVariant::SimV2Reference);
+  CHECK(product.costCredits == 0);
+  CHECK(canonicalMoveKey(product.move) == canonicalMoveKey(plain.move));
+  CHECK(product.work.movegenNodes == plain.work.movegenNodes);
+}
+
 static DecisionPosition fromGame(const GameSim& sim, int side) {
   DecisionPosition position;
   position.board = sim.board;
@@ -193,6 +275,9 @@ int main() {
   testDefaultPolicyRemainsTheReference();
   testPairedCheckpointHasCompleteRows();
   testReplyIndexMatchesReference();
+  testAdaptiveStaysInsideItsCreditEnvelope();
+  testMoreCreditsBuyMoreWorldsAndPairingConcentrates();
+  testOverridesDoNotLeakIntoTheProductRoute();
   testOpeningNoScoreStreakDoesNotEndTheGame();
   if (failures == 0) {
     std::printf("ALL DECISION-SEARCH TESTS PASSED\n");

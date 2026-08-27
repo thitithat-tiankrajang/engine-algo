@@ -143,12 +143,17 @@ minutes to about one minute without changing the endgame assertions.
 | G3 root catalogue | partial | assignment/exchange fixtures and one-root v2 invariant pass; 500-position corpus and shared exact-endgame root are outstanding |
 | G4 reference | partial | real reference exists, deterministic paired rows and hidden-information tests pass; known 24-sample opening fixture remains unresolved |
 | G5 ReplyIndex | strong partial | 10,000 randomized exact triples and measured node/p95 reductions pass; exhaustive small-rack matrix remains |
-| G6 admission | not run | frozen train/held-out corpus and registered regret thresholds required |
-| G7 PairedRace | not passed | batch invariants pass, but equal-work agreement/regret/call-reduction corpus is not complete |
-| G8 strength/latency | not run | requires paired self-play and latency percentiles on the frozen corpus |
+| G6 admission | **measured, fails** | 95.8% recall at Deep's cap against a required 99%; the reference variant's effective cap of 12 reaches 75%. See [`deep-compute-allocation-report.md`](deep-compute-allocation-report.md) |
+| G7 PairedRace | **measured, fails** | at equal credits paired allocation agrees 93.8% with uniform against a required 95%, raises generation calls instead of cutting them 30%, and carries 15x the reference regret |
+| G8 strength/latency | not run | blocked by G6 and G7; requires paired self-play and latency percentiles on the frozen corpus |
 
 Therefore no production solver route, service tier, or public wire field was
 changed. Threat Oracle and selective third ply remain absent, as required.
+
+G6 and G7 have since been measured on a frozen 24-position corpus and both fail.
+`PairedRace` in particular does not buy strength per unit of compute: the
+follow-up report recommends retaining uniform allocation over a wide admitted
+set and treating admission, not allocation, as the next thing to fix.
 
 ## Smallest next sequence
 

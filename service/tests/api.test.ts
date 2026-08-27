@@ -7,6 +7,7 @@ import { describe, expect, it, vi } from "vitest";
 
 import { createApp } from "../src/app.js";
 import { EngineCancelledError, EngineFailureError, EngineTimeoutError } from "../src/engineRunner.js";
+import { BOT_TIER_CONFIG } from "../src/levels.js";
 import { EngineQueue } from "../src/queue.js";
 import { JobRegistry } from "../src/jobRegistry.js";
 import { ComputeBudget, ConcurrencyLimit } from "../src/rateLimit.js";
@@ -52,6 +53,9 @@ function harness(overrides: Overrides = {}) {
   const budget = new ComputeBudget({
     perWindow: config.budgetPerWindow,
     windowMs: config.budgetWindowMs,
+    // Read from the config so a harness cannot meter while its config says it
+    // does not, or the reverse.
+    enforced: config.budgetEnforced,
   });
   const analysisSlots = new ConcurrencyLimit(config.maxAnalysisPerUser);
   // Typed so `mock.calls[0][0].request` is checkable — several tests assert on
@@ -493,6 +497,7 @@ describe("engine failures", () => {
 
   it("refunds the compute budget when the engine fails", async () => {
     const { call, budget } = harness({
+      config: { analysisBudgeted: true },
       engine: async () => {
         throw new EngineFailureError("boom");
       },
@@ -515,8 +520,98 @@ describe("compute protection", () => {
     expect(response.status).toBe(413);
   });
 
+  it("never runs an account out of analyses, however expensive the level", async () => {
+    // Four DISTINCT `max` analyses, one after another — none of them the cache
+    // hit that would be free under any policy. At 30 cost units each, a budget
+    // of 60 would have refused the third. There is no budget on analysis: a
+    // player who waits their turn is never told they have had enough.
+    const { call, source, runEngine, budget, analysisSlots } = harness();
+    for (let revision = 7; revision < 11; revision += 1) {
+      source.advanceTo(revision);
+      const response = await call("/analysis", { expectedRevision: revision, level: "max" });
+      expect(response.status).toBe(200);
+    }
+    expect(runEngine).toHaveBeenCalledTimes(4);
+    expect(budget.remaining("user-1")).toBe(60);
+    // And the account is left holding nothing, so the next press is free to go.
+    expect(analysisSlots.heldBy("user-1")).toBe(0);
+  });
+
+  it("counts a QUEUED analysis as in flight, and leaves it in its place", async () => {
+    // The player's analysis has not started — it is behind another search on a
+    // one-at-a-time queue. That is still an analysis this account has asked for
+    // and is about to be given, so a press on a DIFFERENT game is refused until
+    // it is done. The waiting job is not cancelled or overtaken to make room:
+    // it keeps its place in line and then answers.
+    const OTHER_GAME = "99999999-8888-7777-6666-555555555555";
+    const queue = new EngineQueue({ concurrency: 1, maxWaiting: 8, maxWaitMs: 30_000 });
+    let release: (() => void) | undefined;
+    const held = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    // Someone else's search owns the one engine slot.
+    const occupier = harness({
+      queue,
+      engine: async () => {
+        await held;
+        return fakeEngineResponse();
+      },
+    });
+    const occupying = occupier.call("/analysis", { expectedRevision: 7, level: "quick" });
+    await new Promise((resolve) => setTimeout(resolve, 10));
+
+    const player = harness({ queue });
+    const queued = player.call("/analysis", { expectedRevision: 7, level: "deep" });
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    // Nothing of the player's is running yet — and the second game is refused
+    // on those grounds alone.
+    expect(player.runEngine).not.toHaveBeenCalled();
+    const otherGame = await player.app.request(`/v1/games/${OTHER_GAME}/analysis`, {
+      method: "POST",
+      headers: {
+        Authorization: "Bearer token-1",
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ expectedRevision: 7, level: "quick" }),
+    });
+    expect(otherGame.status).toBe(429);
+    expect(await otherGame.json()).toMatchObject({ code: "analysis_in_progress" });
+
+    release?.();
+    expect((await occupying).status).toBe(200);
+    expect((await queued).status).toBe(200);
+    // Once it is done the account is clear, and the game it was refused for
+    // goes through — the refusal was "wait", not "no".
+    expect(player.analysisSlots.heldBy("user-1")).toBe(0);
+    const retried = await player.app.request(`/v1/games/${OTHER_GAME}/analysis`, {
+      method: "POST",
+      headers: {
+        Authorization: "Bearer token-1",
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ expectedRevision: 7, level: "quick" }),
+    });
+    expect(retried.status).toBe(200);
+  });
+
+  it("still budgets bot moves, which no player is sitting and waiting for", async () => {
+    // Dropping the analysis budget is not dropping the budget. A bot turn is charged
+    // exactly as before — `max` costs 8, and a budget of 12 buys one. The
+    // second is a different turn, so it is a real second search rather than the
+    // cached answer to the first.
+    const { call, source } = harness({
+      config: { budgetPerWindow: 12 },
+      source: { botSide: "A", botDifficulty: "max" },
+    });
+    expect((await call("/bot-move", { expectedRevision: 7 })).status).toBe(200);
+    source.advanceTo(8);
+    const second = await call("/bot-move", { expectedRevision: 8 });
+    expect(second.status).toBe(429);
+    expect(await second.json()).toMatchObject({ code: "budget_exhausted" });
+  });
+
   it("stops a user who has spent their budget", async () => {
-    const { call } = harness({ config: { budgetPerWindow: 12 } });
+    const { call } = harness({ config: { budgetPerWindow: 12, analysisBudgeted: true } });
     // deep costs 10, so the first succeeds and the second is over.
     expect((await call("/analysis", { expectedRevision: 7, level: "deep" })).status).toBe(200);
     const second = await call("/analysis", { expectedRevision: 7, level: "deep" });
@@ -525,7 +620,7 @@ describe("compute protection", () => {
     expect(second.headers.get("Retry-After")).toBeTruthy();
   });
 
-  it("holds one analysis slot per user, so one account cannot fill the queue", async () => {
+  it("refuses a second analysis while this account already has one in flight", async () => {
     let release: (() => void) | undefined;
     const gate = new Promise<void>((resolve) => {
       release = resolve;
@@ -560,7 +655,7 @@ describe("compute protection", () => {
       release = resolve;
     });
     const { call, runEngine, analysisSlots, budget } = harness({
-      config: { budgetPerWindow: 100 },
+      config: { budgetPerWindow: 100, analysisBudgeted: true },
       engine: async () => {
         await gate;
         return fakeEngineResponse();
@@ -704,7 +799,6 @@ describe("the queue, through the API", () => {
     let first = true;
     const occupier = harness({
       queue,
-      config: { maxAnalysisPerUser: 4 },
       engine: async () => {
         if (first) {
           first = false;
@@ -717,7 +811,7 @@ describe("the queue, through the API", () => {
     const running = sse(occupier.call, "/analysis", { expectedRevision: 7, level: "quick" });
     await new Promise((resolve) => setTimeout(resolve, 10));
 
-    const waiter = harness({ queue, config: { maxAnalysisPerUser: 4 }, source: { revision: 7 } });
+    const waiter = harness({ queue, source: { revision: 7 } });
     const queuedResponse = await sse(waiter.call, "/analysis", {
       expectedRevision: 7,
       level: "deep",
@@ -990,6 +1084,17 @@ describe("health", () => {
     expect(body.retention).toEqual({
       analysisResultTtlMs: 5 * 60 * 1000,
       botResultTtlMs: 60 * 1000,
+    });
+    // How the queue numbers above should be read: analysis is serialised per
+    // account rather than rationed, so its load arrives in this queue.
+    expect(body.metering).toEqual({
+      analysisInFlight: 1,
+      analysisBudget: "unlimited",
+      botBudget: "rationed",
+      // Reported so an operator can see what the ration actually is, rather
+      // than only that one exists.
+      budgetPerWindow: baseConfig().budgetPerWindow,
+      budgetWindowMs: baseConfig().budgetWindowMs,
     });
 
     const text = JSON.stringify(body);
@@ -1495,8 +1600,11 @@ describe("two callers, one canonical turn", () => {
     const b = (await second.json()) as { revision: number; move: unknown };
     expect(a.revision).toBe(7);
     expect(b).toEqual(a);
-    // `medium` costs 2. Charged once, not twice.
-    expect(h.budget.remaining("user-1")).toBe(58);
+    // Charged ONCE, not twice — which is the claim, not the price. Derived from
+    // the tier table so a legitimate reprice does not read as a regression here.
+    expect(h.budget.remaining("user-1")).toBe(
+      baseConfig().budgetPerWindow - BOT_TIER_CONFIG.medium.cost,
+    );
   });
 
   it("serves a second caller from the cached result rather than re-searching", async () => {
@@ -1505,7 +1613,9 @@ describe("two callers, one canonical turn", () => {
     const again = await h.call("/bot-move", { expectedRevision: 7 });
     expect(again.status).toBe(200);
     expect(h.runEngine).toHaveBeenCalledTimes(1);
-    expect(h.budget.remaining("user-1")).toBe(58);
+    expect(h.budget.remaining("user-1")).toBe(
+      baseConfig().budgetPerWindow - BOT_TIER_CONFIG.medium.cost,
+    );
   });
 
   it("does not let a cached turn answer for the NEXT position", async () => {
@@ -1516,5 +1626,169 @@ describe("two callers, one canonical turn", () => {
     h.source.advanceTo(8);
     await h.call("/bot-move", { expectedRevision: 8 });
     expect(h.runEngine).toHaveBeenCalledTimes(2);
+  });
+});
+
+// ── explaining a move that has already been played ───────────────────────────
+//
+// The move response carries the move and nothing else, on purpose. The engine's
+// ranking is read afterwards, on demand, a page at a time, out of the result the
+// registry already holds — no second search, and no payload paid for on turns
+// where nobody opens the panel.
+describe("bot reasoning", () => {
+  const BOT_ROOM: FakeSourceOptions = {
+    botSide: "B",
+    botDifficulty: "medium",
+    activeSide: "B",
+  };
+
+  /** A ranking long enough to page through. Descending by value, chosen first —
+   *  the order the engine itself serialises. */
+  function rankedResponse(count = 20) {
+    return fakeEngineResponse({
+      equity: 31.5,
+      stats: { moves: 410, nodes: 81234, elapsedMs: 1830, candidates: count, samples: 4 },
+      candidates: Array.from({ length: count }, (_, index) => ({
+        type: "place" as const,
+        placements: [{ r: 7, c: 7 + index, kind: "5", token: "5" }],
+        exchange: [],
+        score: 30 - index,
+        scoreComp: 30 - index,
+        leave: 8.5,
+        potential: 6.2,
+        oppReply: 12.1,
+        mean: 26.6 - index,
+        stddev: 3.2,
+        value: 24.1 - index,
+        chosen: index === 0,
+      })),
+    });
+  }
+
+  const read = (h: ReturnType<typeof harness>, query: string) =>
+    h.app.request(`/v1/games/${GAME_ID}/bot-move/reasoning${query}`, {
+      headers: { Authorization: "Bearer token-1" },
+    });
+
+  /** Play the bot's turn at revision 7, then let the game advance past it — the
+   *  state the panel is actually opened in. */
+  async function playedTurn(overrides: FakeSourceOptions = {}) {
+    const h = harness({
+      source: { ...BOT_ROOM, ...overrides },
+      engine: async () => rankedResponse(),
+    });
+    expect((await h.call("/bot-move", { expectedRevision: 7 })).status).toBe(200);
+    h.source.advanceTo(8);
+    return h;
+  }
+
+  it("asks the engine for a full ranking, not the default handful", async () => {
+    const h = harness({ source: BOT_ROOM });
+    await h.call("/bot-move", { expectedRevision: 7 });
+    expect(h.runEngine.mock.calls[0]?.[0].request).toMatchObject({ topN: 24 });
+  });
+
+  it("serves the first page with the numbers the move response withholds", async () => {
+    const h = await playedTurn();
+    const response = await read(h, "?revision=7");
+    expect(response.status).toBe(200);
+    const body = (await response.json()) as {
+      equity: number;
+      stats: { candidates: number; moves: number };
+      page: { offset: number; limit: number; total: number };
+      candidates: Array<{ value: number; chosen: boolean }>;
+      chosenIndex: number;
+      chosen: { chosen: boolean };
+      runnerUp: { value: number };
+    };
+    // Exactly the fields `toBotResponse` on the client had to zero-fill.
+    expect(body.equity).toBe(31.5);
+    expect(body.stats).toMatchObject({ candidates: 20, moves: 410 });
+    expect(body.page).toEqual({ offset: 0, limit: 6, total: 20 });
+    expect(body.candidates).toHaveLength(6);
+    expect(body.chosenIndex).toBe(0);
+    expect(body.chosen.chosen).toBe(true);
+    expect(body.runnerUp.value).toBe(23.1);
+    // No second search: the report came out of the registry's cached result.
+    expect(h.runEngine).toHaveBeenCalledTimes(1);
+  });
+
+  it("pages through the ranking without re-running the search", async () => {
+    const h = await playedTurn();
+    const body = (await (await read(h, "?revision=7&offset=6&limit=6")).json()) as {
+      page: { offset: number; total: number };
+      candidates: Array<{ value: number }>;
+      chosen: { value: number };
+      runnerUp: { value: number };
+    };
+    expect(body.page).toMatchObject({ offset: 6, total: 20 });
+    expect(body.candidates.map((candidate) => Math.round(candidate.value * 10) / 10)).toEqual([
+      18.1, 17.1, 16.1, 15.1, 14.1, 13.1,
+    ]);
+    // Repeated on every page, so a client can render page four without ever
+    // having fetched page one.
+    expect(body.chosen.value).toBe(24.1);
+    expect(body.runnerUp.value).toBe(23.1);
+    expect(h.runEngine).toHaveBeenCalledTimes(1);
+  });
+
+  it("clamps a page past the end instead of failing, and says what it served", async () => {
+    const h = await playedTurn();
+    const body = (await (await read(h, "?revision=7&offset=999&limit=500")).json()) as {
+      page: { offset: number; limit: number; total: number };
+      candidates: unknown[];
+    };
+    expect(body.page).toEqual({ offset: 20, limit: 24, total: 20 });
+    expect(body.candidates).toEqual([]);
+  });
+
+  it("still explains the move that ENDED the game", async () => {
+    // The last move of a game is the one players most want explained, and by
+    // then the room is no longer `playing`.
+    const h = await playedTurn({ status: "finished" });
+    expect((await read(h, "?revision=7")).status).toBe(200);
+  });
+
+  it("refuses a spectator, exactly as the move endpoint does", async () => {
+    const h = await playedTurn();
+    const spectator = harnessSharing(h, { ...BOT_ROOM, callerControlsActiveSide: false });
+    const response = await read(spectator, "?revision=7");
+    expect(response.status).toBe(403);
+    expect(await response.json()).toMatchObject({ code: "forbidden" });
+  });
+
+  it("has nothing to explain in a room with no engine player", async () => {
+    const h = harness({ source: { botSide: null, botDifficulty: null } });
+    const response = await read(h, "?revision=7");
+    expect(response.status).toBe(409);
+    expect(await response.json()).toMatchObject({ code: "turn_rule" });
+  });
+
+  it("says plainly when the reasoning is no longer held", async () => {
+    // Retention is bounded and in memory. An old move, or a restarted service,
+    // is an ordinary outcome the client shows as a sentence — not an error.
+    const h = harness({ source: { ...BOT_ROOM, revision: 8 } });
+    const response = await read(h, "?revision=7");
+    expect(response.status).toBe(404);
+    expect(await response.json()).toMatchObject({ code: "reasoning_unavailable" });
+  });
+
+  it("refuses to walk the cache backwards through the game", async () => {
+    const h = harness({ source: { ...BOT_ROOM, revision: 40 } });
+    const response = await read(h, "?revision=7");
+    expect(response.status).toBe(409);
+    expect(await response.json()).toMatchObject({ code: "stale_revision" });
+  });
+
+  it("refuses a revision the game has not reached", async () => {
+    const h = harness({ source: BOT_ROOM });
+    expect((await read(h, "?revision=99")).status).toBe(409);
+  });
+
+  it("requires a revision at all", async () => {
+    const h = harness({ source: BOT_ROOM });
+    const response = await read(h, "");
+    expect(response.status).toBe(400);
+    expect(await response.json()).toMatchObject({ code: "bad_request" });
   });
 });

@@ -1,10 +1,16 @@
 #include "reply_index.hpp"
 
-#include <map>
+#include <algorithm>
+#include <string>
 #include <utility>
 
 namespace amath {
 namespace {
+
+struct KeyedMove {
+  std::string key;
+  Move move;
+};
 
 void markRow(MovegenStartMasks& masks, int row) {
   if (row < 0 || row >= BOARD_SIZE) return;
@@ -71,15 +77,20 @@ ReplySet ReplyIndex::recover(const ReplyIndexResult& index, const Board& boardAf
                              const std::vector<Placement>& candidatePlacements,
                              const TileCounts& opponentRack, WorkLedger& ledger,
                              uint64_t requestedDeltaNodeLimit) {
+  // Keyed entries in insertion order: every surviving base reply first, then
+  // the delta. Deduplication happens once at the end, which is the same set and
+  // the same delta-wins precedence a std::map gave, without a tree node and an
+  // allocation per reply per candidate per world.
   ReplySet result;
-  std::map<std::string, Move> merged;
+  std::vector<KeyedMove> merged;
+  merged.reserve(index.basePlacements.size());
   for (const Move& indexed : index.basePlacements) {
     const MoveValidation validation = validatePlaceMove(boardAfterCandidate, indexed.placements);
     result.revalidated++;
     if (!validation.valid) continue;
     Move move = indexed;
     move.score = validation.score;
-    merged[canonicalMoveKey(move)] = std::move(move);
+    merged.push_back({canonicalMoveKey(move), std::move(move)});
   }
   ledger.chargeReplyRevalidation(result.revalidated);
 
@@ -105,12 +116,20 @@ ReplySet ReplyIndex::recover(const ReplyIndexResult& index, const Board& boardAf
       deltaComplete = accounted && !stats.truncated;
       result.deltaNodes = static_cast<uint64_t>(stats.nodesVisited);
       result.deltaAssignments = static_cast<uint64_t>(stats.movesEmitted);
-      for (Move& move : delta) merged[canonicalMoveKey(move)] = std::move(move);
+      for (Move& move : delta) merged.push_back({canonicalMoveKey(move), std::move(move)});
     }
   }
 
+  // Stable so that equal keys keep insertion order, then the last of each run
+  // wins: a reply the delta regenerated supersedes the revalidated base copy,
+  // exactly as the overwriting map insert did.
+  std::stable_sort(merged.begin(), merged.end(),
+                   [](const KeyedMove& a, const KeyedMove& b) { return a.key < b.key; });
   result.placements.reserve(merged.size());
-  for (auto& [key, move] : merged) result.placements.push_back(std::move(move));
+  for (size_t i = 0; i < merged.size(); i++) {
+    if (i + 1 < merged.size() && merged[i + 1].key == merged[i].key) continue;
+    result.placements.push_back(std::move(merged[i].move));
+  }
   result.complete = index.complete && deltaComplete;
   return result;
 }

@@ -1,9 +1,18 @@
 // ── The boundary adapter: canonical game state → engine request ──────────────
 //
-// One direction, one place. Everything the engine is told about a position is
-// derived HERE from the stored canonical state, and nothing the caller sends is
-// ever mixed in. That is the whole trust story of this service: a client names
-// a game and a revision, and the server looks up what is actually true.
+// One direction, one place. For a GAME, everything the engine is told about a
+// position is derived HERE from the stored canonical state, and nothing the
+// caller sends is ever mixed in. That is the whole trust story of this service:
+// a client names a game and a revision, and the server looks up what is
+// actually true.
+//
+// `toStudyEngineRequest` at the bottom is the one deliberate exception, and it
+// is an exception to the INPUT, not to the guarantee. A study position has no
+// room to look up and no opponent to hide anything from — the caller invented
+// every tile in it, including their own rack. `study.ts` validates it against
+// the physical tile set before it reaches this file; what it must never be is
+// a way to ask about a real game's position, which is why it takes a
+// `StudyPosition` and not a game id.
 //
 // This is also the file that has to agree, field for field, with what the
 // browser used to compute in `EQ-Lab/src/bot/botController.ts::buildBotRequest`.
@@ -24,6 +33,7 @@ import {
   rackSize,
   rackTokens,
 } from "./canonical.js";
+import { studyExchangeAllowed, studyFingerprint, type StudyPosition } from "./study.js";
 
 export type EngineRequest = {
   board: Array<{ r: number; c: number; kind: string; token: string }>;
@@ -40,6 +50,9 @@ export type EngineRequest = {
    *  every existing caller keeps its behaviour. */
   solver?: "static" | "sim";
   budgetMs?: number;
+  /** Take every wall-clock ceiling off the search and let it run its schedule
+   *  to completion. Omitted for every tier but `super`. */
+  unlimited?: boolean;
   sampleCap?: number;
   topN?: number;
   seed: number;
@@ -117,11 +130,57 @@ export type AdapterOptions = {
   difficulty: string;
   solver?: "static" | "sim";
   budgetMs?: number;
+  unlimited?: boolean;
   sampleCap?: number;
   topN?: number;
   events: readonly CommittedCommand[];
   seedSalt?: string;
 };
+
+export type StudyAdapterOptions = {
+  difficulty: string;
+  solver?: "static" | "sim";
+  budgetMs?: number;
+  unlimited?: boolean;
+  topN?: number;
+};
+
+/**
+ * Build the engine request for a STUDY position — one the caller invented
+ * rather than one the server is holding.
+ *
+ * The hidden-information guarantee `toEngineRequest` provides structurally (the
+ * opponent's tiles become a COUNT before they reach the engine) is not weakened
+ * here: there is no opponent whose tiles could leak, and the only rack in the
+ * request is the caller's own. What `study.ts` guarantees instead is that the
+ * position is one the physical tile set can actually produce.
+ */
+export function toStudyEngineRequest(
+  position: StudyPosition,
+  options: StudyAdapterOptions,
+): EngineRequest {
+  return {
+    board: position.board,
+    rack: position.rack,
+    bagCount: position.bagCount,
+    oppRackCount: position.oppRackCount,
+    myScore: position.scoreSelf,
+    oppScore: position.scoreOpponent,
+    // A study position has no history, so there is no scoreless run behind it.
+    // Inventing one would change how the engine reasons about ending a game
+    // that never happened.
+    noScoreStreak: 0,
+    exchangeAllowed: studyExchangeAllowed(position),
+    difficulty: options.difficulty,
+    ...(options.solver != null ? { solver: options.solver } : {}),
+    ...(options.budgetMs != null ? { budgetMs: options.budgetMs } : {}),
+    ...(options.unlimited ? { unlimited: true } : {}),
+    ...(options.topN != null ? { topN: options.topN } : {}),
+    // Keyed by the position itself: the same puzzle at the same strength is the
+    // same search, and must not quietly rank differently on a second visit.
+    seed: seedFor(studyFingerprint(position, options.difficulty), 0),
+  };
+}
 
 /**
  * Build the engine request for one side of one position.
@@ -157,6 +216,7 @@ export function toEngineRequest(
     difficulty: options.difficulty,
     ...(options.solver != null ? { solver: options.solver } : {}),
     ...(options.budgetMs != null ? { budgetMs: options.budgetMs } : {}),
+    ...(options.unlimited ? { unlimited: true } : {}),
     ...(options.sampleCap != null ? { sampleCap: options.sampleCap } : {}),
     ...(options.topN != null ? { topN: options.topN } : {}),
     seed: seedFor(state.gameId, state.revision, options.seedSalt),

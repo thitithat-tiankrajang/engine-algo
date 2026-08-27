@@ -23,6 +23,7 @@ OpponentSearchResult rankReplies(const SearchState& state, std::vector<Move> mov
                                  bool placementSetComplete) {
   OpponentSearchResult result;
   const OpponentInformationSet info = OpponentPolicyEvaluator::project(state);
+  const BoardContext context = OpponentPolicyEvaluator::context(info);
   const int reserve = info.publicPhysicalBagCount + info.aetherRackCount - RACK_SIZE;
   if (reserve >= EXCHANGE_MIN_RESERVE) {
     std::vector<Move> exchanges = enumerateExchangeMultisets(info.opponentRack);
@@ -33,14 +34,26 @@ OpponentSearchResult rankReplies(const SearchState& state, std::vector<Move> mov
   pass.type = MoveType::Pass;
   moves.push_back(std::move(pass));
 
+  // The canonical key is only consulted to break a value tie, and ties are
+  // rare, so it is built on demand. Building one per reply per candidate per
+  // world was a quarter of a Deep decision's CPU; the selected move is
+  // unchanged because the comparison itself is unchanged.
   int32_t bestValue = std::numeric_limits<int32_t>::min();
   std::string bestKey;
+  bool haveBest = false;
   for (const Move& move : moves) {
-    const int32_t value = OpponentPolicyEvaluator::evaluate(info, move);
-    const std::string key = canonicalMoveKey(move);
-    if (value > bestValue || (value == bestValue && (bestKey.empty() || key < bestKey))) {
+    const int32_t value = OpponentPolicyEvaluator::evaluate(info, context, move);
+    if (!haveBest || value > bestValue) {
       bestValue = value;
-      bestKey = key;
+      bestKey = canonicalMoveKey(move);
+      result.move = move;
+      haveBest = true;
+      continue;
+    }
+    if (value != bestValue) continue;
+    std::string key = canonicalMoveKey(move);
+    if (key < bestKey) {
+      bestKey = std::move(key);
       result.move = move;
     }
   }
@@ -85,13 +98,19 @@ OpponentInformationSet OpponentPolicyEvaluator::project(const SearchState& state
   return info;
 }
 
+BoardContext OpponentPolicyEvaluator::context(const OpponentInformationSet& info) {
+  const int otherSide = 1 - info.opponentSide;
+  return makeContext(info.board, info.publicUnseen, info.publicPhysicalBagCount,
+                     static_cast<float>(info.scores[info.opponentSide] - info.scores[otherSide]));
+}
+
 int32_t OpponentPolicyEvaluator::evaluate(const OpponentInformationSet& info,
                                           const Move& move) {
-  const int otherSide = 1 - info.opponentSide;
-  const BoardContext context =
-      makeContext(info.board, info.publicUnseen, info.publicPhysicalBagCount,
-                  static_cast<float>(info.scores[info.opponentSide] - info.scores[otherSide]));
+  return evaluate(info, context(info), move);
+}
 
+int32_t OpponentPolicyEvaluator::evaluate(const OpponentInformationSet& info,
+                                          const BoardContext& context, const Move& move) {
   if (move.type == MoveType::Place) {
     TileCounts after = info.opponentRack;
     for (const Placement& placement : move.placements) after.sub(placement.kind);

@@ -23,6 +23,26 @@ struct SearchPolicy {
   uint32_t minimumWorlds = 1;
   size_t candidateCap = 1;
   int32_t correctionEnvelope = 0;
+
+  // True for the candidate-specific full-generation reference, whose call
+  // ceiling scales with worlds x candidates rather than with worlds alone.
+  bool referenceReplies = false;
+
+  // Adaptive allocation only. `worlds` becomes the screening prefix every
+  // admitted candidate is measured on; after that the schedule continues for
+  // as long as the contenders are unresolved and credits remain.
+  bool adaptive = false;
+  bool eliminate = false;
+  uint32_t maxWorlds = 0;
+  uint64_t searchCostCredits = 0;
+  int32_t indifferenceMargin = 0;
+
+  // How far behind the leader a candidate must be before the race is willing to
+  // stop paying for it. It is an allowance for evaluator and truncation error,
+  // not a confidence level, and it is the single most consequential number in
+  // the allocation policy: too small and good moves are dropped, too large and
+  // nothing is ever dropped and the race degenerates into uniform allocation.
+  int32_t modelAllowance = RaceConfig{}.modelAllowance;
 };
 
 struct RankedAction {
@@ -45,6 +65,8 @@ SearchPolicy policyFor(SearchEffort effort, SearchVariant variant) {
     policy.minimumWorlds = 1;
     policy.candidateCap = 7;
     policy.correctionEnvelope = 50 * ENDPOINT_SCALE;
+    policy.maxWorlds = 8;
+    policy.searchCostCredits = 40'000'000;
   } else if (effort == SearchEffort::Strong) {
     policy.envelope = {5, 60, 800'000'000, 0, 4};
     policy.rootNodeLimit = 20'000'000;
@@ -53,14 +75,29 @@ SearchPolicy policyFor(SearchEffort effort, SearchVariant variant) {
     policy.minimumWorlds = 2;
     policy.candidateCap = 15;
     policy.correctionEnvelope = 70 * ENDPOINT_SCALE;
+    policy.maxWorlds = 24;
+    policy.searchCostCredits = 120'000'000;
   } else {
     policy.envelope = {9, 184, 2'400'000'000ULL, 0, 8};
     policy.rootNodeLimit = 24'000'000;
-    policy.opponentNodeLimit = 12'000'000;
+    // A world whose reply set does not fit the per-call ceiling has to be
+    // dropped, and the racks that overflow are the ones with the most replies —
+    // exactly the dangerous ones. At 12M, 4-8% of Deep's worlds were dropped
+    // and the sample was biased toward quiet opponent racks; measured over a
+    // 24-world deck, 48M drops none of them.
+    policy.opponentNodeLimit = 48'000'000;
     policy.worlds = 8;
     policy.minimumWorlds = 2;
     policy.candidateCap = 23;
     policy.correctionEnvelope = 90 * ENDPOINT_SCALE;
+    // Deep's envelope is a ceiling on work, not a quota to consume, and it is
+    // set from where the measured quality curve stops rising rather than from a
+    // round number. On the 24-position corpus uniform allocation reaches its
+    // best agreement and regret at about 60M modelled cost; 120M and 240M buy
+    // more worlds and no better decisions. Re-derive this whenever the corpus
+    // or the endpoint evaluator changes. See deep-compute-allocation-report.md.
+    policy.maxWorlds = 64;
+    policy.searchCostCredits = 60'000'000;
   }
 
   if (variant == SearchVariant::SimV2Reference) {
@@ -70,22 +107,91 @@ SearchPolicy policyFor(SearchEffort effort, SearchVariant variant) {
     const uint32_t opponentCallAllowance = effort == SearchEffort::Interactive
                                                ? 7
                                                : effort == SearchEffort::Strong ? 32 : 96;
+    policy.referenceReplies = true;
     policy.candidateCap = std::min<size_t>(
         policy.candidateCap, opponentCallAllowance / std::max<uint32_t>(policy.worlds, 1));
     policy.envelope.maxFullGenCalls = 1 + policy.worlds * policy.candidateCap;
     policy.envelope.maxDeltaGenCalls = 0;
-  } else {
-    // Exact ReplyIndex needs one full base generation per world; every
-    // candidate-local recovery is separately bounded and reported as delta.
-    // The remaining full-call allowance is reserved for exact fallback if a
-    // base or delta generation is incomplete.
-    const uint32_t opponentCallAllowance = effort == SearchEffort::Interactive
-                                               ? 8
-                                               : effort == SearchEffort::Strong ? 32 : 96;
-    policy.envelope.maxFullGenCalls = 1 + opponentCallAllowance;
-    policy.envelope.maxDeltaGenCalls = policy.worlds * policy.candidateCap;
+    return policy;
   }
+
+  // Exact ReplyIndex needs one full base generation per world; every
+  // candidate-local recovery is separately bounded and reported as delta.
+  // The remaining full-call allowance is reserved for exact fallback if a
+  // base or delta generation is incomplete.
+  const uint32_t opponentCallAllowance = effort == SearchEffort::Interactive
+                                             ? 8
+                                             : effort == SearchEffort::Strong ? 32 : 96;
+  policy.envelope.maxFullGenCalls = 1 + opponentCallAllowance;
+  policy.envelope.maxDeltaGenCalls = policy.worlds * policy.candidateCap;
+
+  if (!usesAdaptiveAllocation(variant)) return policy;
+
+  policy.adaptive = true;
+  policy.eliminate = variant == SearchVariant::ReplyIndexAdaptivePaired;
+  policy.minimumWorlds = std::min<uint32_t>(policy.worlds, 3);
+  policy.indifferenceMargin = ENDPOINT_SCALE / 2;
+  policy.modelAllowance = RaceConfig{}.modelAllowance;
+  // The ledger ceilings become the outer safety net; the credit envelope is
+  // what actually stops the search, so these are sized to the world ceiling.
+  policy.envelope.maxWorlds = policy.maxWorlds;
+  policy.envelope.maxFullGenCalls = 1 + policy.maxWorlds + opponentCallAllowance;
+  policy.envelope.maxDeltaGenCalls =
+      static_cast<uint32_t>(policy.maxWorlds * policy.candidateCap);
+  policy.envelope.maxMovegenNodes =
+      std::max<uint64_t>(policy.envelope.maxMovegenNodes, 4 * policy.searchCostCredits);
   return policy;
+}
+
+// Re-derive the ledger ceilings from whatever the knobs now say. An override
+// that widened admission or lengthened the schedule without widening the
+// ceilings would not fail loudly: generations would simply be refused, replies
+// would fall back or truncate, and the run would report a weaker search as if
+// it were the policy under test. So the ceilings are computed in one place,
+// from the final values, and never patched field by field.
+void sizeEnvelope(SearchPolicy& policy) {
+  const uint32_t worldCeiling = policy.adaptive ? policy.maxWorlds : policy.worlds;
+  const uint32_t candidates = static_cast<uint32_t>(policy.candidateCap);
+  policy.envelope.maxWorlds = worldCeiling;
+  if (policy.referenceReplies) {
+    policy.envelope.maxFullGenCalls = 1 + worldCeiling * candidates;
+    policy.envelope.maxDeltaGenCalls = 0;
+  } else {
+    // One base index per world, plus headroom for the exact full-generation
+    // fallback, plus one delta per candidate per world.
+    policy.envelope.maxFullGenCalls = 1 + worldCeiling * 2 + 96;
+    policy.envelope.maxDeltaGenCalls = worldCeiling * candidates;
+  }
+  if (policy.adaptive) {
+    policy.envelope.maxMovegenNodes =
+        std::max<uint64_t>(policy.envelope.maxMovegenNodes, 4 * policy.searchCostCredits);
+  }
+}
+
+void applyOverrides(SearchPolicy& policy, const SearchOverrides& overrides) {
+  bool resize = false;
+  if (overrides.candidateCap != 0) {
+    policy.candidateCap = overrides.candidateCap;
+    resize = true;
+  }
+  if (overrides.worlds != 0) {
+    policy.worlds = overrides.worlds;
+    policy.minimumWorlds = std::min(policy.minimumWorlds, policy.worlds);
+    resize = true;
+  }
+  if (overrides.maxWorlds != 0) {
+    policy.maxWorlds = overrides.maxWorlds;
+    resize = true;
+  }
+  if (overrides.searchCostCredits != 0) {
+    policy.searchCostCredits = overrides.searchCostCredits;
+    resize = true;
+  }
+  if (overrides.correctionEnvelope >= 0) policy.correctionEnvelope = overrides.correctionEnvelope;
+  if (overrides.modelAllowance >= 0) policy.modelAllowance = overrides.modelAllowance;
+  if (overrides.indifferenceMargin >= 0) policy.indifferenceMargin = overrides.indifferenceMargin;
+  if (overrides.disableIndifferenceStop) policy.indifferenceMargin = 0;
+  if (resize) sizeEnvelope(policy);
 }
 
 uint64_t hashByte(uint64_t hash, uint8_t byte) {
@@ -176,6 +282,40 @@ std::vector<RankedAction> selectRootScope(std::vector<RankedAction> ranked, size
   return selected;
 }
 
+// What one more world would cost, from what the completed worlds actually
+// cost. Integer arithmetic throughout, so the projection — and therefore the
+// stopping point — is identical on every machine.
+//
+// The mean is not enough on its own. World cost is heavy-tailed: opponent racks
+// differ by an order of magnitude in how many replies they generate, so a
+// mean-priced world that turns out to be a big one can carry the search well
+// past its envelope — measured overshoot was over 30% before this took the
+// worst completed world into account. Pricing the next world at the worst one
+// seen so far is conservative and still deterministic. It cannot make the bound
+// absolute, because the next world can always be worse than every previous one;
+// the ledger's hard ceilings remain the guarantee, and the credits are what the
+// search actually aims at.
+uint64_t projectedWorldCost(uint64_t baseCostSum, uint32_t baseCostWorlds,
+                            uint64_t observationCostSum, uint64_t observationCount,
+                            uint64_t worstWorldCost, size_t activeCandidates) {
+  if (baseCostWorlds == 0 || observationCount == 0) return 0;
+  const uint64_t base = baseCostSum / baseCostWorlds;
+  const uint64_t perObservation = observationCostSum / observationCount;
+  const uint64_t typical = base + perObservation * activeCandidates;
+  return std::max(typical, worstWorldCost);
+}
+
+// True when no surviving challenger could beat the leader by more than the
+// declared indifference margin. This is what lets an easy position stop early:
+// the remaining candidates are not separated, but the decision between them is
+// worth less than the margin, so more worlds cannot buy a better move.
+bool indifferenceResolved(const PairedRace& race, int32_t indifferenceMargin) {
+  if (indifferenceMargin <= 0) return false;
+  const PairedGap challenger = race.closestChallenger();
+  if (!challenger.ok) return false;
+  return challenger.bound <= static_cast<double>(indifferenceMargin);
+}
+
 SearchState makeWorldState(const DecisionPosition& position, const HiddenWorld& world) {
   SearchState state;
   state.board = position.board;
@@ -192,7 +332,8 @@ SearchState makeWorldState(const DecisionPosition& position, const HiddenWorld& 
 
 }  // namespace
 
-static SearchDecision decideWithVariant(const SearchQuery& query, SearchVariant variant) {
+static SearchDecision decideWithVariant(const SearchQuery& query, SearchVariant variant,
+                                        const SearchOverrides& overrides) {
   SearchDecision decision;
   decision.variant = variant;
   const DecisionPosition& position = query.position;
@@ -203,7 +344,9 @@ static SearchDecision decideWithVariant(const SearchQuery& query, SearchVariant 
     return decision;
   }
 
-  const SearchPolicy policy = policyFor(query.effort, variant);
+  SearchPolicy policy = policyFor(query.effort, variant);
+  applyOverrides(policy, overrides);
+  decision.costCredits = policy.adaptive ? policy.searchCostCredits : 0;
   WorkLedger ledger(policy.envelope);
   RootCatalogueResult root = RootCatalogue::build(
       position.board, position.myRack, position.physicalBagCount,
@@ -255,6 +398,7 @@ static SearchDecision decideWithVariant(const SearchQuery& query, SearchVariant 
                              ? ReferenceRootScope::Exhaustive
                              : ReferenceRootScope::FrozenSubset;
     decision.work = ledger.report();
+    decision.modeledCost = modeledSearchCost(decision.work);
     return decision;
   }
 
@@ -283,31 +427,124 @@ static SearchDecision decideWithVariant(const SearchQuery& query, SearchVariant 
       decision.admittedPassCount++;
   }
 
+  // World `i` depends only on the position hash and its own index, so a longer
+  // deck is a superset of a shorter one. Every policy compared here therefore
+  // sees the same world 0, world 1, ... and candidates are compared on common
+  // random numbers both within a policy and across policies.
+  const uint32_t plannedWorlds = policy.adaptive ? policy.maxWorlds : policy.worlds;
   const WorldDeckResult deck =
       WorldDeck::build(position.unseen, position.opponentRackCount,
-                       position.physicalBagCount, canonicalPositionHash(position), 2,
-                       policy.worlds);
+                       position.physicalBagCount,
+                       canonicalPositionHash(position) ^ overrides.worldSeedSalt, 2,
+                       plannedWorlds);
   if (!deck.ok) {
     decision.ok = false;
     decision.error = deck.error;
     decision.work = ledger.report();
+    decision.modeledCost = modeledSearchCost(decision.work);
     return decision;
   }
+  decision.worldsPlanned = plannedWorlds;
 
   const bool usesReplyIndex = variant != SearchVariant::SimV2Reference;
-  const bool usesPairedElimination = variant == SearchVariant::PairedReplyIndex;
+  const bool usesPairedElimination =
+      variant == SearchVariant::PairedReplyIndex || policy.eliminate;
   const uint32_t eliminationStart =
-      usesPairedElimination ? policy.minimumWorlds : policy.worlds + 1;
-  PairedRace race(candidates.size(), RaceConfig{eliminationStart, 3000, 2.0});
+      usesPairedElimination ? policy.minimumWorlds : plannedWorlds + 1;
+
+  // Cost attribution, so the allocator can price the next world instead of
+  // guessing: a world costs one base generation plus one observation per active
+  // candidate, and those two have very different scaling.
+  uint64_t baseCostSum = 0;
+  uint32_t baseCostWorlds = 0;
+  uint64_t observationCostSum = 0;
+  uint64_t observationCount = 0;
+  uint64_t worstWorldCost = 0;
+  uint64_t deltaCostSum = 0;
+  uint64_t deltaObservationCount = 0;
+  uint64_t indexSizeSum = 0;
+  uint32_t indexSizeCount = 0;
+  StopReason stopReason =
+      policy.adaptive ? StopReason::DeckExhausted : StopReason::ScheduleComplete;
+
+  PairedRace race(candidates.size(), RaceConfig{eliminationStart, policy.modelAllowance, 2.0});
   for (uint32_t worldIndex = 0; worldIndex < deck.worlds.size(); worldIndex++) {
-    if (!ledger.reserveWorld()) break;
+    if (policy.adaptive && worldIndex > 0) {
+      const uint64_t spent = modeledSearchCost(ledger.report());
+      if (worldIndex < policy.minimumWorlds) {
+        // Still screening. The minimum batch is what makes any of the paired
+        // statistics meaningful, so it is not skipped to save credits — but a
+        // screening prefix that has already overrun the envelope stops here
+        // rather than continuing to spend against a budget it has used up.
+        if (spent >= policy.searchCostCredits) {
+          stopReason = StopReason::CreditsExhausted;
+          break;
+        }
+      } else {
+        if (race.activeIndices().size() <= 1) {
+          stopReason = StopReason::SingleCandidate;
+          break;
+        }
+        if (indifferenceResolved(race, policy.indifferenceMargin)) {
+          stopReason = StopReason::Indifferent;
+          break;
+        }
+        const uint64_t projected =
+            projectedWorldCost(baseCostSum, baseCostWorlds, observationCostSum, observationCount,
+                               worstWorldCost, race.activeIndices().size());
+        if (spent + projected > policy.searchCostCredits) {
+          stopReason = StopReason::CreditsExhausted;
+          break;
+        }
+      }
+    }
+    if (!ledger.reserveWorld()) {
+      stopReason = StopReason::LedgerExhausted;
+      break;
+    }
+    const uint64_t costAtWorldStart = modeledSearchCost(ledger.report());
+    const uint64_t deltaNodesAtWorldStart =
+        ledger.report().byPurpose[workPurposeIndex(WorkPurpose::ReplyDelta)].nodes;
     const HiddenWorld& world = deck.worlds[worldIndex];
     ReplyIndexResult replyIndex;
     if (usesReplyIndex) {
       replyIndex = ReplyIndex::build(position.board, world.opponentRack, ledger,
                                      policy.opponentNodeLimit);
     }
+    const uint64_t costAfterBase = modeledSearchCost(ledger.report());
+
     const std::vector<size_t> active = race.activeIndices();
+
+    // Once the index exists its size is known exactly, and it is what drives
+    // the rest of the world: every active candidate revalidates every indexed
+    // reply. That is the term a projection from previous worlds cannot see —
+    // reply-set size varies by an order of magnitude between opponent racks, so
+    // an outlier world costs a multiple of the mean no matter how many worlds
+    // preceded it. Pricing the observations from this world's own index and
+    // abandoning it before paying for them is the only point at which the
+    // search can react.
+    if (policy.adaptive && usesReplyIndex && worldIndex >= policy.minimumWorlds) {
+      const uint64_t indexSize = replyIndex.basePlacements.size();
+      uint64_t perObservationDelta =
+          deltaObservationCount > 0 ? deltaCostSum / deltaObservationCount : 0;
+      // Delta generation scales with the reply set too, so the historical mean
+      // is scaled by how much larger this world's index is than the ones it was
+      // measured on. Without this an outlier world is priced at the average
+      // world's delta cost, which is exactly the case that overruns.
+      if (indexSizeCount > 0 && indexSizeSum > 0) {
+        const uint64_t meanIndexSize = indexSizeSum / indexSizeCount;
+        if (meanIndexSize > 0 && indexSize > meanIndexSize)
+          perObservationDelta = perObservationDelta * indexSize / meanIndexSize;
+      }
+      const uint64_t projectedObservations =
+          active.size() * (REVALIDATION_NODE_EQUIVALENT * indexSize + perObservationDelta);
+      if (costAfterBase + projectedObservations > policy.searchCostCredits) {
+        ledger.discardWorld();
+        stopReason = StopReason::CreditsExhausted;
+        break;
+      }
+    }
+
     std::vector<std::pair<size_t, int32_t>> row;
     row.reserve(active.size());
     bool complete = true;
@@ -359,24 +596,62 @@ static SearchDecision decideWithVariant(const SearchQuery& query, SearchVariant 
       ledger.chargeEndpointEvaluation();
     }
     if (!complete) {
+      // A world whose reply set cannot be enumerated completely within the
+      // envelope contributes nothing: committing a truncated row would quietly
+      // hand the opponent a weaker move list in that world only. A fixed
+      // schedule has no budget to recover with and stops; an adaptive one drops
+      // the world and continues, because the credits it did not spend here are
+      // still worth spending on a world it can finish. Dropped worlds remain
+      // visible as `worldsDiscarded`.
       ledger.discardWorld();
-      break;
+      if (!policy.adaptive) {
+        stopReason = StopReason::IncompleteWorld;
+        break;
+      }
+      continue;
     }
     ledger.commitWorld();
     if (!race.commitBatch(row)) {
       decision.ok = false;
       decision.error = "paired race invariant failure";
       decision.work = ledger.report();
+      decision.modeledCost = modeledSearchCost(decision.work);
       return decision;
+    }
+    const uint64_t costAtWorldEnd = modeledSearchCost(ledger.report());
+    baseCostSum += costAfterBase - costAtWorldStart;
+    baseCostWorlds++;
+    observationCostSum += costAtWorldEnd - costAfterBase;
+    observationCount += row.size();
+    worstWorldCost = std::max(worstWorldCost, costAtWorldEnd - costAtWorldStart);
+    deltaCostSum += ledger.report().byPurpose[workPurposeIndex(WorkPurpose::ReplyDelta)].nodes -
+                    deltaNodesAtWorldStart;
+    deltaObservationCount += row.size();
+    if (usesReplyIndex) {
+      indexSizeSum += replyIndex.basePlacements.size();
+      indexSizeCount++;
     }
     for (const auto& [candidateIndex, value] : row) {
       (void)value;
       decision.candidates[candidateIndex].observations = race.observations(candidateIndex);
       decision.candidates[candidateIndex].meanValue = race.mean(candidateIndex);
     }
-    if (usesPairedElimination && race.activeIndices().size() == 1) break;
+    if (usesPairedElimination && race.activeIndices().size() == 1) {
+      stopReason = StopReason::SingleCandidate;
+      break;
+    }
   }
 
+  decision.stopReason = stopReason;
+  decision.eliminationRounds = race.eliminationRounds();
+  decision.activeCandidatesPerRound = race.activeCountHistory();
+  const PairedGap finalGap = race.closestChallenger();
+  if (finalGap.ok) {
+    decision.leaderChallengerKnown = true;
+    decision.leaderChallengerGap = static_cast<int32_t>(std::llround(finalGap.mean));
+    decision.leaderChallengerGapUpper = static_cast<int32_t>(std::llround(finalGap.bound));
+    decision.leaderChallengerObservations = finalGap.observations;
+  }
   decision.worldsCompleted = ledger.report().worldsCompleted;
   if (decision.worldsCompleted == 0) {
     decision.completion = root.placementEnumerationComplete ? Completion::WorkLimited
@@ -386,24 +661,36 @@ static SearchDecision decideWithVariant(const SearchQuery& query, SearchVariant 
     decision.move = decision.candidates[best].move;
     decision.value = decision.candidates[best].meanValue;
     decision.activeCandidatesFinal = static_cast<uint32_t>(race.activeIndices().size());
+    // A fixed schedule is complete when it ran; an adaptive one is complete
+    // only when it stopped because the decision was settled. Stopping on
+    // credits is a bounded search, and is reported as one.
+    const bool resolved =
+        policy.adaptive ? (stopReason == StopReason::SingleCandidate ||
+                           stopReason == StopReason::Indifferent)
+                        : (decision.worldsCompleted == policy.worlds ||
+                           (usesPairedElimination && decision.activeCandidatesFinal == 1));
     decision.completion =
-        root.placementEnumerationComplete &&
-                (decision.worldsCompleted == policy.worlds ||
-                 (usesPairedElimination && decision.activeCandidatesFinal == 1))
+        root.placementEnumerationComplete && resolved
             ? Completion::Complete
             : (root.placementEnumerationComplete ? Completion::WorkLimited
                                                    : Completion::RootLimited);
   }
   decision.work = ledger.report();
+  decision.modeledCost = modeledSearchCost(decision.work);
   return decision;
 }
 
 SearchDecision DecisionSearch::decide(const SearchQuery& query) {
-  return decideWithVariant(query, SearchVariant::SimV2Reference);
+  return decideWithVariant(query, SearchVariant::SimV2Reference, SearchOverrides{});
 }
 
 SearchDecision DecisionSearch::benchmark(const SearchQuery& query, SearchVariant variant) {
-  return decideWithVariant(query, variant);
+  return decideWithVariant(query, variant, SearchOverrides{});
+}
+
+SearchDecision DecisionSearch::benchmark(const SearchQuery& query, SearchVariant variant,
+                                         const SearchOverrides& overrides) {
+  return decideWithVariant(query, variant, overrides);
 }
 
 }  // namespace amath

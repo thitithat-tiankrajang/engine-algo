@@ -10,6 +10,7 @@ move generator:
 |---|---|
 | `POST /v1/games/:gameId/bot-move` | What does the room's bot play on its own turn? |
 | `POST /v1/games/:gameId/analysis` | What would the engine do on *your* turn, and why? |
+| `GET /v1/games/:gameId/bot-move/reasoning` | Why did the bot play what it played? (paged, after the fact) |
 
 ## The rule that shapes the API
 
@@ -38,9 +39,41 @@ Four gates, cheapest first:
    and validates the asymmetric signature, issuer, audience, expiration,
    subject, and `authenticated` role. A non-user token can neither be metered
    nor authorized.
-2. **Metering** — per-user compute budget and concurrency (`rateLimit.ts`).
+2. **Metering** — per-user concurrency and compute budget (`rateLimit.ts`).
+   An account holds **one analysis at a time**; the sliding-window budget
+   applies to **bot turns**, and to analysis only under
+   `ENGINE_ANALYSIS_BUDGETED=true`. See below.
 3. **Authorization** — whatever Postgres says (`roomContext.ts`).
 4. **Turn rules** — enforced in `app.ts`, and only there.
+
+### Analysis: one at a time, never rationed
+
+The analysis limit is **one in flight per account**, and that is the whole of
+it. There is no per-window quota: press analyse as often as you like, on as
+many games as you like, for as long as you like — each request simply waits for
+the previous one.
+
+"In flight" includes **queued**, not just running. If the analysis of game 3 is
+still sitting in the queue, asking about another game is refused with
+`analysis_in_progress` (429) until game 3's answer comes back. The waiting job
+is not cancelled, hurried, or overtaken to make room: it keeps its place in
+line. Asking the *same* question again — the same game, revision and level from
+a second tab or a reconnect — is not a second analysis at all: it attaches to
+the search already running and takes no slot.
+
+Everything else is the **queue**, which is the honest place for a load limit:
+it bounds how many searches run at once (`ENGINE_CONCURRENCY`) and how many may
+wait (`ENGINE_MAX_WAITING`, `ENGINE_MAX_QUEUE_WAIT_MS`), and every analysis
+level queues *behind* every bot turn (`BOT_PRIORITY` in `levels.ts`). Heavy
+analysis use therefore makes analysis slower — the analyser's own included —
+and can never slow down a game waiting on its opponent, or oversubscribe the
+CPU. A saturated instance still answers `queue_full` (503, retry).
+
+What a caller is no longer told for analysis is `budget_exhausted`: that code
+is reachable for analysis only under `ENGINE_ANALYSIS_BUDGETED=true`, because
+rationing fails a player mid-game, on the turn they stopped to think about, and
+no amount of waiting gets them the answer. Bot moves are budgeted either way —
+nobody is sitting and waiting on a press for those.
 
 ### Analysis permission
 
@@ -65,9 +98,16 @@ integer count. There is no field on the wire that *could* carry a tile the
 requester may not see, so no engine output — not a move, not a candidate row,
 not a progress line — can leak one.
 
-The bot endpoint additionally returns **only the move**. The candidate report is
-the engine's reasoning about the *bot's* rack, and the human across the board is
-not entitled to it.
+The bot MOVE endpoint returns **only the move**. The candidate report is the
+engine's reasoning about the *bot's* rack, so it is not shipped alongside an
+answer a client applies mid-turn.
+
+It is served instead by `GET /v1/games/:gameId/bot-move/reasoning?revision=N`,
+after the fact and **a page at a time**, out of the completed search the registry
+already holds — no second search, and no payload paid for on turns where nobody
+asks. The gate is the one the move endpoint applies: the caller must control this
+bot room, so a spectator is refused there and here alike, and a room with no
+engine player has nothing to explain.
 
 ## Compute protection
 
@@ -194,11 +234,12 @@ roughly **1 second per sample**. Midgame and endgame positions differ.
 | `ENGINE_MAX_WAITING` | no | `concurrency × 8`, clamped to 8–64 | Queue depth before refusing |
 | `ENGINE_MAX_QUEUE_WAIT_MS` | no | `120000` | How long a job may wait before it is refused |
 | `ENGINE_MAX_BODY_BYTES` | no | `8192` | Request body ceiling |
-| `ENGINE_BUDGET_PER_WINDOW` | no | `60` | Cost units per user per window |
+| `ENGINE_BUDGET_PER_WINDOW` | no | `60` | Cost units per user per window. Always charged for bot turns; charged for analysis only when `ENGINE_ANALYSIS_BUDGETED` is on. |
 | `ENGINE_BUDGET_WINDOW_MS` | no | `600000` | Budget window |
-| `ENGINE_MAX_ANALYSIS_PER_USER` | no | `1` | Concurrent analyses per user |
+| `ENGINE_MAX_ANALYSIS_PER_USER` | no | `1` | Analyses **in flight** per account — queued counts, not only running. This is the analysis limit; a second one is told to wait (`analysis_in_progress`), never that it is out of quota. |
+| `ENGINE_ANALYSIS_BUDGETED` | no | `false` | Whether analysis *also* spends the window budget above. Off: **analysis is never rationed**, only serialised by the cap. On: it can exhaust the budget like a bot turn. |
 | `ENGINE_ANALYSIS_RESULT_TTL_MS` | no | `1800000` | How long a completed analysis is served from the result cache. Analysis is a pure function of an immutable (position, settings), so a returning player reads it without recomputing. |
-| `ENGINE_BOT_RESULT_TTL_MS` | no | `1800000` | How long a completed bot move is cached. The cache key includes the revision, so it pins one move only to that same canonical turn and cannot carry into a later turn. |
+| `ENGINE_BOT_RESULT_TTL_MS` | no | `1800000` | How long a completed bot move is cached. The cache key includes the revision, so it pins one move only to that same canonical turn and cannot carry into a later turn. This is also the window in which `bot-move/reasoning` can still explain that move; past it the report is gone and the client is told so. |
 | `ENGINE_JOB_CACHE_MAX` | no | `256` | Ceiling on cached engine results, evicted least-recently-used. 1–100000. |
 
 An engine job (a bot turn or an analysis) now outlives the request that started
@@ -255,7 +296,7 @@ docker build -f service/Dockerfile -t amath-engine-service .
 The service is CPU-bound, single-purpose, and holds queue state in memory. Two
 consequences for the plan you pick:
 
-- **Keep it to one instance.** The queue, the per-user budget, the per-user
+- **Keep it to one instance.** The queue, the per-user budget, the per-account
   analysis cap, the job registry and the result cache are all per-process. Job
   DISCOVERY (`GET /v1/games/:id/jobs`) reads that same in-memory registry, so
   behind two replicas a returning player could ask the instance that is not
@@ -272,15 +313,17 @@ cannot be *wrong*, then raise it against measurements from a real instance.
 
 | Plan | CPU | `ENGINE_CONCURRENCY` | `ENGINE_MAX_WAITING` | Notes |
 |---|---|---|---|---|
-| Starter | 0.5 | `1` | `8` (default) | A single `max` search already exceeds this instance's whole allowance; expect `max` bot turns to run several times slower than the reference machine. Fine for `easy`–`hard` and `quick`/`normal` analysis. |
+| Starter | 0.5 | `1` | `8` (default) | A single `max` search already exceeds this instance's whole allowance; expect `max` bot turns to run several times slower than the reference machine, and `super` — which has no clock to cut it short — to run until it is done. Fine for `medium`/`hard` and `quick`/`normal` analysis. |
 | **Standard** | **1** | **`1`** | **`8` (default)** | **The expected initial deployment.** One search at full speed, everything else queued. |
 | Pro | 2 | `1` (default) — try `2` only after measuring | `8`–`16` | Two engine processes will each finish roughly on time and leave nothing for Node. Raise only if the evidence below says the event loop is not suffering. |
 | Pro Plus | 4 | `3` (default) | `24` (default) | Three searches, one core reserved. |
 
 **CPU count alone does not determine the right setting.** It bounds it. What
 actually decides it is the mix of work this deployment sees: a room full of
-`easy` bots is a completely different load from two people running `max`
-analysis, and the same concurrency is right for one and wrong for the other.
+`medium` bots is a completely different load from two people running `max`
+analysis — or from one `super` bot, which holds its slot until the search
+finishes rather than until a deadline fires — and the same concurrency is right
+for one and wrong for the other.
 
 ### What to measure before raising `ENGINE_CONCURRENCY`
 
@@ -310,13 +353,186 @@ If you raise it, raise it by one, and re-check (4) afterwards.
 Required: `SUPABASE_URL`, `SUPABASE_PUBLISHABLE_KEY`, `ENGINE_ALLOWED_ORIGINS`.
 Recommended: `ENGINE_CONCURRENCY` set explicitly, so the pool size is a decision
 in the dashboard rather than an inference from a file the platform may change.
+
+For the Champion beta, two more — and **both** are required before any browser
+runs Super locally:
+
+| Variable | Value | Effect |
+|---|---|---|
+| `CLIENT_SIDE_SUPER` | `true` | The master switch. Off, every Super turn takes the backend path. |
+| `CLIENT_SIDE_SUPER_USER_IDS` | comma-separated Supabase user ids | The audience. **Empty means nobody**, even with the switch on. |
+
+The audience fails closed deliberately. A deployment-wide boolean, once flipped,
+hands the local path to every signed-in player at once, and nothing in the flag
+itself records that it happened — so `CLIENT_SIDE_SUPER=true` with no allowlist
+reaches **zero** players rather than all of them. `*` alone means everyone and is
+how the beta eventually graduates; `*` mixed with named ids is refused at boot
+rather than guessed at.
+
+Read the result off `/health`, which reports the switch and the audience
+together:
+
+```json
+"clientSuper": {
+  "enabled": true,
+  "audience": "3 champion(s)",
+  "engineVersion": "super-v8",
+  "weightsVersion": "v1",
+  "adaptiveBudget": "off"
+}
+```
+
+`"audience": "nobody (no CLIENT_SIDE_SUPER_USER_IDS set)"` is the misconfiguration
+to look for: the switch is on and the rollout is reaching no one.
 `PORT` and `ENGINE_BINARY_PATH` are already correct in the image.
+
+## Client-side Super (Champion beta)
+
+The `super` tier can run **in the player's browser** instead of on this
+container. That is the one change that breaks the linear relationship between
+concurrent Super players and this service's CPU.
+
+The arithmetic it exists to fix: a Super move is a search that runs to
+completion rather than to a deadline, measured at **180 CPU-seconds per move**
+on the reference machine (p50 197 s, range 106–213 s). At
+`ENGINE_CONCURRENCY=1` that is **20 Super moves an hour** against the dozen a
+game needs — one to two concurrent Super games, with the rest queued behind a
+search that cannot be interrupted and refused once the queue fills. Nothing
+about tuning the queue changes that; the CPU is the bound.
+
+After the change, the same turn costs this service **one legality check —
+measured at 2.5 ms including process spawn**, a factor of roughly 72,000.
+
+### What moved and what did not
+
+| | Runs where |
+|---|---|
+| Super search | **The player's device** (WASM, in a Web Worker) |
+| Every other bot tier, and all analysis | This service, unchanged |
+| Game state, turn order, revisions | Postgres, unchanged |
+| Move legality | **This service**, per submitted move — no search |
+| Bot configuration and weights | **This service**, versioned |
+
+The backend Super path is **still here and still works**. Every client-side
+refusal — the flag is off, the browser cannot run a module worker, the config
+could not be fetched, the pinned weights version is gone — falls back to it.
+That is why it was not removed.
+
+Being **slow** is not on that list. A slow device runs full Super locally and
+takes longer over it; it is never quietly moved onto a different engine or a
+smaller search.
+
+### `GET /v1/bot-config`
+
+What a client-side engine should be configured with, and whether it may run.
+
+```json
+{
+  "clientSuperEnabled": true,
+  "engineVersion": "super-v8",
+  "weightsVersion": "v1",
+  "weights": {},
+  "calibration": {
+    "benchmark": "gen-nodes-v1",
+    "reference": {
+      "device": "Apple M3 (8 core, 16 GB), macOS 14.6.1, WASM",
+      "nodesPerSec": 8700000,
+      "fullSuper": { "p50Ms": 225466, "p95Ms": 334240, "positions": 13 }
+    },
+    "tiers": [ { "tier": "EXCELLENT", "maxEstimatedMoveMs": 30000 } ],
+    "warnAboveMs": 60000,
+    "adaptiveBudget": { "enabled": false, "budgets": [], "targets": {} }
+  }
+}
+```
+
+The client runs the same `gen-nodes-v1` benchmark and scales `fullSuper` by its
+own throughput ratio. That is the whole calculation, and its output is a
+**prediction and a label** — nothing here selects a search.
+
+**Every device runs the full 160-sample Super schedule.** There is one latency
+in `reference` rather than a table of them, and there is no `targets` and no
+`minimumTier` at this level, both deliberately: a latency target reachable from
+the default path is how the schedule came to be chosen to fit a stopwatch in an
+earlier revision, which gave reference-class hardware 8 of 160 samples while
+this service's fallback went on running all 160.
+
+`warnAboveMs` is the estimated p50 above which the UI tells the player the wait
+will be long. It changes what is **said**, never what is searched.
+
+`adaptiveBudget` is the retired experiment, off unless `SUPER_ADAPTIVE_BUDGET`
+is deliberately set, and it is the one switch that changes how **strong** the
+client-side bot plays rather than how fast. Its state is readable off `/health`
+so nobody has to inspect an environment to find out. Turning it on is a strength
+change with no strength measurement behind it.
+
+Authenticated, cached privately for five minutes, and **not a security
+mechanism**: the weights are handed to a WASM module in a browser the player
+controls. What versioning buys is remote tuning, A/B testing, rollback,
+reproducibility, and being able to say afterwards which evaluator played a game.
+
+`?weightsVersion=v1` asks for a **specific** version. A version this deployment
+does not carry is **refused** (`400 bad_request`) rather than substituted —
+answering with different weights under the pinned version's name is precisely
+what pinning exists to prevent, and the client falls back to the backend engine
+instead.
+
+### Version pinning
+
+A game records the versions its first device-computed move used
+(`superEngineVersion` / `superWeightsVersion` on the stored game). Every later
+turn of that game fetches that version by name. A retune shipped mid-match
+therefore applies to **new games only**, and a finished game can be replayed
+under the weights it was actually played with.
+
+### `POST /v1/games/:gameId/bot-move/validate`
+
+> Is this move legal, from the position this server is holding?
+
+That is the whole claim, and it is deliberately smaller than "is this the move
+the engine would have played" — proving the latter means running the Super
+search again, which is the exact CPU cost this whole path removes.
+
+The board and the rack come from canonical state at a revision the caller had to
+name correctly; the caller supplies only the move. So a caller cannot make an
+illegal move legal by also describing a board on which it would be.
+
+It runs the engine in `mode: "validate"` — rules arithmetic, no search,
+microseconds — and it deliberately **does not go through the search queue**.
+Queueing it would mean a player whose device computed a move in ten seconds then
+waited minutes behind a running `max` analysis for permission to play it. It is
+bounded instead by `ENGINE_VALIDATION_CONCURRENCY` per account.
+
+`valid: false` is a **successful call** reporting an illegal move — an engine
+bug, a desynced rack, or a position that moved. The client discards the move and
+recomputes; it never converts it into a pass.
+
+### What this is not
+
+For this beta, the Champion group is trusted, and the following are deliberately
+**not** implemented: obfuscated WASM, hidden weights, cryptographic proof that
+the client ran the search, server-side re-search to verify a move, or any
+anti-cheat infrastructure. A client could commit a move it did not compute — as
+it could before any of this existed, because the browser has always been the
+thing that submits moves in a bot room.
+
+### Configuration
+
+| Variable | Required | Default | Meaning |
+|---|---|---|---|
+| `CLIENT_SIDE_SUPER` | no | `false` | Whether clients may run Super locally. Server-controlled rollout switch: turning it off must never require shipping anything to a browser. |
+| `ENGINE_VALIDATION_CONCURRENCY` | no | `4` | Simultaneous legality checks per account. Not a CPU protection — a validation is microseconds — but the bound that stops one account spawning processes in a loop. |
+
+`/health` reports `clientSuper.enabled` along with the versions this instance
+would hand out, so the rollout state is readable from the same page as the
+queue.
 
 ## Limitations
 
-- Rate limiting, the queue and the per-user analysis cap are **in-memory and
+- Rate limiting, the per-account analysis cap and the queue are **in-memory and
   per-instance**. Correct for a single instance; behind more than one replica
-  they would need Redis.
+  they would need Redis — two replicas would let one account run two analyses
+  at once, one per instance.
 - Completed results are cached in memory, TTL'd and LRU-bounded
   (`ENGINE_ANALYSIS_RESULT_TTL_MS`, `ENGINE_BOT_RESULT_TTL_MS`,
   `ENGINE_JOB_CACHE_MAX`). Like the queue and the rate limiter, the cache is
