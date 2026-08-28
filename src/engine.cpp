@@ -374,14 +374,38 @@ struct Config {
   // before raising this. Bumping past 1 without re-validating risks an unsound
   // "proven win".
   int endgameExactBagMax = 1;
-  // Only ATTEMPT the exact proof when few enough tiles are still in play that it
-  // can actually finish. At bag ≤ 1 both racks are usually full (8+8), so the
-  // remaining game is a ~17-tile tree that cannot be proven inside the endgame
-  // ceiling — the solver would grind the whole budget (looking frozen) and only
-  // then fall back to sampling. The exact solver is validated/feasible for small
-  // remainders (bench: 10–13 tiles), so gate on the total unplayed count
-  // (myRack + oppRack + bag). Over this, skip straight to the sampling search.
-  int endgameExactTilesMax = 13;
+  // How long a TIMED tier may spend trying to prove the endgame before giving up
+  // and sampling instead.
+  //
+  // This replaces a hard tile-count cutoff (`endgameExactTilesMax = 13`), which
+  // was measuring the wrong quantity. What decides whether the proof finishes is
+  // the BRANCHING FACTOR, not how many tiles are left: across 192 real bag-0
+  // decisions from 40 self-play games, the cutoff rejected 24 positions, and
+  // 10 of them proved inside 10 s — one in 31k nodes and 0.03 s. Meanwhile a
+  // 16-tile position with 1730 root moves is still unproven after 240 s. Tile
+  // count does not separate those two cases; only trying does.
+  //
+  // What the cutoff bought was worth keeping: a position that cannot be proven
+  // must not burn a timed tier's whole budget looking frozen before falling back.
+  // So the attempt is bounded rather than pre-refused. 1 s is the measured knee —
+  // of the ten provable rejects, seven finish inside 1 s (56, 150, 365, 543, 623,
+  // 664, 753 ms) and the next one does not land until 4.8 s. Paying 1 s to
+  // convert a sampled guess into a proof, on the turns right after the bag
+  // empties, is the best-value second this engine spends.
+  double endgameProbeMs = 1'000;
+  // The STATIC (Level-1) tier keeps the old tile-count gate, and must. Its whole
+  // contract is one root generation per decision and a move that is a pure
+  // function of the request — a wall-clock probe is neither: it costs hundreds of
+  // generations when it fails, and whether it succeeds depends on how busy the
+  // machine was. So Level 1 pre-refuses on a number it can compute for free, and
+  // only the searching tiers probe. tests/test_static_l1.cpp holds this line.
+  int endgameStaticTilesMax = 13;
+  // Super (`unlimited`) is not probed, it is given the real endgame ceiling —
+  // that converts 18 of those 24 positions into proofs instead of 10. It is
+  // still a ceiling and not "forever": if the proof does not land, the full
+  // sampling search still has to run, and an unbounded attempt would mean a
+  // move that never arrives.
+  double endgameProvenBudgetMs = 300'000;
   // Cap on how many distinct opponent-rack scenarios we enumerate before giving
   // up on an exact proof (RAM/time bound); over this we fall back to sampling.
   int endgameMaxAssignments = 4'000;
@@ -1884,13 +1908,23 @@ std::string handleRequest(const std::string& requestJson) {
 
   const bool endgameEligible =
       req.oppRackCount > 0 && req.unseen.total == req.oppRackCount + req.bagCount;
-  // Total tiles still to be played out from here (both racks + bag). The exact
-  // proof is only attempted when this is small enough to finish in budget;
-  // otherwise the request falls through to sampling (see endgameExactTilesMax).
-  const int endgameTilesLeft = req.rack.total + req.oppRackCount + req.bagCount;
   const double egBudget = req.unlimited       ? UNLIMITED_BUDGET_MS
                           : req.budgetMs > 0 ? req.budgetMs
                                              : cfg.endgameBudgetMs;  // 5-min ceiling
+  const int endgameTilesLeft = req.rack.total + req.oppRackCount + req.bagCount;
+  // How long this request may spend TRYING to prove the endgame.
+  //
+  // Positions the old tile gate ALREADY accepted keep exactly the budget they
+  // had. The probe bounds only the territory that used to be refused outright,
+  // so this change cannot stop a proof that lands today — it can only add ones
+  // that did not. Everything below is new coverage:
+  //   • Super gets the real endgame ceiling, which proves 18 of the 24.
+  //   • A timed tier gets the measured 1 s probe, capped at a quarter of its own
+  //     budget so the sampling fallback still has time to run, which proves 7.
+  const bool wasAlreadyEligible = endgameTilesLeft <= cfg.endgameStaticTilesMax;
+  const double egProveMs = wasAlreadyEligible ? egBudget * 0.92
+                           : req.unlimited    ? cfg.endgameProvenBudgetMs
+                                              : std::min(egBudget * 0.25, cfg.endgameProbeMs);
 
   // ── nearly-empty bag (bag ≤ endgameExactBagMax): exact endgame proof ───────
   // Once the bag is (nearly) empty the game is a finite tree; we solve it EXACTLY
@@ -1901,12 +1935,23 @@ std::string handleRequest(const std::string& requestJson) {
   // over-optimistic, so a reported win is a real 100% win. Rack-out scoring
   // (going out doubles the opponent's remainder and ends the game) is handled.
   // Validated bit-exact vs a pure-minimax ground truth (bag 0: 86/86, bag 1:
-  // 16/16). It gets almost the whole endgame budget; if it can't finish it aborts
-  // and we fall back below.
+  // 16/16). It gets `egProveMs`; if it can't finish it aborts and we fall back
+  // below.
+  //
+  // The proof is ATTEMPTED on every eligible position now, not only on small
+  // ones. The tile-count cutoff this replaces was silently sending the first two
+  // or three turns after the bag empties — 8+8 racks, the turns that decide the
+  // game — to a 2-ply sampling search, in a position where the opponent's rack
+  // is not hidden at all but derivable by subtraction. Sampling a rack you can
+  // compute, two plies deep, in a game that is a finite solvable tree, is the
+  // weakest thing this engine does.
+  //
+  // Level 1 is the exception and keeps the old tile-count gate — see
+  // `endgameStaticTilesMax`.
   if (endgameEligible && req.bagCount <= cfg.endgameExactBagMax &&
-      endgameTilesLeft <= cfg.endgameExactTilesMax) {
-    const HiddenResult hr = solveHiddenEndgame(req, cfg.endgameNodeBudget, egBudget * 0.92,
-                                               cfg.endgameMaxAssignments);
+      (!staticSolver || wasAlreadyEligible)) {
+    const HiddenResult hr =
+        solveHiddenEndgame(req, cfg.endgameNodeBudget, egProveMs, cfg.endgameMaxAssignments);
     // PROVEN: the exact solver finished. This is the only path that returns a
     // move through the "endgame" channel, and it is always endgameSolved=true.
     if (hr.found && hr.solved) {
