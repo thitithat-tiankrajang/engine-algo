@@ -29,7 +29,7 @@
  * a Champion who has not reloaded is playing a real game, and stopping it to
  * force a refresh is worse than knowing which build played it.
  */
-export const SUPER_ENGINE_VERSION = "super-v8";
+export const SUPER_ENGINE_VERSION = "super-v9";
 
 /** The weights a NEW game is pinned to. Change this to roll out a retune;
  *  change it back to roll one back. */
@@ -79,6 +79,9 @@ export type SuperWeights = {
   nextTurnPotentialWeight?: number;
   riskAversionBase?: number;
   riskAversionLeadPer50?: number;
+  /** How far the risk coefficient may go BELOW zero when trailing, i.e. the
+   *  most variance-seeking the bot ever gets. Defaults to 1.0 in the engine. */
+  riskAversionMaxGamble?: number;
 };
 
 /**

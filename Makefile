@@ -34,6 +34,12 @@ test-parallel-sim: build $(SRC) $(HDR) tests/test_parallel_sim.cpp
 	$(CXX) $(CXXFLAGS) -o build/test_parallel_sim tests/test_parallel_sim.cpp $(SRC)
 	./build/test_parallel_sim
 
+# Risk aversion: λ must go negative when behind, and stay bounded.
+test-risk-aversion: build $(SRC) $(HDR) tests/test_risk_aversion.cpp
+	$(CXX) $(CXXFLAGS) -o build/test_risk_aversion tests/test_risk_aversion.cpp \
+		src/rules.cpp src/movegen.cpp src/eval.cpp
+	./build/test_risk_aversion
+
 # Revision 2 request-local work accounting.
 test-work-ledger: build $(SRC) $(HDR) tests/test_work_ledger.cpp
 	$(CXX) $(CXXFLAGS) -o build/test_work_ledger tests/test_work_ledger.cpp
@@ -165,7 +171,7 @@ wasm-mt: build $(SRC) $(HDR) src/wasm_api.cpp
 		-pthread -s PTHREAD_POOL_SIZE='globalThis.__amathThreads||1' \
 		-s PTHREAD_POOL_SIZE_STRICT=2
 
-.PHONY: build test test-bot test-inc test-static test-parallel-sim test-work-ledger test-transition test-root-catalogue test-world-deck test-opponent-search test-decision-search test-reply-index verify-reply-index test-paired-race test-v2 cli deep-bench deep-credit-curve gate6 gate7 wasm wasm-mt deploy-ui
+.PHONY: build test test-bot test-inc test-static test-risk-aversion test-parallel-sim test-work-ledger test-transition test-root-catalogue test-world-deck test-opponent-search test-decision-search test-reply-index verify-reply-index test-paired-race test-v2 cli deep-bench deep-credit-curve gate6 gate7 wasm wasm-mt deploy-ui
 
 # The browser build is production again: the Super bot runs on the player's
 # device, so this artifact ships. It lands inside EQ-Lab's bundled source tree
