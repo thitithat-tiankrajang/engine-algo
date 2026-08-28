@@ -29,7 +29,7 @@
  * a Champion who has not reloaded is playing a real game, and stopping it to
  * force a refresh is worse than knowing which build played it.
  */
-export const SUPER_ENGINE_VERSION = "super-v10";
+export const SUPER_ENGINE_VERSION = "super-v11";
 
 /** The weights a NEW game is pinned to. Change this to roll out a retune;
  *  change it back to roll one back. */
