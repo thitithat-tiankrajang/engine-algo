@@ -108,27 +108,47 @@ a phone that throttles through a minutes-long move gives back more.
 
 ### Memory
 
-Max RSS of the whole process over one search, WASM under Node:
+Measured in Chromium, as the resident memory of the renderer process hosting the
+page — Chromium runs a page's dedicated workers inside that renderer, so one
+number covers the host worker, every pthread, and all of their WASM heaps.
+Driven through the real `superEngine.ts` from `tools/super-bench/`.
 
-| build | max RSS |
-|---|---:|
-| single-threaded (`make wasm`) | 61 MB |
-| threaded, 1 thread | 79 MB |
-| threaded, 2 threads | 88 MB |
-| threaded, 4 threads | 113 MB |
-| threaded, 8 threads | 158 MB |
+Two false starts are worth recording, because both produce numbers that look
+fine and mean nothing. `performance.measureUserAgentSpecificMemory()` is the
+right API and is present in this browser as a function that throws
+`SecurityError` on call, so a `typeof === "function"` feature check turns the
+first measurement into an unhandled rejection. And `lsof` on the dev-server port
+names Chromium's **network service**, not the renderer: sampling it gives a
+perfectly flat line through a search that is pegging eight cores.
 
-About **12 MB per pooled worker**, plus ~18 MB fixed for the pthreads runtime,
-and it is charged at module instantiation whether or not the thread is ever
-scheduled. That is why `PTHREAD_POOL_SIZE` is a runtime JS expression rather than
-a build-time constant (see the `wasm-mt` target): a build-time 8 would hand a
-two-core phone a ~97 MB bill for six workers it will never use.
+| phase | threads | peak MB | settled MB | peak CPU |
+|---|---:|---:|---:|---:|
+| baseline, no worker | — | 124 | 124 | 0% |
+| after WASM init | 1 | 133 | 118 | 1% |
+| during Full Super | 1 | 132 | 130 | **100%** |
+| after cancel | 1 | 130 | 119 | 0% |
+| after WASM init | 4 | 169 | 169 | 27% |
+| during Full Super | 4 | 173 | 173 | **385%** |
+| after cancel | 4 | 173 | 130 | 0% |
+| after WASM init | 8 | 212 | 212 | 6% |
+| during Full Super | 8 | 215 | 215 | **722%** |
+| after cancel | 8 | 215 | 137 | 0% |
+| 5 rapid start/cancel cycles | 8 | **471** | 194 | ~700% |
+| one Full Super to completion after all of that | 8 | 271 | 255 | 746% |
 
-This matters more than the raw number suggests. Peak device memory today is
-~130 MB and arrives in the end-game, on the exact turn a player is most likely to
-be on a phone; a four-thread pool takes that to ~185 MB. A device that cannot
-spare it fails inside the worker and the turn falls back to the backend engine —
-safe, but visible.
+**The engine costs about 12 MB per thread, and the browser agrees with Node.**
+Above the ~119–124 MB the renderer holds before any engine exists: +9–14 MB at
+one thread, +50 MB at four, +93 MB at eight. That is the number
+`superThreads.ts` budgets against, and it is now measured where it will be paid
+rather than inferred from a Node process.
+
+The CPU column is the other half of the claim: 100% → 385% → 722% is the sample
+loop actually occupying the cores it asked for, not merely being handed them.
+
+**Rapid start/cancel is the one place memory spikes.** Five cycles in ten
+seconds reached 471 MB before settling back to 194 MB. Nothing accumulates — the
+line comes down — but a device tight on memory is most at risk when a player
+changes their mind repeatedly, not while a search is running.
 
 ### Bundle
 
@@ -158,6 +178,26 @@ Per-thread memos lose the hits a shared cache would have had: `genCalls` rises
 1.4% at two threads to 3.1% at eight. `stats.nodes` is unchanged at every thread
 count, so the extra work is entirely in `bestPlaceScore`, whose nodes that counter
 does not include.
+
+### Cancellation, and what it actually frees
+
+Super is cancelled by `worker.terminate()`, which is the only thing that can stop
+a search already inside the engine's synchronous call. Whether that reliably
+takes the pthread pool with it was the open question. Measured in Chromium, on a
+live Full Super at 1, 4 and 8 threads:
+
+| | result |
+|---|---|
+| the promise settles | rejected as `cancelled` in **0 ms**, at every thread count |
+| CPU after cancel | **0%**, from 100% / 385% / 722% |
+| memory after cancel | back to 119 / 130 / 137 MB, against a 124 MB no-engine baseline |
+| stale results | none — the request counter never advanced past 0 resolutions across three cancels |
+| five rapid start/cancel cycles | no result delivered from any of them; memory peaked at 471 MB and settled to 194 MB |
+| a Full Super started after all of that | completed, **160 samples**, 1,551,222,214 nodes, one resolution |
+
+So `terminate()` does take the pool with it: an orphaned pthread would keep a
+core busy and show up in the CPU column, and eight orphaned pools across the
+cycle test would show up in the memory one. Neither does.
 
 ### Cross-origin isolation
 
@@ -199,13 +239,14 @@ ordered reduction after the join.
   `bench_super.jsonl` #2 on one M3. The sweep has not been run across the phase
   mix, and the opening — the widest and most expensive board a game contains —
   is not in it.
-- **The memory table is Node, not a browser.** The latency rows are now measured
-  in Chromium, but the resident-memory rows are not: Node's worker_threads each
-  carry a V8 isolate and a Web Worker's cost is not the same number. The ~12 MB
-  per worker that `superThreads.ts` budgets against should be re-measured in a
-  browser before it is trusted as a device policy.
 - **One browser, on a desktop.** Chromium on the reference laptop, mains power,
-  nothing else in the tab. No tab throttling, no thermal ceiling, no phone.
+  nothing else in the tab. No thermal ceiling, no phone. Every per-thread cost
+  here is a desktop cost.
+- **A hidden tab throttles its timers, hard.** A scripted benchmark that paces
+  itself with `setTimeout` stretches by 5x or more when the pane is not visible,
+  which silently turns "cancel took 12 s to arrive" into a finding that is not
+  real. The phases above were driven from outside the page for that reason, and
+  every duration in this document comes from a clock that was not the page's.
 - **Absolute times drifted late in the session.** Repeat runs of the same
   configuration varied by ~10% after the machine had been benchmarking for a
   while, almost certainly thermal. The ratios held; the absolute seconds should

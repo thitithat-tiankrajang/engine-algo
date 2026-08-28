@@ -4,6 +4,16 @@
     {
       "name": "eq-lab-dev",
       "url": "http://127.0.0.1:5173"
+    },
+    {
+      "name": "eqlab-bench",
+      "runtimeExecutable": "sh",
+      "runtimeArgs": [
+        "-c",
+        "cd ../EQ-Lab && npm run dev -- --port 5273 --strictPort"
+      ],
+      "port": 5273,
+      "url": "http://127.0.0.1:5273"
     }
   ]
 }
