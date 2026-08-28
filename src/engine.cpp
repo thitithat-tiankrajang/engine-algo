@@ -160,6 +160,7 @@ int applyWeights(const json::Value& obj, std::string& error) {
       {"nextTurnPotentialWeight", &LeaveWeights::nextTurnPotentialWeight},
       {"riskAversionBase", &LeaveWeights::riskAversionBase},
       {"riskAversionLeadPer50", &LeaveWeights::riskAversionLeadPer50},
+      {"riskAversionMaxGamble", &LeaveWeights::riskAversionMaxGamble},
   };
 
   for (const auto& [key, member] : kScalars) {
@@ -691,11 +692,11 @@ SimResult simulate(const Request& req, const std::vector<Move>& candidates, int 
 
   // Rank by mean − λ·stddev: a move that is usually good but occasionally lets
   // the opponent punish it hard (a high-variance downside, like opening a ×9) is
-  // discounted for that risk. λ rises with our lead — protect a winning position,
-  // gamble when behind. Every retained candidate saw the same `done` samples.
-  const float lambda =
-      std::max(0.0f, g_leave.riskAversionBase + g_leave.riskAversionLeadPer50 *
-                                                    (ctx.scoreDiff / 50.0f));
+  // discounted for that risk when we are ahead — and SOUGHT OUT when we are
+  // behind, where λ goes negative. See `riskAversionLambda` for why that sign
+  // change is the whole point. Every retained candidate saw the same `done`
+  // samples, so the stddev is comparable across them.
+  const float lambda = riskAversionLambda(ctx.scoreDiff);
   if (diag) diag->assign(candidates.size(), CandidateDiag{});
   SimResult res;
   res.samplesUsed = done;

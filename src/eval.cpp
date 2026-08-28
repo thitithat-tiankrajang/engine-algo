@@ -146,6 +146,38 @@ float defensePenalty(const Board& board, const std::vector<Placement>& placement
   return penalty;
 }
 
+// ── how much variance we want, given the score ───────────────────────────────
+//
+// The sim ranks candidates by mean − λ·stddev, so this one number decides
+// whether spread is a liability or an asset. λ rises with our lead: a winning
+// position is protected by taking the steady line. λ falls as we trail, and it
+// IS ALLOWED TO GO NEGATIVE — that is the whole of "gamble when behind".
+//
+// This used to be `std::max(0.0f, ...)`, which meant the second half of that
+// sentence was never implemented. λ bottomed out at 0 as soon as the deficit
+// reached 41 points, so trailing by 41 and trailing by 300 produced
+// byte-identical rankings, and no weights document could say otherwise because
+// the clamp sat below them.
+//
+// Ranking a losing position by its MEAN is the mistake. Points are not the
+// objective — finishing ahead is — and a player 200 down does not get there by
+// choosing the steady line. That is not an abstraction: in the position this was
+// found in (a ×9 lane still open, 195 behind, 25 tiles in the bag), the steady
+// line was a bingo that sealed the lane for both sides, and the engine took it
+// because +59.2 mean beat +42.9 mean. Against a negative λ the same numbers read
+// the other way, because the move that keeps the game live is exactly the one
+// whose value is still spread out (σ 83.0 against the bingo's 36.6).
+//
+// The spread is measured across sampled OPPONENT RACKS, so a negative λ is
+// literally "prefer the move whose value depends most on what the opponent turns
+// out to be holding". When behind, handing the game to a coin flip is the
+// improvement.
+float riskAversionLambda(float scoreDiff) {
+  return std::max(-g_leave.riskAversionMaxGamble,
+                  g_leave.riskAversionBase +
+                      g_leave.riskAversionLeadPer50 * (scoreDiff / 50.0f));
+}
+
 float staticEquity(const Board& board, const TileCounts& rack, const Move& move,
                    const BoardContext& ctx) {
   if (move.type == MoveType::Pass) {

@@ -29,6 +29,12 @@ test-static: build $(SRC) $(HDR) tests/test_static_l1.cpp
 	$(CXX) $(CXXFLAGS) -o build/test_static_l1 tests/test_static_l1.cpp $(SRC)
 	./build/test_static_l1
 
+# Risk aversion: λ must go negative when behind, and stay bounded.
+test-risk-aversion: build $(SRC) $(HDR) tests/test_risk_aversion.cpp
+	$(CXX) $(CXXFLAGS) -o build/test_risk_aversion tests/test_risk_aversion.cpp \
+		src/rules.cpp src/movegen.cpp src/eval.cpp
+	./build/test_risk_aversion
+
 # Revision 2 request-local work accounting.
 test-work-ledger: build $(SRC) $(HDR) tests/test_work_ledger.cpp
 	$(CXX) $(CXXFLAGS) -o build/test_work_ledger tests/test_work_ledger.cpp
@@ -124,7 +130,7 @@ wasm: build $(SRC) $(HDR) src/wasm_api.cpp
 		-s EXPORTED_RUNTIME_METHODS=UTF8ToString,stringToUTF8,lengthBytesUTF8 \
 		-s STACK_SIZE=4MB
 
-.PHONY: build test test-bot test-inc test-static test-work-ledger test-transition test-root-catalogue test-world-deck test-opponent-search test-decision-search test-reply-index verify-reply-index test-paired-race test-v2 cli deep-bench deep-credit-curve gate6 gate7 wasm deploy-ui
+.PHONY: build test test-bot test-inc test-static test-risk-aversion test-work-ledger test-transition test-root-catalogue test-world-deck test-opponent-search test-decision-search test-reply-index verify-reply-index test-paired-race test-v2 cli deep-bench deep-credit-curve gate6 gate7 wasm deploy-ui
 
 # The browser build is production again: the Super bot runs on the player's
 # device, so this artifact ships. It lands inside EQ-Lab's bundled source tree

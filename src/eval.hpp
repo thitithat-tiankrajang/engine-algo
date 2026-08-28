@@ -95,9 +95,18 @@ struct LeaveWeights {
   // Risk aversion: candidates are ranked by mean − λ·stddev of their sampled
   // value, so a move that is usually fine but occasionally lets the opponent
   // punish it hard (e.g. opening a ×9 double word square) is penalized for that
-  // downside. λ grows when we are ahead (protect a lead) and shrinks when behind.
+  // downside. λ grows when we are ahead (protect a lead) and goes NEGATIVE when
+  // behind, where the spread is the asset rather than the liability.
   float riskAversionBase = 0.18f;
   float riskAversionLeadPer50 = 0.22f;  // extra λ per 50 points of lead
+
+  // How far λ is allowed below zero, i.e. the most variance-seeking the bot ever
+  // gets. λ = −1 ranks candidates at roughly their 84th percentile instead of
+  // their mean, which is aggressive but still reads the distribution; deeper
+  // than that the ranking stops being about the position and starts being about
+  // whichever candidate happens to have the fattest tail. Reached at a deficit
+  // of 268 points with the slope above.
+  float riskAversionMaxGamble = 1.0f;
 };
 
 extern LeaveWeights g_leave;
@@ -111,6 +120,10 @@ float leaveValue(const TileCounts& rack, const BoardContext& ctx);
 
 // Static defensive penalty of a placement set on `board` (board BEFORE move).
 float defensePenalty(const Board& board, const std::vector<Placement>& placements);
+
+// Risk-aversion coefficient λ for the sim's mean − λ·stddev ranking, from the
+// score situation alone. Positive protects a lead, negative chases variance.
+float riskAversionLambda(float scoreDiff);
 
 // Full static equity of a move: immediate score + leave(rack − used) − defense.
 float staticEquity(const Board& board, const TileCounts& rack, const Move& move,
