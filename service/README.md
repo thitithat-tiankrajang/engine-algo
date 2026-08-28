@@ -372,7 +372,7 @@ Read the state off `/health`:
 ```json
 "clientSuper": {
   "enabled": true,
-  "engineVersion": "super-v9",
+  "engineVersion": "super-v10",
   "weightsVersion": "v1",
   "adaptiveBudget": "off"
 }
@@ -425,7 +425,7 @@ What a client-side engine should be configured with, and whether it may run.
 ```json
 {
   "clientSuperEnabled": true,
-  "engineVersion": "super-v9",
+  "engineVersion": "super-v10",
   "weightsVersion": "v1",
   "weights": {},
   "calibration": {
