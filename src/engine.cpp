@@ -1060,11 +1060,32 @@ struct HiddenBagSolver {
         if (cell.occupied()) boardHash ^= zob->cell[Board::idx(r, c)][cell.kind][cell.token];
       }
   }
+  // ── the two questions this solver answers ───────────────────────────────────
+  //
+  // `optimistic == false` is the guarantee: side 1 plays its best defence, so the
+  // value is what we get NO MATTER WHAT. That is the only value a "forced win"
+  // may ever be read from.
+  //
+  // `optimistic == true` asks the other question — "is a win still REACHABLE?" —
+  // by letting side 1 choose the line that suits us best instead of the line that
+  // suits it. It is not a prediction and must never outrank a guarantee; it exists
+  // so that a position with no forced win can still be played toward the win that
+  // an opponent mistake would hand us, rather than toward the prettiest losing
+  // margin. See `pickEndgameMove`.
+  //
+  // Only the opponent's CHOICE flips. Chance does not: `drawWorst` stays
+  // worst-case in both modes, because a tile you get lucky with is not a mistake
+  // the opponent made, and calling that a reachable win would be wishful.
+  bool optimistic = false;
+
   uint64_t stateKey(int side, const TileCounts& ai, const TileCounts& opp, int streak) const {
     uint64_t h = boardHash ^ zob->streak[streak];
     if (side == 1) h ^= zob->side;
     for (uint8_t k = 0; k < KIND_COUNT; k++)
       h ^= zob->rack[0][k][ai.n[k]] ^ zob->rack[1][k][opp.n[k]];
+    // The two searches value the same state differently, so they must not share
+    // an entry. One constant separates the namespaces.
+    if (optimistic) h ^= 0x9E3779B97F4A7C15ULL;
     return h;
   }
 
@@ -1176,11 +1197,17 @@ struct HiddenBagSolver {
       return histOf(a) > histOf(b);
     });
 
-    int best = side == 0 ? -INF : INF;
+    // Side 0 always maximises the AI margin. Side 1 minimises it — unless this is
+    // the optimistic pass, where it maximises too and the whole tree becomes a
+    // single-agent "best line that exists" search. Alpha-beta then degenerates
+    // (beta never tightens), which is why the optimistic pass is only ever run
+    // when the guarantee has already failed to find a win.
+    const bool maximizing = side == 0 || optimistic;
+    int best = maximizing ? -INF : INF;
     int bestMove = -1;  // signature of the move that currently owns `best`
     // Fold an option value into `best` with alpha-beta; returns true on cutoff.
     auto consider = [&](int v) -> bool {
-      if (side == 0) {
+      if (maximizing) {
         best = std::max(best, v);
         alpha = std::max(alpha, best);
       } else {
@@ -1218,7 +1245,9 @@ struct HiddenBagSolver {
       if (best != prev) bestMove = s;
       if (cutoff) {
         // Cutoff bound is side-dependent: side 0 maximises → fail-HIGH (lower
-        // bound, flag 1); side 1 minimises → fail-LOW (upper bound, flag 2).
+        // bound, flag 1); a minimising side fails LOW (upper bound, flag 2). In the
+        // optimistic pass side 1 maximises too, so `maximizing` — not `side` — is
+        // what decides which bound this is.
         if (s >= 0 && killers[kd][0] != s) {
           killers[kd][1] = killers[kd][0];
           killers[kd][0] = static_cast<int16_t>(s);
@@ -1228,7 +1257,7 @@ struct HiddenBagSolver {
               depth * depth + 1;
         if (useTT)
           tt[idx] = TTSlot{key, best, static_cast<int16_t>(s),
-                           static_cast<uint8_t>(side == 0 ? 1 : 2), true};
+                           static_cast<uint8_t>(maximizing ? 1 : 2), true};
         return best;
       }
     }
@@ -1247,7 +1276,7 @@ struct HiddenBagSolver {
       if (best != prev) bestMove = -1;  // pass now owns best
       if (cutoff && useTT) {
         tt[idx] = TTSlot{key, best, static_cast<int16_t>(-1),
-                         static_cast<uint8_t>(side == 0 ? 1 : 2), true};
+                         static_cast<uint8_t>(maximizing ? 1 : 2), true};
         return best;
       }
     }
@@ -1287,12 +1316,36 @@ std::vector<TileCounts> enumerateBags(const TileCounts& pool, int count) {
   return out;
 }
 
+// How the chosen end-game move relates to WINNING, which is the only thing the
+// bot is actually trying to do. Margin is a tiebreak inside a class, never a
+// reason to move between classes.
+enum class EndgameOutcome {
+  ForcedWin,       // wins against every defence
+  ConditionalWin,  // no forced win, but a win is still reachable if they err
+  NoWin,           // not reachable at all — play the best margin available
+};
+
+const char* endgameOutcomeName(EndgameOutcome o) {
+  switch (o) {
+    case EndgameOutcome::ForcedWin: return "forced_win";
+    case EndgameOutcome::ConditionalWin: return "conditional_win";
+    default: return "no_win";
+  }
+}
+
 struct HiddenResult {
   bool found = false;
   bool solved = false;  // every scenario proven within budget
   Move move;
   int value = -(1 << 20);
   std::vector<std::pair<Move, int>> rootVals;  // per-AI-root-move guaranteed margin
+  EndgameOutcome outcome = EndgameOutcome::NoWin;
+  int winThreshold = 0;  // margin that has to be BEATEN to win: oppScore − myScore
+  // Set only in the ConditionalWin class: the best final margin the chosen move
+  // can still reach if the opponent goes wrong. Not a guarantee, and never
+  // reported as one.
+  int reachable = 0;
+  bool optimisticComplete = false;  // the reachability pass finished within budget
 };
 
 // Proven end-game under hidden information, for bag ∈ {0,1}. bag==0 is the exact
@@ -1401,22 +1454,139 @@ HiddenResult solveHiddenEndgame(const Request& req, long long nodeBudget, double
     }
   }
 
-  // Aggregate: pick the AI option with the best guaranteed (worst-case) margin.
-  for (size_t i = 0; i < aiMoves.size(); i++) {
-    res.rootVals.push_back({aiMoves[i], guaranteed[i]});
-    if (!res.found || guaranteed[i] > res.value) {
-      res.found = true;
-      res.value = guaranteed[i];
-      res.move = aiMoves[i];
+  for (size_t i = 0; i < aiMoves.size(); i++) res.rootVals.push_back({aiMoves[i], guaranteed[i]});
+  res.rootVals.push_back({Move{}, guaranteed[passIdx]});  // pass
+  res.found = true;
+  res.solved = true;
+
+  // ── the decision, in the only order that respects the goal ─────────────────
+  //
+  //   FORCED_WIN  >  CONDITIONAL_WIN  >  best available margin
+  //
+  // The point of the ordering is what it FORBIDS: a conditional win never
+  // outranks a forced win, however much prettier its margin looks. Winning by 1
+  // for certain beats winning by 40 if they slip. Margin is only ever consulted
+  // to choose between options that already sit in the same class.
+  //
+  // What this replaces: a single `argmax(guaranteed)`. That is the right answer
+  // in two of the three classes and the wrong one in the middle — a position
+  // with no forced win was played toward the best losing margin, so the bot
+  // would concede a game it could still have won, and no amount of end-game
+  // search depth could recover it because the search was answering a different
+  // question. Note also that a margin-only rule never once reads the SCORE: it
+  // cannot tell "win by 1" from "lose by 40", because both are just numbers on
+  // the same axis. This does read it.
+  const int T = req.oppScore - req.myScore;  // Δ must EXCEED this to win
+  res.winThreshold = T;
+
+  auto bestBy = [&](const std::vector<int>& key, int floor) {
+    int idx = -1;
+    for (size_t i = 0; i < key.size(); i++) {
+      if (key[i] <= floor) continue;
+      if (idx < 0 || key[i] > key[idx]) idx = static_cast<int>(i);
+    }
+    return idx;
+  };
+  auto commit = [&](int i) {
+    res.value = guaranteed[i];
+    res.move = i == passIdx ? Move{} : aiMoves[i];
+  };
+
+  // 1. FORCED_WIN — wins against best defence. Inside the class, the biggest
+  //    guaranteed margin, so a won game is also won by as much as possible.
+  if (const int forced = bestBy(guaranteed, T); forced >= 0) {
+    res.outcome = EndgameOutcome::ForcedWin;
+    commit(forced);
+    return res;
+  }
+
+  // 2. CONDITIONAL_WIN — nothing forces it, so ask the second question: which
+  //    options still have a win in them at all? Only now, because this pass has
+  //    no beta pruning (every node maximises) and costs real time.
+  std::vector<int> reachable(aiMoves.size() + 1, -HiddenBagSolver::INF);
+  solver.optimistic = true;
+  solver.resetOrdering();
+  bool optimisticOk = true;
+  for (size_t s = 0; s < scenarios.size() && optimisticOk; s++) {
+    TileCounts oppRack = req.unseen;
+    for (uint8_t k = 0; k < KIND_COUNT; k++) oppRack.sub(k, scenarios[s].n[k]);
+    TileCounts bag = scenarios[s];
+    solver.incb.board = req.board;
+    solver.incb.rebuild();
+    solver.recomputeBoardHash();
+    solver.reportDetail = "reachable-win check, world " + std::to_string(s + 1) + "/" +
+                          std::to_string(scenarios.size());
+
+    for (size_t i = 0; i < aiMoves.size() && optimisticOk; i++) {
+      const Move& m = aiMoves[i];
+      TileCounts ai = req.rack;
+      for (const Placement& p : m.placements) {
+        solver.boardHash ^= solver.zob->cell[Board::idx(p.row, p.col)][p.kind][p.token];
+        ai.sub(p.kind);
+      }
+      solver.incb.makeMove(m.placements);
+      TileCounts scenarioBag = bag;
+      int v;
+      if (ai.total == 0 && scenarioBag.total == 0) {
+        v = m.score + 2 * oppRack.points();
+      } else {
+        const int draw = std::min(RACK_SIZE - ai.total, scenarioBag.total);
+        v = m.score + solver.drawWorst(draw, 0, ai, oppRack, scenarioBag, 1,
+                                       -HiddenBagSolver::INF, HiddenBagSolver::INF, 0);
+      }
+      solver.incb.undoMove(m.placements);
+      for (const Placement& p : m.placements) {
+        solver.boardHash ^= solver.zob->cell[Board::idx(p.row, p.col)][p.kind][p.token];
+      }
+      // A reachability pass that runs out of budget is NOT a failure of the
+      // proof. The guarantees above are already proven and already enough to
+      // answer classes 1 and 3; we simply lose the chance to upgrade into class
+      // 2, and say so rather than pretending the number exists.
+      if (solver.aborted) { optimisticOk = false; break; }
+      // Best case across worlds: the question is whether a win is REACHABLE.
+      reachable[i] = std::max(reachable[i], v);
+      doneUnits++;
+      emitProgress();
+    }
+
+    // Passing can reach a win too — holding the rack while they have to open the
+    // board is a real endgame idea, so it competes in this class like any move.
+    if (!optimisticOk) break;
+    {
+      TileCounts ai = req.rack;
+      TileCounts scenarioBag = bag;
+      int v;
+      if (req.noScoreStreak + 1 >= NO_SCORE_STREAK_LENGTH) {
+        v = oppRack.points() - ai.points();
+      } else {
+        v = solver.mm(1, ai, oppRack, scenarioBag, req.noScoreStreak + 1, -HiddenBagSolver::INF,
+                      HiddenBagSolver::INF, 0);
+      }
+      if (solver.aborted) { optimisticOk = false; break; }
+      reachable[passIdx] = std::max(reachable[passIdx], v);
     }
   }
-  res.rootVals.push_back({Move{}, guaranteed[passIdx]});  // pass
-  if (!res.found || guaranteed[passIdx] > res.value) {
-    res.found = true;
-    res.value = guaranteed[passIdx];
-    res.move = Move{};
+  res.optimisticComplete = optimisticOk;
+
+  if (optimisticOk) {
+    // Inside the class, the best reachable winning outcome — play toward the win
+    // that is actually there, not the least-bad loss.
+    if (const int cond = bestBy(reachable, T); cond >= 0) {
+      res.outcome = EndgameOutcome::ConditionalWin;
+      res.reachable = reachable[cond];
+      commit(cond);
+      return res;
+    }
   }
-  res.solved = res.found;
+
+  // 3. NO_WIN — unreachable however they play, or unknown because the
+  //    reachability pass could not finish. Either way the best available
+  //    evaluation is the guaranteed margin, exactly as before.
+  res.outcome = EndgameOutcome::NoWin;
+  int best = 0;
+  for (size_t i = 1; i < guaranteed.size(); i++)
+    if (guaranteed[i] > guaranteed[best]) best = static_cast<int>(i);
+  commit(best);
   return res;
 }
 
@@ -1583,7 +1753,8 @@ json::ValuePtr buildEndgameReport(const std::vector<std::pair<Move, int>>& rootV
 std::string respond(const Move& move, float equity, const std::string& solver, bool endgameSolved,
                     int expectedFinalDiff, bool hasFinalDiff, const GenStats& stats,
                     double elapsedMs, int candidates, int samples, int rootMoves,
-                    json::ValuePtr candidateReport = nullptr) {
+                    json::ValuePtr candidateReport = nullptr,
+                    const HiddenResult* endgame = nullptr) {
   auto o = json::makeObject();
   const char* type = move.type == MoveType::Place ? "place"
                      : move.type == MoveType::Exchange ? "exchange"
@@ -1610,6 +1781,20 @@ std::string respond(const Move& move, float equity, const std::string& solver, b
   o->obj["solver"] = json::makeString(solver);
   o->obj["endgameSolved"] = json::makeBool(endgameSolved);
   if (hasFinalDiff) o->obj["expectedFinalDiff"] = json::makeInt(expectedFinalDiff);
+  // Why this end-game move was chosen, in the bot's own terms. `expectedFinalDiff`
+  // alone cannot say it: a guaranteed +3 and a hoped-for +30 are the same kind of
+  // number, and only one of them is a win.
+  if (endgame) {
+    o->obj["outcome"] = json::makeString(endgameOutcomeName(endgame->outcome));
+    o->obj["winThreshold"] = json::makeInt(endgame->winThreshold);
+    // Only meaningful when the reachability pass actually ran. A forced win never
+    // asks the question, and reporting "false" there would read as "we looked and
+    // found nothing" rather than "we did not need to look".
+    if (endgame->outcome != EndgameOutcome::ForcedWin)
+      o->obj["winReachabilityProven"] = json::makeBool(endgame->optimisticComplete);
+    if (endgame->outcome == EndgameOutcome::ConditionalWin)
+      o->obj["reachableFinalDiff"] = json::makeInt(endgame->reachable);
+  }
 
   auto st = json::makeObject();
   st->obj["moves"] = json::makeInt(rootMoves);
@@ -1903,7 +2088,7 @@ std::string handleRequest(const std::string& requestJson) {
     if (!hr.found) return respondError("hidden_no_result");
     json::ValuePtr report = buildEndgameReport(hr.rootVals, hr.move, req.topN);
     return respond(hr.move, static_cast<float>(hr.value), "endgame", hr.solved, hr.value, true,
-                   stats, msSince(start), 0, 0, rootMoves, report);
+                   stats, msSince(start), 0, 0, rootMoves, report, &hr);
   }
 
   const bool endgameEligible =
@@ -1957,7 +2142,7 @@ std::string handleRequest(const std::string& requestJson) {
     if (hr.found && hr.solved) {
       json::ValuePtr report = buildEndgameReport(hr.rootVals, hr.move, req.topN);
       return respond(hr.move, static_cast<float>(hr.value), "endgame", true, hr.value, true, stats,
-                     msSince(start), 0, 0, rootMoves, report);
+                     msSince(start), 0, 0, rootMoves, report, &hr);
     }
 
     // INCOMPLETE: the exact proof did not finish within budget. We do NOT fall

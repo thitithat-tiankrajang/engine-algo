@@ -29,6 +29,11 @@ test-static: build $(SRC) $(HDR) tests/test_static_l1.cpp
 	$(CXX) $(CXXFLAGS) -o build/test_static_l1 tests/test_static_l1.cpp $(SRC)
 	./build/test_static_l1
 
+# End-game objective: FORCED_WIN > CONDITIONAL_WIN > best margin.
+test-endgame-outcome: build $(SRC) $(HDR) tests/test_endgame_outcome.cpp
+	$(CXX) $(CXXFLAGS) -o build/test_endgame_outcome tests/test_endgame_outcome.cpp $(SRC)
+	./build/test_endgame_outcome
+
 # Risk aversion: λ must go negative when behind, and stay bounded.
 test-risk-aversion: build $(SRC) $(HDR) tests/test_risk_aversion.cpp
 	$(CXX) $(CXXFLAGS) -o build/test_risk_aversion tests/test_risk_aversion.cpp \
@@ -92,7 +97,7 @@ test-paired-race: build $(SRC) $(HDR) tests/test_paired_race.cpp
 	$(CXX) $(CXXFLAGS) -o build/test_paired_race tests/test_paired_race.cpp src/paired_race.cpp
 	./build/test_paired_race
 
-test-v2: test-work-ledger test-transition test-root-catalogue test-world-deck \
+test-v2: test-work-ledger test-transition test-endgame-outcome test-risk-aversion test-root-catalogue test-world-deck \
 	test-opponent-search test-decision-search test-reply-index test-paired-race
 
 # Measurement-only translation unit: linked into the CLI, deliberately kept out
@@ -130,7 +135,7 @@ wasm: build $(SRC) $(HDR) src/wasm_api.cpp
 		-s EXPORTED_RUNTIME_METHODS=UTF8ToString,stringToUTF8,lengthBytesUTF8 \
 		-s STACK_SIZE=4MB
 
-.PHONY: build test test-bot test-inc test-static test-risk-aversion test-work-ledger test-transition test-root-catalogue test-world-deck test-opponent-search test-decision-search test-reply-index verify-reply-index test-paired-race test-v2 cli deep-bench deep-credit-curve gate6 gate7 wasm deploy-ui
+.PHONY: build test test-bot test-inc test-static test-endgame-outcome test-risk-aversion test-work-ledger test-transition test-root-catalogue test-world-deck test-opponent-search test-decision-search test-reply-index verify-reply-index test-paired-race test-v2 cli deep-bench deep-credit-curve gate6 gate7 wasm deploy-ui
 
 # The browser build is production again: the Super bot runs on the player's
 # device, so this artifact ships. It lands inside EQ-Lab's bundled source tree
