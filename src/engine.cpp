@@ -3,7 +3,10 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <map>
+#include <optional>
 #include <random>
+#include <set>
 #include <unordered_map>
 
 #include "board.hpp"
@@ -1322,14 +1325,43 @@ std::vector<TileCounts> enumerateBags(const TileCounts& pool, int count) {
 enum class EndgameOutcome {
   ForcedWin,       // wins against every defence
   ConditionalWin,  // no forced win, but a win is still reachable if they err
-  NoWin,           // not reachable at all — play the best margin available
+  Unknown,         // not established — the search did not finish. NOT a loss.
+  ForcedDraw,      // proven to end exactly level: cannot win, cannot lose
+  ForcedLoss,      // proven: no line reaches a win, and best play still loses
 };
 
+// These are LABELS, not a comparable ranking. Nothing anywhere compares two
+// EndgameOutcome values — the preference is enforced by the ORDER THE RETURNS
+// FIRE IN, and reading the enum as an ordering would describe a mechanism the
+// code does not have. What actually decides, in order:
+//
+//   1. `solveHiddenEndgame` returns a completed proof — ForcedWin,
+//      ConditionalWin, ForcedDraw or ForcedLoss — and every one of those returns
+//      before a candidate set exists. ForcedWin is tested before ConditionalWin,
+//      which is where "a forced win is never traded for a bigger conditional
+//      one" actually lives.
+//   2. Failing that, a terminal rack-out with Δ >= T returns, as ForcedWin or
+//      ForcedDraw.
+//   3. Failing that, the sampling search runs and reports no outcome at all.
+//
+// So a proven result is never weighed against an unproven one: by the time the
+// search runs, every proof has already returned. In particular Unknown and
+// ForcedDraw never meet — an earlier design let them, by admitting the draw to
+// the search, and the search (which cannot price a terminal move) ranked a
+// proven draw 24th and played a loss instead. That is why step 2 returns rather
+// than admits.
+//
+// `Unknown` is an EPISTEMIC state, not an outcome. It is set only when a proof
+// was attempted and did not finish, it is never inferred, and nothing may read
+// it as a prediction — least of all as a loss. The caller falls back to the
+// heuristic search precisely because the engine does not know.
 const char* endgameOutcomeName(EndgameOutcome o) {
   switch (o) {
     case EndgameOutcome::ForcedWin: return "forced_win";
     case EndgameOutcome::ConditionalWin: return "conditional_win";
-    default: return "no_win";
+    case EndgameOutcome::Unknown: return "unknown";
+    case EndgameOutcome::ForcedDraw: return "forced_draw";
+    default: return "forced_loss";
   }
 }
 
@@ -1339,7 +1371,10 @@ struct HiddenResult {
   Move move;
   int value = -(1 << 20);
   std::vector<std::pair<Move, int>> rootVals;  // per-AI-root-move guaranteed margin
-  EndgameOutcome outcome = EndgameOutcome::NoWin;
+  // Unknown by default, deliberately. Every early return from the solver
+  // leaves this untouched, and an unfilled result must never read as a proven
+  // anything — least of all a loss.
+  EndgameOutcome outcome = EndgameOutcome::Unknown;
   int winThreshold = 0;  // margin that has to be BEATEN to win: oppScore − myScore
   // Set only in the ConditionalWin class: the best final margin the chosen move
   // can still reach if the opponent goes wrong. Not a guarantee, and never
@@ -1579,14 +1614,26 @@ HiddenResult solveHiddenEndgame(const Request& req, long long nodeBudget, double
     }
   }
 
-  // 3. NO_WIN — unreachable however they play, or unknown because the
-  //    reachability pass could not finish. Either way the best available
-  //    evaluation is the guaranteed margin, exactly as before.
-  res.outcome = EndgameOutcome::NoWin;
+  // 3. Everything else. The move is the same in all three cases below — the best
+  //    guarantee available — but WHAT WE CLAIM about it is not, and that is the
+  //    whole point of separating them.
   int best = 0;
   for (size_t i = 1; i < guaranteed.size(); i++)
     if (guaranteed[i] > guaranteed[best]) best = static_cast<int>(i);
   commit(best);
+
+  if (!optimisticOk) {
+    // UNKNOWN. The guarantees are proven, so the move is sound, but the
+    // reachability pass ran out of budget and we never learned whether a win was
+    // still available. Saying "no win" here would be a lie told by a clock: the
+    // same position with a larger budget answers ConditionalWin.
+    res.outcome = EndgameOutcome::Unknown;
+    return res;
+  }
+  // Proven, and proven not to be a win — reachability was searched to the end and
+  // no line beats T. Level exactly is a draw; below it is a loss. The two are
+  // different facts and the caller is entitled to be told which.
+  res.outcome = guaranteed[best] == T ? EndgameOutcome::ForcedDraw : EndgameOutcome::ForcedLoss;
   return res;
 }
 
@@ -1913,6 +1960,155 @@ std::string respondError(const std::string& message) {
 
 }  // namespace
 
+// ── the outcome a move settles on the spot ──────────────────────────────────
+//
+// A move that empties the rack can END THE GAME on this turn, and when it does
+// the final score is fully determined — no search, no sampling, no opponent
+// reply to guess. The rule is `state_transition.cpp`'s and the app's alike: the
+// rack-out check happens BEFORE the refill, so the game ends when the mover has
+// played their last tile and `opponent rack + bag <= RACK_SIZE`, and the mover
+// receives twice what is left in the opponent's rack AND the bag.
+//
+// The reason this is exact even though the opponent's rack is hidden: the bonus
+// is charged on `opponent rack + bag` TOGETHER, and that union is precisely the
+// unseen pool. Which tiles sit where does not enter the arithmetic, so nothing
+// here depends on information we do not have. That is what makes this a proof
+// rather than an estimate, and it is why it holds at any bag count rather than
+// only at bag 0.
+//
+// Returns the exact final margin Δ (our gain − theirs, from here to the end of
+// the game), or nothing when the move does not end the game.
+std::optional<int> immediateOutMargin(const TileCounts& unseen, int myRackTotal,
+                                      int oppRackCount, int bagCount, const Move& move) {
+  if (move.type != MoveType::Place || move.placements.empty()) return std::nullopt;
+  // The bonus is read off `unseen`, so this must be a position where `unseen` is
+  // exactly the opponent's rack plus the bag. Every caller checks it too; a
+  // mismatch means the request described a pool we cannot account for, and the
+  // honest answer is then "not decided here" rather than a wrong number.
+  if (unseen.total != oppRackCount + bagCount) return std::nullopt;
+  if (static_cast<int>(move.placements.size()) != myRackTotal) return std::nullopt;
+  if (oppRackCount + bagCount > RACK_SIZE) return std::nullopt;
+  // Playing out scores the move and then twice the whole unseen pool. Our own
+  // rack is empty, so there is nothing left to deduct on our side, and the
+  // opponent keeps their tiles rather than losing them — this rule adds to the
+  // winner, it does not subtract from the loser.
+  return move.score + 2 * unseen.points();
+}
+
+// ── assignment completion for the admitted candidates ───────────────────────
+//
+// Root generation runs with `dedup`, which collapses moves that share a
+// FOOTPRINT — the same cells holding the same physical tile kinds — and keeps
+// only the highest-scoring one. What differs inside such a group is the face a
+// choice tile is played as: a blank as `-` or as `+`, a `x//` as `×` or `÷`.
+//
+// Dedup's stated justification is that leave depends only on the KINDS spent and
+// defense only on the CELLS used, so the best-scoring member is also the best by
+// static equity. Both halves are true, and the conclusion holds — for RANKING.
+// It does not hold for what happens next, because the assigned token lands on
+// the board and changes every cross-check from then on. movegen.hpp already says
+// this ("MUST stay off for the exact endgame, where a blank's assigned token
+// lands on the board and changes future play"); the same argument applies to the
+// simulation, which scores an opponent reply and our own next turn on exactly
+// that board.
+//
+// Measured on the end-game position this was found in: four moves put the same
+// two kinds on the same two cells for the same 14 points and the same −11.12
+// static equity, and the exact solver proves them at +36, +15, +15 and +15. Two
+// of them tie on score, so which one dedup keeps is decided by enumeration
+// order — and the +36 lost that coin flip and was gone before ranking began.
+// Growing the candidate cap could not have recovered it; the move no longer
+// existed.
+//
+// The fix keeps dedup exactly where it earns its keep — bounding what generation
+// STORES — and undoes it only for the handful of footprints that survive
+// admission. That is sound with respect to the cap for a reason worth stating:
+// within a group `leave` and `defense` are identical by construction and dedup
+// keeps the maximum `score`, so the representative has the maximum static equity
+// in its group. If any member deserved a slot, the representative took one. So
+// expanding after admission admits exactly the set an un-deduped ranking would
+// have admitted.
+//
+// Cost is bounded by the same argument: only admitted footprints are expanded,
+// and the second pass is restricted to their start cells.
+void expandAdmittedAssignments(const Board& board, const TileCounts& rack,
+                               std::vector<Move>& admitted) {
+  // Footprint = sorted (cell, kind), the same identity dedup uses.
+  auto footprint = [](const std::vector<Placement>& ps) {
+    std::vector<std::pair<int, uint8_t>> f;
+    f.reserve(ps.size());
+    for (const Placement& p : ps) f.push_back({Board::idx(p.row, p.col), p.kind});
+    std::sort(f.begin(), f.end());
+    return f;
+  };
+
+  std::map<std::vector<std::pair<int, uint8_t>>, std::vector<Move>> variants;
+  MovegenStartMasks starts{};
+  bool any = false;
+  for (const Move& m : admitted) {
+    if (m.type != MoveType::Place || m.placements.empty()) continue;
+    variants[footprint(m.placements)];  // registers the footprint we want back
+    // Where generation starts this move: the leftmost new tile for a horizontal
+    // run, the topmost for a vertical one. A single new tile is emitted by the
+    // horizontal pass only (see movegen.hpp), so it is registered there.
+    int minRow = BOARD_SIZE, maxRow = -1, minCol = BOARD_SIZE, maxCol = -1;
+    for (const Placement& p : m.placements) {
+      minRow = std::min(minRow, static_cast<int>(p.row));
+      maxRow = std::max(maxRow, static_cast<int>(p.row));
+      minCol = std::min(minCol, static_cast<int>(p.col));
+      maxCol = std::max(maxCol, static_cast<int>(p.col));
+    }
+    if (minRow == maxRow) starts.horizontal[Board::idx(minRow, minCol)] = 1;
+    if (minCol == maxCol && minRow != maxRow) starts.vertical[Board::idx(minRow, minCol)] = 1;
+    any = true;
+  }
+  if (!any) return;
+
+  // Second pass: no dedup, streamed, and restricted to the start cells the
+  // admitted footprints actually use, so this re-enumerates a sliver of the
+  // board rather than all of it. Everything it emits that belongs to an admitted
+  // footprint is kept; everything else is dropped without being materialised.
+  GenOptions opts;
+  opts.allowedStarts = &starts;
+  GenStats gs;
+  MoveSink collect = [&](int score, const std::vector<Placement>& pls) {
+    auto it = variants.find(footprint(pls));
+    if (it == variants.end()) return;
+    Move mv;
+    mv.type = MoveType::Place;
+    mv.score = score;
+    mv.placements = pls;
+    it->second.push_back(std::move(mv));
+  };
+  generatePlaceMovesStream(board, rack, collect, &gs, opts);
+  // A truncated second pass could return a partial group, which would be worse
+  // than not expanding at all: the representative might be the member dropped.
+  // Generation here is bounded by the admitted start cells and has no budget, so
+  // this is belt-and-braces — but if it ever fires, keep what admission chose.
+  if (gs.truncated) return;
+
+  // Rebuild in admission order, each footprint followed by its own assignments,
+  // so the candidate list stays a deterministic function of the ranking.
+  std::vector<Move> out;
+  out.reserve(admitted.size() * 2);
+  std::set<std::vector<std::pair<int, uint8_t>>> emitted;
+  for (const Move& m : admitted) {
+    if (m.type != MoveType::Place || m.placements.empty()) {
+      out.push_back(m);
+      continue;
+    }
+    const auto f = footprint(m.placements);
+    if (!emitted.insert(f).second) continue;  // already expanded via an earlier twin
+    const std::vector<Move>& group = variants[f];
+    if (group.empty()) {
+      out.push_back(m);  // nothing came back; admission's choice stands
+      continue;
+    }
+    for (const Move& v : group) out.push_back(v);
+  }
+  admitted.swap(out);
+}
+
 void setProgressCallback(ProgressFn fn) { g_progress = fn; }
 
 // ── move validation ──────────────────────────────────────────────────────────
@@ -2154,15 +2350,141 @@ std::string handleRequest(const std::string& requestJson) {
     // exact. The endgame solver's contract is therefore PROVEN or INCOMPLETE only.
   }
 
+  // ── moves that settle the game on this turn ────────────────────────────────
+  //
+  // Reached only when the tree search did not answer — it returns above when it
+  // does, and it is strictly stronger, since it also finds wins that take
+  // several turns. What is left here is the class that needs no search at all:
+  // playing out the last tile ends the game, and `immediateOutMargin` reads the
+  // final score straight off the rules.
+  //
+  // Two things follow, and they are the whole point of doing this before
+  // admission rather than inside the simulation:
+  //
+  //   • A move with Δ > T is a PROVEN forced win. Not a high-equity move, not a
+  //     move that usually wins — the game is over when it is played and the
+  //     score is already known. Nothing the opponent does exists. It is chosen
+  //     directly, and no sampling is consulted, because sampling could only
+  //     estimate something that is already certain.
+  //   • Every other out-move is a PROVEN NON-WIN, and it is kept out of the
+  //     simulation rather than pushed into it. Two independent reasons, and the
+  //     second is the one that matters:
+  //
+  //       1. The simulation cannot price a terminal move. It applies the
+  //          placement and then asks `oppReplyValue` for the opponent's best
+  //          answer on a board where the game is already over, adds a leave and
+  //          a next-turn potential for a rack that no longer exists, and never
+  //          adds the ×2 bonus at all. Measured on a real 8+8 position: a move
+  //          whose true final margin is +108 came back from the sim at 140.1 —
+  //          not an approximation of the right number, a number on a different
+  //          axis.
+  //       2. Under the outcome hierarchy it does not need pricing. A terminal
+  //          non-win is a proven ForcedDraw or ForcedLoss, and every candidate
+  //          the simulation ranks is Unknown — unproven, and therefore still
+  //          possibly a win. Unknown outranks both, so the comparison is already
+  //          decided and no equity number can change it.
+  //
+  //     This replaces a force-admission loop that pushed every out-move into the
+  //     candidate set to protect it from `simTopK`. It protected them from the
+  //     cap and then handed them to a judge that could not read them, and it
+  //     cost up to 953 extra candidates (68 → 1021 measured) to do it.
+  //
+  // Scanning the DEDUPED list is sound here, and for a reason specific to this
+  // class: members of a footprint play the same tiles, so they empty the rack
+  // together and share the same bonus; Δ differs between them only by `score`,
+  // and dedup keeps the highest score. The survivor is the best member.
+  const int winThreshold = req.oppScore - req.myScore;  // Δ must EXCEED this
+  int bestOut = -1;
+  int bestOutMargin = 0;
+  int terminalCount = 0;
+  for (size_t i = 0; i < moves.size(); i++) {
+    const std::optional<int> margin =
+        immediateOutMargin(req.unseen, req.rack.total, req.oppRackCount, req.bagCount, moves[i]);
+    if (!margin) continue;
+    terminalCount++;
+    if (bestOut < 0 || *margin > bestOutMargin) {
+      bestOut = static_cast<int>(i);
+      bestOutMargin = *margin;
+    }
+  }
+  //
+  // A terminal move with Δ >= T is RETURNED here, win or draw alike, and that
+  // second half is the whole of "a proven draw beats an unproven anything".
+  //
+  // Reaching this line already means the tree search produced nothing: it
+  // returns above when it proves a ForcedWin, a ConditionalWin, a ForcedDraw or
+  // a ForcedLoss. So every option still standing is UNKNOWN — not "probably a
+  // win", just unexamined — and the hierarchy's Unknown > ForcedDraw was written
+  // for comparing an unknown against a KNOWN draw, not for discarding the draw
+  // before anything is known about its rival.
+  //
+  // Admitting the draw to the simulation instead was tried and measured. The
+  // simulation cannot price a terminal move (it invents an opponent reply for a
+  // finished game and omits the ×2 bonus), so on corpus position 13 it ranked a
+  // proven draw 24th — value 19.0 against the leader's 60.9 — and played a move
+  // whose true value is a loss. Over the audited corpus, admitting it gave 1 loss
+  // and 3 draws; returning it gives 0 losses and 4 draws, and no position was
+  // worse. The number the simulation would compare against is not a probability
+  // of winning; it is a two-ply points estimate on a different axis, and trading
+  // a certainty for it is not a trade the engine is equipped to make.
+  if (bestOut >= 0 && bestOutMargin >= winThreshold) {
+    // A proof, so it goes out through the same channel a proof goes out through.
+    // `endgameSolved` means the outcome is established, not that a particular
+    // algorithm ran — this is the second path that can honestly set it.
+    HiddenResult immediate;
+    immediate.found = true;
+    immediate.solved = true;
+    immediate.move = moves[bestOut];
+    immediate.value = bestOutMargin;
+    immediate.outcome = bestOutMargin > winThreshold ? EndgameOutcome::ForcedWin
+                                                     : EndgameOutcome::ForcedDraw;
+    immediate.winThreshold = winThreshold;
+    immediate.optimisticComplete = true;  // the game ends here; nothing is unexamined
+    return respond(moves[bestOut], static_cast<float>(bestOutMargin), "endgame", true,
+                   bestOutMargin, true, stats, msSince(start), 0, 0, rootMoves, nullptr,
+                   &immediate);
+  }
+
   // ── build one candidate set: placements + exchange + pass ──────────────────
   // Exchange and pass compete on the SAME 2-ply footing as placements, so the
   // bot swaps tiles whenever keeping a playable rack (judged by leave value)
   // beats a weak placement — rather than "play whatever is legal". There is no
   // score gate; the simulation decides.
+  //
+  // Terminal moves are priced exactly above, so what happens to them here is
+  // decided by their PROVEN class rather than by a ranking that cannot see it:
+  //
+  //   Δ >= T  a forced win or a proven draw. Both already returned above; they
+  //           never reach this loop.
+  //   Δ < T   a proven LOSS, and the only terminal class left here. Dropped.
+  //           Nothing unproven can be worse than a certain loss, so removing it
+  //           cannot cost anything — and dropping them is what keeps the
+  //           candidate set bounded: one measured position offers 953 of these.
   std::vector<std::pair<float, size_t>> ranked;
   ranked.reserve(moves.size());
-  for (size_t i = 0; i < moves.size(); i++)
+  for (size_t i = 0; i < moves.size(); i++) {
+    if (terminalCount > 0 &&
+        immediateOutMargin(req.unseen, req.rack.total, req.oppRackCount, req.bagCount, moves[i]))
+      continue;
     ranked.push_back({staticEquity(req.board, req.rack, moves[i], ctx), i});
+  }
+  // Unless holding them out leaves nothing to search. Then the proven non-win is
+  // the whole of what this position offers, and it is returned as what it is —
+  // an exact final margin with an honest class — rather than passed to a search
+  // with an empty board of options.
+  if (ranked.empty() && bestOut >= 0 && !req.exchangeAllowed) {
+    HiddenResult terminal;
+    terminal.found = true;
+    terminal.solved = true;
+    terminal.move = moves[bestOut];
+    terminal.value = bestOutMargin;
+    terminal.winThreshold = winThreshold;
+    terminal.optimisticComplete = true;  // nothing was left unexamined
+    terminal.outcome = EndgameOutcome::ForcedLoss;  // Δ >= T returned above
+    return respond(moves[bestOut], static_cast<float>(bestOutMargin), "endgame", true,
+                   bestOutMargin, true, stats, msSince(start), 0, 0, rootMoves, nullptr,
+                   &terminal);
+  }
   // Total order, not just a strict-weak one on equity. Equal-equity moves are
   // common (mirrored placements, blank assignments that dedup could not merge),
   // and std::sort leaves ties in an unspecified order — so without the index
@@ -2182,16 +2504,45 @@ std::string handleRequest(const std::string& requestJson) {
   if (req.oppRackCount > 0 && !staticSolver) {
     const int k = std::min<int>(cfg.simTopK, static_cast<int>(ranked.size()));
     candidates.reserve(k + 3);
-    if (!moves.empty()) {
-      size_t topScoreIdx = 0;
-      for (size_t i = 0; i < moves.size(); i++)
-        if (moves[i].score > moves[topScoreIdx].score) topScoreIdx = i;
+    if (!ranked.empty()) {
+      // The highest scorer among the ADMISSIBLE moves — `ranked`, not `moves`.
+      //
+      // This guard exists so a spent generation budget can never silently drop
+      // the board's biggest play, and scanning the raw move list used to undo the
+      // terminal filter directly above it: proven ForcedLoss rack-outs are
+      // removed from `ranked`, but the highest-scoring move on the board is very
+      // often exactly one of those (its ×2 bonus is not in the score, yet playing
+      // out the rack tends to score well), so the fallback pushed it straight
+      // back into the candidate set. Measured over the bag-0 corpus: the top
+      // scorer was a filtered terminal loss in 16 of 23 positions, and the engine
+      // then PLAYED that proven loss in 7 of them — a certain loss chosen over
+      // unproven alternatives, which is the one thing the whole ordering exists
+      // to prevent.
+      //
+      // `ranked` already holds exactly the admissible moves, so restricting the
+      // scan to it is the whole fix. The tie-break is preserved deliberately:
+      // the original took the LOWEST index among equal scores, and equal top
+      // scores are common (mirrored placements, blank faces), so keeping that
+      // rule keeps the chosen candidate set a pure function of the request.
+      size_t topScoreIdx = ranked.front().second;
+      for (const auto& entry : ranked) {
+        const size_t i = entry.second;
+        if (moves[i].score > moves[topScoreIdx].score ||
+            (moves[i].score == moves[topScoreIdx].score && i < topScoreIdx))
+          topScoreIdx = i;
+      }
       bool topIncluded = false;
       for (int i = 0; i < k; i++) {
         candidates.push_back(moves[ranked[i].second]);
         if (ranked[i].second == topScoreIdx) topIncluded = true;
       }
       if (!topIncluded) candidates.push_back(moves[topScoreIdx]);  // always simulate the top scorer
+      // Undo dedup for the survivors only: admission ranked footprints, and the
+      // simulation has to see every face those footprints can be played as,
+      // because the face is what lands on the board. See
+      // `expandAdmittedAssignments` for why doing this AFTER admission loses
+      // nothing a complete ranking would have kept.
+      expandAdmittedAssignments(req.board, req.rack, candidates);
     }
     if (req.exchangeAllowed && req.rack.total > 0) {
       // One candidate per swap size, so the sim can pick how many to fish for.
