@@ -153,5 +153,12 @@ wasm: build $(SRC) $(HDR) src/wasm_api.cpp
 # and it is reached ONLY through a dynamic import inside a Web Worker, so it
 # stays a lazily fetched chunk rather than part of the app's first load.
 # tests/engine-in-browser.test.ts is what holds that line.
+# The browser also runs the TOP ANALYSIS LEVEL now, and an analysis is a search
+# plus a description of it. The search is the artifact above; the description is
+# service/src/analysisReport.ts, which imports nothing precisely so it can be
+# copied. One source, mechanically vendored — the alternative is two copies of
+# the prose drifting until two analysis levels explain the same position
+# differently and nothing catches it.
 deploy-ui: wasm
 	cp build/amath_engine.mjs ../EQ-Lab/src/bot/engine/amath_engine.mjs
+	cp service/src/analysisReport.ts ../EQ-Lab/src/bot/engine/analysisReport.ts
