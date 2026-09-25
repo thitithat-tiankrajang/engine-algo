@@ -21,6 +21,8 @@
 
 namespace amath {
 
+struct SpaceMap;  // src/space_map.hpp — carried, not yet consulted (see below)
+
 // Live situation the leave model judges tiles against. Computed once per turn.
 struct BoardContext {
   float mobility = 1.0f;       // board openness: ~0 closed, ~1 typical, ~1.5 wide open
@@ -28,6 +30,14 @@ struct BoardContext {
   int bagSize = 0;             // tiles still in the bag (phase signal)
   float scoreDiff = 0.0f;      // my score − opponent score (situation)
   int unseenTotal = 0;
+
+  // Phase 0 — the board's opportunity map, attached by the decision that built
+  // it and owned by that caller. NOTHING IN THE EVALUATION READS THIS YET, by
+  // design: Phase 0 exists to prove the map is the same board the generator
+  // sees (tests/test_space_map.cpp), and a value function wired to unproven
+  // data is exactly what that proof is meant to come before. Null wherever a
+  // caller has not built one, which is every path except handleRequest.
+  const SpaceMap* spaces = nullptr;
 };
 
 struct LeaveWeights {

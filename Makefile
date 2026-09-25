@@ -2,7 +2,7 @@ CXX ?= clang++
 CXXFLAGS ?= -std=c++20 -O2 -Wall -Wextra
 EMCC ?= emcc
 
-SRC = src/rules.cpp src/movegen.cpp src/eval.cpp src/decision_search.cpp \
+SRC = src/rules.cpp src/movegen.cpp src/eval.cpp src/space_map.cpp src/decision_search.cpp \
 	src/opponent_search.cpp src/paired_race.cpp src/reply_index.cpp src/root_catalogue.cpp src/state_transition.cpp \
 	src/world_deck.cpp src/engine.cpp
 HDR = $(wildcard src/*.hpp)
@@ -23,6 +23,19 @@ test-inc: build $(SRC) $(HDR) tests/test_inc_board.cpp
 	$(CXX) $(CXXFLAGS) -o build/test_inc_board tests/test_inc_board.cpp $(SRC)
 	./build/test_inc_board
 
+# Regression: the rules and complete generation must agree, in both directions,
+# on every ONE-TILE placement. Written for the leading-operator defect.
+test-movegen-singles: build $(SRC) $(HDR) tests/test_movegen_singles.cpp
+	$(CXX) $(CXXFLAGS) -o build/test_movegen_singles tests/test_movegen_singles.cpp $(SRC)
+	./build/test_movegen_singles
+
+# Phase 0: SpaceMap must be the generator's own view of the board. Every field
+# is checked against COMPLETE move generation from one-tile racks, plus a
+# coverage census that fails when an edge class was never reached.
+test-space-map: build $(SRC) $(HDR) tests/test_space_map.cpp
+	$(CXX) $(CXXFLAGS) -o build/test_space_map tests/test_space_map.cpp $(SRC)
+	./build/test_space_map
+
 # Level-1 static path: generation-call bound, determinism, legality, endgame
 # precedence, root-generation completeness.
 test-static: build $(SRC) $(HDR) tests/test_static_l1.cpp
@@ -40,6 +53,31 @@ test-immediate-out: build $(SRC) $(HDR) tests/test_immediate_out.cpp
 	./build/test_immediate_out
 
 # Dedup collapses choice-tile faces; admitted footprints must be re-expanded.
+# ── Authur: the STRONG port. Each target gates one ported piece against the
+# TypeScript original on cases dumped from real positions. Regenerate the cases
+# from amath-bot-lab (scratchpad/authur/) when the original changes.
+test-strong-forest: build tests/test_strong_forest.cpp src/strong/forest.hpp
+	$(CXX) $(CXXFLAGS) -o build/test_strong_forest tests/test_strong_forest.cpp
+	./build/test_strong_forest
+
+test-strong-keep: build tests/test_strong_keep.cpp src/strong/keep_quality.hpp
+	$(CXX) $(CXXFLAGS) -o build/test_strong_keep tests/test_strong_keep.cpp
+	./build/test_strong_keep
+
+test-strong-features: build tests/test_strong_features.cpp src/strong/features.hpp src/strong/forest.hpp
+	$(CXX) $(CXXFLAGS) -o build/test_strong_features tests/test_strong_features.cpp
+	./build/test_strong_features
+
+test-strong-worlds: build tests/test_strong_worlds.cpp src/strong/worlds.hpp
+	$(CXX) $(CXXFLAGS) -o build/test_strong_worlds tests/test_strong_worlds.cpp
+	./build/test_strong_worlds
+
+test-strong: test-strong-forest test-strong-keep test-strong-features test-strong-worlds
+
+# Test-only complete root dump for the cross-repo Authur move-set gate. Never in SRC/WASM.
+authur-move-dump: build tests/authur_move_dump.cpp src/rules.cpp src/movegen.cpp
+	$(CXX) $(CXXFLAGS) -o build/authur_move_dump tests/authur_move_dump.cpp src/rules.cpp src/movegen.cpp
+
 test-assignment-expansion: build $(SRC) $(HDR) tests/test_assignment_expansion.cpp
 	$(CXX) $(CXXFLAGS) -o build/test_assignment_expansion tests/test_assignment_expansion.cpp $(SRC)
 	./build/test_assignment_expansion
@@ -145,7 +183,7 @@ wasm: build $(SRC) $(HDR) src/wasm_api.cpp
 		-s EXPORTED_RUNTIME_METHODS=UTF8ToString,stringToUTF8,lengthBytesUTF8 \
 		-s STACK_SIZE=4MB
 
-.PHONY: build test test-bot test-inc test-static test-immediate-out test-assignment-expansion test-endgame-outcome test-risk-aversion test-work-ledger test-transition test-root-catalogue test-world-deck test-opponent-search test-decision-search test-reply-index verify-reply-index test-paired-race test-v2 cli deep-bench deep-credit-curve gate6 gate7 wasm deploy-ui
+.PHONY: build test test-bot test-inc test-movegen-singles test-space-map test-static test-immediate-out test-assignment-expansion test-endgame-outcome test-risk-aversion test-work-ledger test-transition test-root-catalogue test-world-deck test-opponent-search test-decision-search test-reply-index verify-reply-index test-paired-race test-v2 cli deep-bench deep-credit-curve gate6 gate7 wasm deploy-ui
 
 # The browser build is production again: the Super bot runs on the player's
 # device, so this artifact ships. It lands inside EQ-Lab's bundled source tree

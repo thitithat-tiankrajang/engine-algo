@@ -236,7 +236,10 @@ int main() {
 
   // ── 6. the actual forced win reaches the candidate set ────────────────────
   // (11,4) blank played as `-` with (12,4) `0`. Same cells, same kinds and the
-  // same 14 points as the `+` version dedup kept; proven +36 against its +15.
+  // same 14 points as the `+` version dedup kept, but a different proven value —
+  // which is the whole reason a face dedup collapsed has to come back. (This
+  // line was the proven best until the movegen leading-operator fix; it no
+  // longer is, and the property under test here is membership, not its margin.)
   std::printf("the forced-win assignment survives to the candidate set...\n");
   std::vector<Placement> forcedWin = {
       {11, 4, static_cast<uint8_t>(tileKindFromString("?")),
@@ -262,13 +265,27 @@ int main() {
   // The exact solver generates its own un-deduped list, so this passed before
   // the fix too. It is here so that a future change which routes the endgame
   // through the deduped candidate set fails loudly instead of quietly.
-  std::printf("the engine still returns the proven +36 move...\n");
+  // The proven line is (14,8) `0`, (14,9) blank as `÷`, (14,10) `10` for +25.
+  // It was (11,4)/(12,4) for +36 until the movegen leading-operator fix exposed
+  // the opponent replies that line actually allows; see
+  // endgame_outcome_position.hpp. The assignment being checked is still a blank
+  // face, so this keeps testing what it was written to test.
+  std::vector<Placement> provenWin = {
+      {14, 8, static_cast<uint8_t>(tileKindFromString("0")),
+       static_cast<uint8_t>(assignedTokenFromString("0"))},
+      {14, 9, static_cast<uint8_t>(tileKindFromString("?")),
+       static_cast<uint8_t>(assignedTokenFromString("÷"))},
+      {14, 10, static_cast<uint8_t>(tileKindFromString("10")),
+       static_cast<uint8_t>(assignedTokenFromString("10"))}};
+  const std::string wantedWin = identity(provenWin);
+
+  std::printf("the engine still returns the proven +25 move...\n");
   json::ValuePtr v = ask(0, 8);
   CHECK(v && !v->get("error"));
   if (v && !v->get("error")) {
     CHECK(v->get("solver")->asString() == "endgame");
     CHECK(v->get("outcome")->asString() == "forced_win");
-    CHECK(v->get("expectedFinalDiff")->asInt(0) == 36);
+    CHECK(v->get("expectedFinalDiff")->asInt(0) == 25);
     std::vector<Placement> got;
     for (const auto& p : v->get("placements")->arr) {
       got.push_back({static_cast<uint8_t>(p->get("r")->asInt()),
@@ -276,7 +293,7 @@ int main() {
                      static_cast<uint8_t>(tileKindFromString(p->get("kind")->asString())),
                      static_cast<uint8_t>(assignedTokenFromString(p->get("token")->asString()))});
     }
-    CHECK(identity(got) == wanted);
+    CHECK(identity(got) == wantedWin);
   }
 
   if (failures == 0) {

@@ -69,6 +69,23 @@ inline bool inBounds(int row, int col) {
   return row >= 0 && row < BOARD_SIZE && col >= 0 && col < BOARD_SIZE;
 }
 
+// Premium of one cell as (tile multiplier, equation multiplier). Lifted here
+// from movegen.cpp verbatim so scoring has ONE definition: anything that prices
+// a placement outside the generator (SpaceMap's single-tile scores) must read
+// the same table through the same function, or the two drift silently and the
+// equivalence tests would be comparing two different scoring rules.
+inline void premiumMultipliers(int row, int col, int& tileMult, int& eqMult) {
+  tileMult = 1;
+  eqMult = 1;
+  switch (PREMIUM[Board::idx(row, col)]) {
+    case PX2: tileMult = 2; break;
+    case PX3: tileMult = 3; break;
+    case EX2: eqMult = 2; break;
+    case EX3: eqMult = 3; break;
+    default: break;
+  }
+}
+
 // Rack / bag as tile-kind counts.
 struct TileCounts {
   std::array<uint8_t, KIND_COUNT> n{};

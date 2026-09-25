@@ -24,17 +24,11 @@ struct CrossInfo {
   bool has = false;            // a perpendicular run of length >= 2 would form
 };
 
-// Per-cell premium as (tileMult, eqMult).
+// Per-cell premium as (tileMult, eqMult). The table lookup now lives in
+// board.hpp as `premiumMultipliers` so SpaceMap prices a single-tile placement
+// through the exact same function; this is a rename, not a change.
 inline void premiumOf(int row, int col, int& tileMult, int& eqMult) {
-  tileMult = 1;
-  eqMult = 1;
-  switch (PREMIUM[Board::idx(row, col)]) {
-    case PX2: tileMult = 2; break;
-    case PX3: tileMult = 3; break;
-    case EX2: eqMult = 2; break;
-    case EX3: eqMult = 3; break;
-    default: break;
-  }
+  premiumMultipliers(row, col, tileMult, eqMult);
 }
 
 // Rough value ranking of a premium square, used only to order anchors so the
@@ -97,6 +91,17 @@ struct Generator {
   bool runCoversCenter = false;
 
   bool connected() const { return runHasExisting || crossPlacedCount > 0; }
+
+  // Can a tile placed at (row, col) remain a run of ONE in the main direction?
+  // Only when no existing tile adjoins it along that axis — otherwise the run is
+  // a line of two or more the moment the tile lands, and every line rule
+  // applies to it immediately.
+  bool runStaysSolo(int row, int col) const {
+    const int br = row - dr, bc = col - dc;
+    const int ar = row + dr, ac = col + dc;
+    return !(inBounds(br, bc) && board.at(br, bc).occupied()) &&
+           !(inBounds(ar, ac) && board.at(ar, ac).occupied());
+  }
 
   Generator(const Board& b, const TileCounts& r, std::vector<Move>* o, const MoveSink* sk,
             GenStats* s, const GenOptions& o2, const IncrementalBoard* inc_)
@@ -375,9 +380,28 @@ struct Generator {
 
         const LineState savedState = lineState;
         PROF(lineAdvance++);
+        // `LineState` describes a LINE — a run of two or more tokens that has to
+        // be a valid equation. While the run is still empty the token being
+        // placed is not yet part of a line, and the only rule `advance` can
+        // refuse it by at that point is "a line may not begin with an operator".
+        // Applying that rule here is premature: if the tile ends up standing
+        // alone in the main direction it forms a run of ONE, which is not a line
+        // and which `validatePlaceMove` skips outright (`run.size() < 2`).
+        //
+        // So the verdict is deferred rather than special-cased away. The
+        // placement stays legal exactly as long as the run stays solo — which
+        // `runStaysSolo` decides from the board, and which the guards below
+        // enforce by neither absorbing nor recursing. The moment a second token
+        // would join it, the rule applies again and the branch is pruned as
+        // before. Nothing here names a token: every operator the rules allow in
+        // this position is handled by the same predicate.
+        bool solo = false;
         if (!lineState.advance(token)) {
-          lineState = savedState;
-          continue;
+          if (lineState.length != 0 || !runStaysSolo(row, col)) {
+            lineState = savedState;
+            continue;
+          }
+          solo = true;  // `advance` refused before mutating, so lineState is intact
         }
 
         // Apply.
@@ -398,12 +422,16 @@ struct Generator {
         const int savedSum2 = mainSum;
         const bool savedExisting2 = runHasExisting;
         const bool savedCenter2 = runCoversCenter;
-        const int absorbed = absorb(row + dr, col + dc, lineState);
+        // A solo run absorbs nothing by construction (`runStaysSolo` checked
+        // that no tile adjoins it in the main direction) and must not grow: a
+        // second token would make it a line, and that line would begin with the
+        // operator `advance` already refused. So it emits and stops.
+        const int absorbed = solo ? 0 : absorb(row + dr, col + dc, lineState);
         if (absorbed >= 0) {
           emitIfValid();
           const int nr = row + dr * (absorbed + 1);
           const int nc = col + dc * (absorbed + 1);
-          if (inBounds(nr, nc) && rack.total > 0) extend(nr, nc);
+          if (!solo && inBounds(nr, nc) && rack.total > 0) extend(nr, nc);
           undoAbsorb(absorbed);
         }
         lineState = preAbsorb;

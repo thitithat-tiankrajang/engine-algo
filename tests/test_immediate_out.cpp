@@ -172,11 +172,19 @@ int main() {
               const int cands = static_cast<int>(v->get("stats")->get("candidates")->asInt(0));
               worstCandidates = std::max(worstCandidates, cands);
               positionsWithOuts++;
-              // 60 admitted footprints + top scorer + exchanges + pass, plus the
-              // assignment expansion of those footprints. Terminal moves add
-              // nothing, so this cannot run to the hundreds the force-admission
-              // path produced (68 → 1021 measured).
-              CHECK(cands <= 200);
+              // What bounds this is admission, not the position: 60 admitted
+              // footprints + the top scorer + exchanges + pass, each footprint
+              // then expanded into its assignment faces (a blank-heavy rack can
+              // carry a footprint to a dozen faces on its own). Terminal moves
+              // add nothing to it, which is the property under test.
+              //
+              // Measured over 40 seeds / 17 terminal-rich positions: p50 62,
+              // p90 131, max 229 — while one of those positions offers 1085
+              // terminal moves. That gap is the check: the count tracks the
+              // admission cap, not the number of outs, so it cannot reach the
+              // 1021 the force-admission path produced. The bound sits above the
+              // measured tail rather than on it.
+              CHECK(cands <= 300);
             }
           }
         }

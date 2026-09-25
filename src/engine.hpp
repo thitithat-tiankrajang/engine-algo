@@ -106,4 +106,33 @@ void expandAdmittedAssignments(const Board& board, const TileCounts& rack,
 std::optional<int> immediateOutMargin(const TileCounts& unseen, int myRackTotal,
                                       int oppRackCount, int bagCount, const Move& move);
 
+// ── test seam ────────────────────────────────────────────────────────────────
+//
+// The end-game solver's two failure branches — the witness search running out of
+// budget, and the witness search exhausting itself without finding anything —
+// cannot be reached from a normal request. `overBudget` consults the clock only
+// once every 8192 nodes, and this solver runs at a few hundred nodes a second,
+// so a position either finishes inside one polling interval or dies in the
+// guarantee pass; there is no window in between. Sweeping 40 positions across
+// four budgets and three thresholds produced neither branch.
+//
+// What IS exact is the node budget: `overBudget` tests it on every single call.
+// So this seam hands a test the two bounds the solver already takes as
+// parameters and returns which branch fired. It adds no configuration, changes
+// no default, and is not reachable from `handleRequest` — production keeps
+// calling `solveHiddenEndgame` exactly as before.
+struct EndgameProbe {
+  bool answered = false;         // solver produced a result at all (found && solved)
+  std::string outcome;           // "forced_win" | "conditional_win" | "unknown" | ...
+  int value = 0;                 // guaranteed final margin of the chosen move
+  int winThreshold = 0;
+  bool reachabilityComplete = false;
+  bool witnessEntered = false;
+  bool witnessComplete = false;
+  bool fromWitness = false;
+  int witnessMargin = 0;
+};
+EndgameProbe probeEndgameForTest(const std::string& requestJson, long long nodeBudget,
+                                 double budgetMs);
+
 }  // namespace amath

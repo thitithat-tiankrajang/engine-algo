@@ -5,7 +5,14 @@
 // hierarchy and no class can be tested by accident.
 //
 //   my rack: 1 6 0 10 7 ?   opponent (derived, bag is empty): 0 2 5 9 x x/÷
-//   best guaranteed margin: +36    best reachable margin: +68
+//   best guaranteed margin: +25    best reachable margin: +68
+//
+// The guarantee was recorded as +36 until the movegen leading-operator fix.
+// That number was proven against an opponent who could not play a lone operator
+// hook, because the generator could not produce one — four of this position's
+// root moves hand the opponent exactly such a reply (e.g. after (11,4)+ (12,4)0
+// the opponent answers (13,4) '×' for 17). +25 is the margin that survives
+// against the opponent's real move set; +36 was never guaranteed.
 #pragma once
 #include <string>
 namespace amath_test {
@@ -52,4 +59,25 @@ inline const char* const kDrawTrapRack[] = {"2", "3", "3", "6", "+", "x", "+/-",
 inline constexpr int kDrawTrapOppRack = 3;
 inline constexpr int kDrawTrapThreshold = 61;   // = the best terminal Δ
 inline constexpr int kDrawTrapLossValue = 49;   // what the search preferred
+
+// Two bag-0 positions where the reachability proof runs out of budget.
+//
+// kWitness* (corpus 284): a win IS still reachable, and the bounded witness
+// search finds one inside its budget -- so the answer must be a proven
+// ConditionalWin. Before the witness pass existed this position fell back to
+// argmax(guaranteed) and chose a move that destroyed every winning line.
+//
+// kNoWitness* (corpus 283): also reachable, but the first witness costs ~1.2 s,
+// so nothing is found in time. The answer must stay honest -- never a promoted
+// ConditionalWin, and never a demotion to a proven loss either.
+
+inline const FixtureCell kWitnessBoard[] = {{0,3,"1","1"}, {0,7,"2","2"}, {1,1,"3","3"}, {1,3,"1","1"}, {1,5,"4","4"}, {1,7,"7","7"}, {1,13,"0","0"}, {2,0,"9","9"}, {2,1,"+/-","+"}, {2,2,"6","6"}, {2,3,"+","+"}, {2,4,"0","0"}, {2,5,"x","×"}, {2,6,"12","12"}, {2,7,"=","="}, {2,8,"6","6"}, {2,9,"/","÷"}, {2,10,"?","2"}, {2,11,"x//","×"}, {2,12,"5","5"}, {2,13,"=","="}, {2,14,"15","15"}, {3,1,"5","5"}, {3,3,"17","17"}, {3,5,"7","7"}, {3,7,"8","8"}, {3,13,"0","0"}, {4,1,"=","="}, {4,3,"=","="}, {4,5,"+/-","-"}, {4,7,"6","6"}, {4,11,"2","2"}, {5,1,"8","8"}, {5,3,"2","2"}, {5,5,"19","19"}, {5,7,"-","-"}, {5,11,"4","4"}, {6,1,"x//","×"}, {6,3,"x","×"}, {6,5,"=","="}, {6,7,"5","5"}, {6,11,"7","7"}, {6,14,"1","1"}, {7,0,"5","5"}, {7,1,"4","4"}, {7,2,"x","×"}, {7,3,"14","14"}, {7,4,"x//","÷"}, {7,5,"9","9"}, {7,6,"=","="}, {7,7,"9","9"}, {7,8,"4","4"}, {7,9,"+/-","-"}, {7,10,"?","10"}, {7,11,"x","×"}, {7,12,"6","6"}, {7,13,"/","÷"}, {7,14,"?","6"}, {8,1,"/","÷"}, {8,3,"=","="}, {8,11,"0","0"}, {8,14,"1","1"}, {9,1,"16","16"}, {9,3,"10","10"}, {9,11,"+","+"}, {9,14,"+/-","-"}, {10,1,"x//","×"}, {10,3,"+","+"}, {10,11,"3","3"}, {10,14,"7","7"}, {11,1,"10","10"}, {11,3,"18","18"}, {11,11,"=","="}, {11,14,"9","9"}, {12,1,"-","-"}, {12,11,"3","3"}, {12,14,"=","="}, {13,1,"12","12"}, {13,14,"8","8"}, {14,7,"2","2"}, {14,8,"=","="}, {14,9,"-","-"}, {14,10,"1","1"}, {14,11,"+","+"}, {14,12,"3","3"}, {14,13,"=","="}, {14,14,"2","2"}};
+inline const char* const kWitnessRack[] = {"0", "1", "3", "4", "8", "11", "20", "?"};
+inline constexpr int kWitnessOppRack = 5;
+inline constexpr int kWitnessThreshold = 22;
+
+inline const FixtureCell kNoWitnessBoard[] = {{0,0,"4","4"}, {0,1,"?","3"}, {0,2,"?","-"}, {0,3,"13","13"}, {0,4,"-","-"}, {0,5,"10","10"}, {0,6,"=","="}, {0,7,"20","20"}, {0,8,"-","-"}, {0,9,"3","3"}, {0,10,"?","×"}, {0,11,"4","4"}, {0,12,"+/-","+"}, {0,13,"1","1"}, {0,14,"2","2"}, {1,4,"2","2"}, {2,4,"1","1"}, {2,6,"2","2"}, {2,9,"1","1"}, {3,3,"1","1"}, {3,4,"=","="}, {3,5,"5","5"}, {3,6,"/","÷"}, {3,7,"5","5"}, {3,9,"1","1"}, {3,11,"0","0"}, {4,4,"9","9"}, {4,6,"3","3"}, {4,9,"+","+"}, {4,11,"+","+"}, {5,2,"7","7"}, {5,3,"8","8"}, {5,4,"+/-","-"}, {5,5,"15","15"}, {5,6,"x//","×"}, {5,7,"4","4"}, {5,8,"=","="}, {5,9,"18","18"}, {5,11,"7","7"}, {6,4,"8","8"}, {6,6,"9","9"}, {6,9,"/","÷"}, {6,11,"x","×"}, {7,0,"7","7"}, {7,1,"x","×"}, {7,2,"8","8"}, {7,3,"2","2"}, {7,4,"+/-","+"}, {7,5,"3","3"}, {7,6,"=","="}, {7,7,"5","5"}, {7,8,"7","7"}, {7,9,"3","3"}, {7,10,"?","+"}, {7,11,"4","4"}, {7,14,"0","0"}, {8,4,"0","0"}, {8,6,"6","6"}, {8,9,"=","="}, {8,11,"+/-","-"}, {8,14,"x","×"}, {9,4,"/","÷"}, {9,9,"17","17"}, {9,11,"12","12"}, {9,14,"12","12"}, {10,4,"9","9"}, {10,11,"=","="}, {10,14,"x//","×"}, {11,4,"3","3"}, {11,11,"16","16"}, {11,14,"5","5"}, {12,4,"-","-"}, {12,14,"6","6"}, {13,4,"2","2"}, {13,14,"=","="}, {14,0,"14","14"}, {14,1,"-","-"}, {14,2,"8","8"}, {14,3,"x//","÷"}, {14,4,"2","2"}, {14,5,"=","="}, {14,6,"1","1"}, {14,7,"0","0"}, {14,8,"=","="}, {14,9,"10","10"}, {14,10,"+","+"}, {14,11,"6","6"}, {14,12,"6","6"}, {14,13,"x","×"}, {14,14,"0","0"}};
+inline const char* const kNoWitnessRack[] = {"4", "9", "11", "19", "+", "+/-", "x//", "="};
+inline constexpr int kNoWitnessOppRack = 2;
+inline constexpr int kNoWitnessThreshold = 80;
 }  // namespace amath_test

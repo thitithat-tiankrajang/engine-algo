@@ -1,6 +1,7 @@
 #include "engine.hpp"
 
 #include <algorithm>
+#include <cassert>
 #include <chrono>
 #include <cmath>
 #include <map>
@@ -15,6 +16,7 @@
 #include "json.hpp"
 #include "movegen.hpp"
 #include "rules.hpp"
+#include "space_map.hpp"
 
 namespace amath {
 
@@ -1381,6 +1383,16 @@ struct HiddenResult {
   // reported as one.
   int reachable = 0;
   bool optimisticComplete = false;  // the reachability pass finished within budget
+  // Set only when the ConditionalWin came from the bounded WITNESS search rather
+  // than from a completed reachability pass. The distinction matters to anyone
+  // reading the numbers: `reachable` above is a maximum over every line, while a
+  // witness is simply one line that works. Both prove the same CLASS; only the
+  // first is an optimum, so they are reported under different names.
+  bool fromWitness = false;
+  int witnessMargin = 0;
+  // Which branch produced this, for tests. Nothing in the engine reads them.
+  bool witnessEntered = false;   // the witness pass actually ran
+  bool witnessComplete = false;  // ...and ran to exhaustion rather than aborting
 };
 
 // Proven end-game under hidden information, for bag ∈ {0,1}. bag==0 is the exact
@@ -1403,9 +1415,27 @@ HiddenResult solveHiddenEndgame(const Request& req, long long nodeBudget, double
   const int passIdx = static_cast<int>(aiMoves.size());  // pass is the last "move"
   std::vector<int> guaranteed(aiMoves.size() + 1, HiddenBagSolver::INF);
 
+  // `budgetMs` is the whole allowance this call may spend. It is SPLIT here,
+  // before any search starts, rather than topped up later:
+  //
+  //     budgetMs ──┬── guarantee + reachability   (budgetMs − reserve)
+  //                └── witness search             (the remainder)
+  //
+  // so that guarantee_time + witness_time <= budgetMs holds by construction. The
+  // obvious alternative — run the proof to its deadline, then hand the witness
+  // pass some more time — cannot be made to satisfy that: reaching the witness
+  // pass MEANS the deadline was already hit, so "time remaining" is zero by
+  // definition every single time. Measured across every Mode-B entry in the
+  // corpus, `budgetMs − elapsed` came out between −619 ms and −1595 ms; never
+  // once positive. A reserve has to be set aside in advance or it does not exist.
+  //
+  // A quarter, matching the share `egProveMs` is itself cut with, and small
+  // enough that the proof keeps the bulk: of the six witnesses measured, four
+  // were found in under a millisecond (1 to 14 nodes) and the slowest took 95 ms.
+  const double witnessReserveMs = budgetMs * 0.25;
   HiddenBagSolver solver;
   solver.nodeBudget = nodeBudget;
-  solver.budgetMs = budgetMs;
+  solver.budgetMs = budgetMs - witnessReserveMs;
   solver.start = Clock::now();
   solver.zob = &zobrist();
   solver.initTT(22);  // 4M-slot direct-mapped DP table (~64 MB), RAM-bounded
@@ -1541,66 +1571,99 @@ HiddenResult solveHiddenEndgame(const Request& req, long long nodeBudget, double
   std::vector<int> reachable(aiMoves.size() + 1, -HiddenBagSolver::INF);
   solver.optimistic = true;
   solver.resetOrdering();
-  bool optimisticOk = true;
-  for (size_t s = 0; s < scenarios.size() && optimisticOk; s++) {
-    TileCounts oppRack = req.unseen;
-    for (uint8_t k = 0; k < KIND_COUNT; k++) oppRack.sub(k, scenarios[s].n[k]);
-    TileCounts bag = scenarios[s];
-    solver.incb.board = req.board;
-    solver.incb.rebuild();
-    solver.recomputeBoardHash();
-    solver.reportDetail = "reachable-win check, world " + std::to_string(s + 1) + "/" +
-                          std::to_string(scenarios.size());
 
-    for (size_t i = 0; i < aiMoves.size() && optimisticOk; i++) {
-      const Move& m = aiMoves[i];
-      TileCounts ai = req.rack;
-      for (const Placement& p : m.placements) {
-        solver.boardHash ^= solver.zob->cell[Board::idx(p.row, p.col)][p.kind][p.token];
-        ai.sub(p.kind);
-      }
-      solver.incb.makeMove(m.placements);
-      TileCounts scenarioBag = bag;
-      int v;
-      if (ai.total == 0 && scenarioBag.total == 0) {
-        v = m.score + 2 * oppRack.points();
-      } else {
-        const int draw = std::min(RACK_SIZE - ai.total, scenarioBag.total);
-        v = m.score + solver.drawWorst(draw, 0, ai, oppRack, scenarioBag, 1,
-                                       -HiddenBagSolver::INF, HiddenBagSolver::INF, 0);
-      }
-      solver.incb.undoMove(m.placements);
-      for (const Placement& p : m.placements) {
-        solver.boardHash ^= solver.zob->cell[Board::idx(p.row, p.col)][p.kind][p.token];
-      }
-      // A reachability pass that runs out of budget is NOT a failure of the
-      // proof. The guarantees above are already proven and already enough to
-      // answer classes 1 and 3; we simply lose the chance to upgrade into class
-      // 2, and say so rather than pretending the number exists.
-      if (solver.aborted) { optimisticOk = false; break; }
-      // Best case across worlds: the question is whether a win is REACHABLE.
-      reachable[i] = std::max(reachable[i], v);
-      doneUnits++;
-      emitProgress();
-    }
+  // One scan, two questions.
+  //
+  //   witnessOnly = false — the shipped behaviour: value every option in every
+  //                         world and leave `reachable[]` holding the maximum,
+  //                         so the caller can pick the BEST conditional win.
+  //   witnessOnly = true  — the existential question only: is there ANY line
+  //                         that beats T? ConditionalWin is defined as
+  //                         ∃ world · ∃ our move · ∃ their reply · ∀ draws,
+  //                         so the first line found settles it and the scan can
+  //                         stop — across moves AND across worlds, because both
+  //                         quantifiers are existential.
+  //
+  // The searched sub-tree is IDENTICAL in both modes. Nothing is pruned, no
+  // depth is capped, chance nodes stay worst-case: only the point at which the
+  // enumeration stops differs. That is what makes a found witness proven rather
+  // than merely suggestive — and it is also why not finding one proves nothing,
+  // which is why the caller keeps saying Unknown.
+  int witnessIdx = -1;
+  int witnessValue = 0;
+  auto scanReachability = [&](bool witnessOnly) -> bool {
+    bool ok = true;
+    for (size_t sc = 0; sc < scenarios.size() && ok; sc++) {
+      TileCounts oppRack = req.unseen;
+      for (uint8_t k = 0; k < KIND_COUNT; k++) oppRack.sub(k, scenarios[sc].n[k]);
+      TileCounts bag = scenarios[sc];
+      solver.incb.board = req.board;
+      solver.incb.rebuild();
+      solver.recomputeBoardHash();
+      solver.reportDetail = (witnessOnly ? "witness search, world " : "reachable-win check, world ") +
+                            std::to_string(sc + 1) + "/" + std::to_string(scenarios.size());
 
-    // Passing can reach a win too — holding the rack while they have to open the
-    // board is a real endgame idea, so it competes in this class like any move.
-    if (!optimisticOk) break;
-    {
-      TileCounts ai = req.rack;
-      TileCounts scenarioBag = bag;
-      int v;
-      if (req.noScoreStreak + 1 >= NO_SCORE_STREAK_LENGTH) {
-        v = oppRack.points() - ai.points();
-      } else {
-        v = solver.mm(1, ai, oppRack, scenarioBag, req.noScoreStreak + 1, -HiddenBagSolver::INF,
-                      HiddenBagSolver::INF, 0);
+      for (size_t i = 0; i < aiMoves.size() && ok; i++) {
+        const Move& m = aiMoves[i];
+        TileCounts ai = req.rack;
+        for (const Placement& p : m.placements) {
+          solver.boardHash ^= solver.zob->cell[Board::idx(p.row, p.col)][p.kind][p.token];
+          ai.sub(p.kind);
+        }
+        solver.incb.makeMove(m.placements);
+        TileCounts scenarioBag = bag;
+        int v;
+        if (ai.total == 0 && scenarioBag.total == 0) {
+          v = m.score + 2 * oppRack.points();
+        } else {
+          const int draw = std::min(RACK_SIZE - ai.total, scenarioBag.total);
+          v = m.score + solver.drawWorst(draw, 0, ai, oppRack, scenarioBag, 1,
+                                         -HiddenBagSolver::INF, HiddenBagSolver::INF, 0);
+        }
+        solver.incb.undoMove(m.placements);
+        for (const Placement& p : m.placements) {
+          solver.boardHash ^= solver.zob->cell[Board::idx(p.row, p.col)][p.kind][p.token];
+        }
+        // A reachability pass that runs out of budget is NOT a failure of the
+        // proof. The guarantees above are already proven and already enough to
+        // answer classes 1 and 3; we simply lose the chance to upgrade into class
+        // 2, and say so rather than pretending the number exists.
+        if (solver.aborted) { ok = false; break; }
+        if (witnessOnly) {
+          if (v > T) { witnessIdx = static_cast<int>(i); witnessValue = v; return true; }
+          continue;  // `reachable[]` stays the completed pass's property alone
+        }
+        // Best case across worlds: the question is whether a win is REACHABLE.
+        reachable[i] = std::max(reachable[i], v);
+        doneUnits++;
+        emitProgress();
       }
-      if (solver.aborted) { optimisticOk = false; break; }
-      reachable[passIdx] = std::max(reachable[passIdx], v);
+
+      // Passing can reach a win too — holding the rack while they have to open the
+      // board is a real endgame idea, so it competes in this class like any move.
+      if (!ok) break;
+      {
+        TileCounts ai = req.rack;
+        TileCounts scenarioBag = bag;
+        int v;
+        if (req.noScoreStreak + 1 >= NO_SCORE_STREAK_LENGTH) {
+          v = oppRack.points() - ai.points();
+        } else {
+          v = solver.mm(1, ai, oppRack, scenarioBag, req.noScoreStreak + 1, -HiddenBagSolver::INF,
+                        HiddenBagSolver::INF, 0);
+        }
+        if (solver.aborted) { ok = false; break; }
+        if (witnessOnly) {
+          if (v > T) { witnessIdx = passIdx; witnessValue = v; return true; }
+          continue;
+        }
+        reachable[passIdx] = std::max(reachable[passIdx], v);
+      }
     }
-  }
+    return ok;
+  };
+  const bool optimisticOk = scanReachability(false);
+
   res.optimisticComplete = optimisticOk;
 
   if (optimisticOk) {
@@ -1623,10 +1686,74 @@ HiddenResult solveHiddenEndgame(const Request& req, long long nodeBudget, double
   commit(best);
 
   if (!optimisticOk) {
-    // UNKNOWN. The guarantees are proven, so the move is sound, but the
-    // reachability pass ran out of budget and we never learned whether a win was
-    // still available. Saying "no win" here would be a lie told by a clock: the
-    // same position with a larger budget answers ConditionalWin.
+    // The reachability pass ran out of budget, so we do not know whether a win
+    // was still available. Before settling for that, ask the cheaper question.
+    //
+    // Measured on the corpus this was built from: the full pass values every
+    // option in every world, but the FIRST line that beats T typically appears
+    // almost immediately — 29,725 nodes against 578,101 for the complete pass
+    // over 34 positions, a 19.4x reduction with a median saving of 91%. Eight of
+    // the twelve positions that timed out reach their first witness inside 30 ms.
+    // That gap exists because the full pass spends nearly all of its time proving
+    // the NEGATIVE for options that have no winning line, which the existential
+    // question never has to do.
+    //
+    // The deadline becomes the ORIGINAL `budgetMs` — the reserve is simply the
+    // part of it the proof was never allowed to touch. Nothing is added: this
+    // pass can only consume what was set aside, and if the proof overshot its own
+    // share (see `overBudget`, which consults the clock once every 8192 nodes)
+    // then there is correspondingly less left here.
+    if (msSince(solver.start) >= budgetMs) {
+      res.outcome = EndgameOutcome::Unknown;  // reserve already spent; nothing to run
+      return res;
+    }
+    solver.aborted = false;
+    solver.budgetMs = budgetMs;
+    solver.resetOrdering();
+    res.witnessEntered = true;
+    const bool witnessComplete = scanReachability(true);
+    res.witnessComplete = witnessComplete;
+
+    if (witnessIdx >= 0) {
+      // PROVEN. One line that beats T is the entire definition of ConditionalWin
+      // — the class is existential, so a single witness settles it exactly as
+      // firmly as the exhaustive pass would have. What is NOT established is the
+      // best reachable outcome, so `reachable` is deliberately left alone and the
+      // witness reports itself under its own name.
+      res.outcome = EndgameOutcome::ConditionalWin;
+      res.fromWitness = true;
+      res.witnessMargin = witnessValue;
+      res.value = guaranteed[witnessIdx];
+      res.move = witnessIdx == passIdx ? Move{} : aiMoves[witnessIdx];
+      return res;
+    }
+
+    if (witnessComplete) {
+      // PROVEN NEGATIVE. The witness scan walks the same tree as the full
+      // reachability pass — same full windows, same worst-case chance handling,
+      // nothing pruned or depth-capped — and differs only in stopping early when
+      // it SUCCEEDS. So a scan that runs to the end without succeeding has
+      // evaluated every root option in every world and found none above T, which
+      // is exactly what the full pass would have concluded. That is a proof, not
+      // a timeout, and reporting Unknown here would throw it away.
+      //
+      // The class then follows the same rule as the completed path: level with T
+      // is a draw, below it is a loss. `guaranteed` is exact here — the guarantee
+      // pass finishing is the precondition for reaching this branch at all.
+      int best = 0;
+      for (size_t i = 1; i < guaranteed.size(); i++)
+        if (guaranteed[i] > guaranteed[best]) best = static_cast<int>(i);
+      commit(best);
+      res.outcome =
+          guaranteed[best] == T ? EndgameOutcome::ForcedDraw : EndgameOutcome::ForcedLoss;
+      return res;
+    }
+
+    // UNKNOWN. The guarantees are proven, so the move is sound, but the witness
+    // scan ran out of its reserve without finishing, so we never learned whether
+    // a win was still available. Saying "no win" here would be a lie told by a
+    // clock: the same position with a larger budget answers ConditionalWin.
+    // Failing to FIND a witness is not evidence that none exists.
     res.outcome = EndgameOutcome::Unknown;
     return res;
   }
@@ -1839,8 +1966,16 @@ std::string respond(const Move& move, float equity, const std::string& solver, b
     // found nothing" rather than "we did not need to look".
     if (endgame->outcome != EndgameOutcome::ForcedWin)
       o->obj["winReachabilityProven"] = json::makeBool(endgame->optimisticComplete);
-    if (endgame->outcome == EndgameOutcome::ConditionalWin)
-      o->obj["reachableFinalDiff"] = json::makeInt(endgame->reachable);
+    if (endgame->outcome == EndgameOutcome::ConditionalWin) {
+      // `reachableFinalDiff` has always meant "the BEST final margin still
+      // reachable", and only the exhaustive pass establishes that. A witness
+      // proves the same class from one line, so it is reported separately rather
+      // than borrowing a name that would overstate it.
+      if (endgame->fromWitness)
+        o->obj["winWitnessFinalDiff"] = json::makeInt(endgame->witnessMargin);
+      else
+        o->obj["reachableFinalDiff"] = json::makeInt(endgame->reachable);
+    }
   }
 
   auto st = json::makeObject();
@@ -2206,6 +2341,28 @@ std::string runValidation(const std::string& requestJson, const json::Value& roo
   return verdict(v.valid, v.valid ? v.score : 0, v.error);
 }
 
+// See `EndgameProbe` in engine.hpp. Test-only: nothing in the engine calls this,
+// and it reaches the solver through the same entry point production uses, so the
+// branch a test observes is the branch production would take.
+EndgameProbe probeEndgameForTest(const std::string& requestJson, long long nodeBudget,
+                                 double budgetMs) {
+  EndgameProbe out;
+  Request req;
+  std::string error;
+  if (!parseRequest(requestJson, req, error)) return out;
+  const HiddenResult hr = solveHiddenEndgame(req, nodeBudget, budgetMs, 4000);
+  out.answered = hr.found && hr.solved;
+  out.outcome = endgameOutcomeName(hr.outcome);
+  out.value = hr.value;
+  out.winThreshold = hr.winThreshold;
+  out.reachabilityComplete = hr.optimisticComplete;
+  out.witnessEntered = hr.witnessEntered;
+  out.witnessComplete = hr.witnessComplete;
+  out.fromWitness = hr.fromWitness;
+  out.witnessMargin = hr.witnessMargin;
+  return out;
+}
+
 std::string handleRequest(const std::string& requestJson) {
   // Calibration is answered before anything else and needs no position: it is
   // a question about the DEVICE, not about a game.
@@ -2238,8 +2395,35 @@ std::string handleRequest(const std::string& requestJson) {
 
   // Judge tiles against the live board: openness, the real unseen pool, phase
   // and the score situation.
-  const BoardContext ctx = makeContext(req.board, req.unseen, req.bagCount,
-                                       static_cast<float>(req.myScore - req.oppScore));
+  //
+  // Phase 0 also builds the board's opportunity map here and hangs it on the
+  // context. It is INERT: `leaveValue` and every other evaluation term are
+  // unchanged, so the move this function returns is bit-identical to the move it
+  // returned before. What the hop buys is that the data path exists and is
+  // exercised on every real decision, so the cost is measured on real positions
+  // rather than estimated. `SpaceMap::build` is a pure function of the board —
+  // no RNG, no clock, and no call into `generatePlaceMoves`, so neither the
+  // static path's determinism nor its generation-call bound is touched.
+  const SpaceMap spaces = SpaceMap::build(req.board);
+#ifndef NDEBUG
+  // Dev/test builds re-derive the map and the generator's own cross state from
+  // the same board and require them to agree, on every real decision — the same
+  // gate movegen applies to IncrementalBoard (see loadCrossContact). Release and
+  // WASM builds compile this out entirely.
+  {
+    IncrementalBoard probe;
+    probe.board = req.board;
+    probe.rebuild();
+    assert(spaces.assertConsistent(req.board, "handleRequest") &&
+           "SpaceMap diverged from a fresh rebuild");
+    assert(spaces.assertTopologyMatches(probe, "handleRequest") &&
+           "SpaceMap and the generator's cross state disagree about the board");
+  }
+#endif
+  BoardContext mutableCtx = makeContext(req.board, req.unseen, req.bagCount,
+                                        static_cast<float>(req.myScore - req.oppScore));
+  mutableCtx.spaces = &spaces;
+  const BoardContext& ctx = mutableCtx;
 
   report("movegen", 0, 0, 0, 0, "");
 

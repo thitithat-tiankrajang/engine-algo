@@ -74,10 +74,37 @@ struct Answer {
   bool hasReach = false;
   int reach = 0;
   bool reachProven = false;
+  int witness = 0;
   std::string cells;  // "(r,c)token …", so a changed move is legible in the diff
 };
 
 static bool askJson(const std::string& req, Answer& out);
+
+/** A request for any fixture board, at a stated threshold and budget. */
+template <size_t N, size_t M>
+static std::string boardRequest(const FixtureCell (&board)[N], const char* const (&rack)[M],
+                                int oppRack, int threshold, int budgetMs) {
+  std::string j = "{\"board\":[";
+  bool first = true;
+  for (const FixtureCell& c : board) {
+    if (!first) j += ",";
+    first = false;
+    j += "{\"r\":" + std::to_string(c.r) + ",\"c\":" + std::to_string(c.c) + ",\"kind\":\"" +
+         c.kind + "\",\"token\":\"" + c.token + "\"}";
+  }
+  j += "],\"rack\":[";
+  first = true;
+  for (const char* t : rack) {
+    if (!first) j += ",";
+    first = false;
+    j += std::string("\"") + t + "\"";
+  }
+  j += "],\"bagCount\":0,\"oppRackCount\":" + std::to_string(oppRack) +
+       ",\"myScore\":0,\"oppScore\":" + std::to_string(threshold) +
+       ",\"exchangeAllowed\":false,\"seed\":1,\"topN\":4,\"budgetMs\":" +
+       std::to_string(budgetMs) + "}";
+  return j;
+}
 
 static bool ask(int oppScore, Answer& out) { return askJson(request(oppScore), out); }
 
@@ -100,12 +127,17 @@ static bool askJson(const std::string& req, Answer& out) {
     failures++;
     return false;
   }
-  CHECK(v->get("solver")->asString() == "endgame");
+  if (v->get("solver")->asString() != "endgame") {
+    out.outcome = "(sim)";  // the guarantee pass itself aborted; no endgame answer
+    out.cells = "(sim)";
+    return true;
+  }
   CHECK(v->get("endgameSolved")->asBool());
   out.outcome = v->get("outcome") ? v->get("outcome")->asString() : "";
   out.margin = static_cast<int>(v->get("expectedFinalDiff")->asInt(0));
   out.threshold = static_cast<int>(v->get("winThreshold")->asInt(0));
   if (auto rp = v->get("winReachabilityProven")) out.reachProven = rp->asBool();
+  if (auto w = v->get("winWitnessFinalDiff")) out.witness = static_cast<int>(w->asInt(0));
   if (auto r = v->get("reachableFinalDiff")) {
     out.hasReach = true;
     out.reach = static_cast<int>(r->asInt(0));
@@ -122,7 +154,11 @@ static bool askJson(const std::string& req, Answer& out) {
 int main() {
   // The guarantee available on this board. Everything below is stated relative
   // to it, so the thresholds are not magic numbers.
-  constexpr int kGuaranteed = 36;
+  // Was 36 before the movegen leading-operator fix, which handed the opponent
+  // legal lone-operator replies the old proof never had to face. See the note in
+  // endgame_outcome_position.hpp. Every threshold below is relative to this, so
+  // this is the only number that moved.
+  constexpr int kGuaranteed = 25;
 
   Answer level, tight, mustGamble, hopeless, hopeless2;
 
@@ -217,6 +253,57 @@ int main() {
   }
   CHECK(bounded.outcome != "forced_loss");
   CHECK(bounded.outcome != "forced_draw");
+
+  // ── the bounded witness search ───────────────────────────────────────────
+  // ConditionalWin is existential: exists a world, exists our move, exists their
+  // reply, for all draws, final margin > T. So ONE line that beats T settles the
+  // class exactly -- and failing to find one settles nothing at all.
+  // ── the witness search, driven by the exact axis ─────────────────────────
+  // Both of these use the node budget rather than the clock. `overBudget` tests
+  // the node bound on every call and the clock only once every 8192 nodes, so a
+  // wall-clock budget decides nothing reproducibly here: the same fixture at
+  // budgetMs=2000 lands in a different class depending on how loaded the machine
+  // is, which was measured directly before these were rewritten.
+  std::printf("a witness search that runs out of budget stays UNKNOWN...\n");
+  {
+    const std::string req = boardRequest(kWitnessBoard, kWitnessRack, kWitnessOppRack,
+                                         kWitnessThreshold, /*budgetMs=*/0);
+    // 6000 nodes: the guarantee pass finishes and the reachability pass does not,
+    // so the witness pass runs — and then hits the same exhausted node budget.
+    const EndgameProbe p = probeEndgameForTest(req, /*nodeBudget=*/6000, /*budgetMs=*/1e9);
+    CHECK(p.witnessEntered);     // the branch was genuinely taken...
+    CHECK(!p.witnessComplete);   // ...it aborted rather than exhausting...
+    CHECK(!p.fromWitness);       // ...and it found nothing.
+    CHECK(p.witnessMargin == 0);
+    // Which must mean exactly one thing, and never a proven outcome.
+    CHECK(p.outcome == "unknown");
+    CHECK(p.outcome != "forced_win");
+    CHECK(p.outcome != "forced_draw");
+    CHECK(p.outcome != "forced_loss");
+    CHECK(p.outcome != "conditional_win");
+
+    // The same fixture with room to search reaches the win, which is what makes
+    // the block above a statement about the budget rather than the position.
+    const EndgameProbe rich = probeEndgameForTest(req, /*nodeBudget=*/200000, /*budgetMs=*/1e9);
+    CHECK(rich.outcome == "conditional_win");
+    CHECK(rich.answered);
+    std::printf("  6000 nodes -> %s (witness entered, aborted); 200000 nodes -> %s\n",
+                p.outcome.c_str(), rich.outcome.c_str());
+  }
+
+  std::printf("no witness found means UNKNOWN, never a promotion or a demotion...\n");
+  {
+    Answer a;
+    if (!askJson(boardRequest(kNoWitnessBoard, kNoWitnessRack, kNoWitnessOppRack,
+                              kNoWitnessThreshold, /*budgetMs=*/2000), a))
+      return 1;
+    // A win IS reachable here, but not within the budget. The engine must not
+    // claim it (that would be unproven), and must not deny it either.
+    CHECK(a.outcome != "conditional_win");
+    CHECK(a.outcome != "forced_loss");
+    CHECK(a.outcome != "forced_draw");
+    std::printf("  T=%+d, outcome %s\n", a.threshold, a.outcome.c_str());
+  }
 
   std::printf("the guarantees, as control flow rather than as an ordering...\n");
   // Nothing in the engine compares two EndgameOutcome values; the preference is
