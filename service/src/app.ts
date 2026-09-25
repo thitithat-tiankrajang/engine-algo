@@ -36,8 +36,15 @@ import {
   buildAnalysis,
   buildStudyAnalysis,
 } from "./analysis.js";
-import { type Caller, UnauthenticatedError, bearerFrom, createTokenVerifier } from "./auth.js";
+import {
+  type Caller,
+  UnauthenticatedError,
+  bearerFrom,
+  createTokenVerifier,
+} from "./auth.js";
 import { seedFor, toEngineRequest, toStudyEngineRequest } from "./adapter.js";
+import { authurRequest, runAuthurOnServer } from "./authurRunner.js";
+import { runStage5bOnServer } from "./stage5bRunner.js";
 import { CanonicalStateError, otherSide } from "./canonical.js";
 import type { ServiceConfig } from "./config.js";
 import {
@@ -68,9 +75,18 @@ import {
   QueueWaitTimeoutError,
   type QueuePosition,
 } from "./queue.js";
-import { JobRegistry, type JobKind, type JobObserver, type JobParams } from "./jobRegistry.js";
+import {
+  JobRegistry,
+  type JobKind,
+  type JobObserver,
+  type JobParams,
+} from "./jobRegistry.js";
 import { ComputeBudget, ConcurrencyLimit } from "./rateLimit.js";
-import { StudyPositionError, parseStudyPosition, studyFingerprint } from "./study.js";
+import {
+  StudyPositionError,
+  parseStudyPosition,
+  studyFingerprint,
+} from "./study.js";
 import {
   SUPER_ENGINE_VERSION,
   SUPER_WEIGHTS_VERSION,
@@ -145,7 +161,9 @@ class RequestTiming {
   }
 
   header(): string {
-    const parts = this.#marks.map(([name, ms]) => `${name};dur=${ms.toFixed(1)}`);
+    const parts = this.#marks.map(
+      ([name, ms]) => `${name};dur=${ms.toFixed(1)}`,
+    );
     parts.push(`total;dur=${(performance.now() - this.#start).toFixed(1)}`);
     return parts.join(", ");
   }
@@ -165,8 +183,14 @@ class RequestTiming {
  * self-describing rather than silently wrong. A value that is not a number at
  * all is a different thing — that is a caller mistake, and it takes the default.
  */
-function pageNumber(raw: string | undefined, fallback: number, min: number, max: number): number {
-  if (raw === undefined || raw === "") return Math.min(Math.max(fallback, min), max);
+function pageNumber(
+  raw: string | undefined,
+  fallback: number,
+  min: number,
+  max: number,
+): number {
+  if (raw === undefined || raw === "")
+    return Math.min(Math.max(fallback, min), max);
   const value = Number(raw);
   if (!Number.isInteger(value)) return Math.min(Math.max(fallback, min), max);
   return Math.min(Math.max(value, min), max);
@@ -259,7 +283,8 @@ function streamResult<T>(
     let lastSent = 0;
     try {
       const response = await start({
-        onQueued: (state) => send("queued", { ahead: state.ahead, position: state.position }),
+        onQueued: (state) =>
+          send("queued", { ahead: state.ahead, position: state.position }),
         onRunning: () => send("running", {}),
         onProgress: (progress) => {
           const now = Date.now();
@@ -290,15 +315,27 @@ function streamResult<T>(
  *  after the status line has already been sent. */
 function describeStreamError(error: unknown): Record<string, unknown> {
   if (error instanceof EngineTimeoutError) {
-    return { code: "engine_timeout", error: "The engine ran out of time on this position." };
+    return {
+      code: "engine_timeout",
+      error: "The engine ran out of time on this position.",
+    };
   }
-  if (error instanceof EngineCancelledError || error instanceof QueueCancelledError) {
+  if (
+    error instanceof EngineCancelledError ||
+    error instanceof QueueCancelledError
+  ) {
     return { code: "cancelled", error: "The request was cancelled." };
   }
-  if (error instanceof QueueFullError || error instanceof QueueWaitTimeoutError) {
+  if (
+    error instanceof QueueFullError ||
+    error instanceof QueueWaitTimeoutError
+  ) {
     // Two causes, one meaning for the caller: the server is oversubscribed and
     // this request should be made again rather than waited on.
-    return { code: "queue_full", error: "The engine is busy. Try again shortly." };
+    return {
+      code: "queue_full",
+      error: "The engine is busy. Try again shortly.",
+    };
   }
   if (error instanceof StaleRevisionError) {
     // Reached the front of the queue for a position the game has already left.
@@ -313,11 +350,17 @@ function describeStreamError(error: unknown): Record<string, unknown> {
     return { code: "analysis_unavailable", error: error.message };
   }
   if (error instanceof RoomAccessError) {
-    return { code: error.status === 404 ? "not_found" : "forbidden", error: error.message };
+    return {
+      code: error.status === 404 ? "not_found" : "forbidden",
+      error: error.message,
+    };
   }
   if (error instanceof EngineFailureError) {
     console.error("engine failure (stream)", error.message, error.detail ?? "");
-    return { code: "engine_failed", error: "The engine could not complete this request." };
+    return {
+      code: "engine_failed",
+      error: "The engine could not complete this request.",
+    };
   }
   console.error("unhandled (stream)", error);
   return { code: "internal", error: "Something went wrong." };
@@ -405,7 +448,9 @@ export function createApp(deps: AppDependencies) {
         enabled: config.clientSideSuper,
         engineVersion: SUPER_ENGINE_VERSION,
         weightsVersion: SUPER_WEIGHTS_VERSION,
-        adaptiveBudget: config.superAdaptiveBudget ? "ON (reduces Super strength)" : "off",
+        adaptiveBudget: config.superAdaptiveBudget
+          ? "ON (reduces Super strength)"
+          : "off",
       },
       // How analysis load is bounded changes how the numbers above should be
       // read: a deployment that rations analysis sheds load a deployment that
@@ -417,10 +462,15 @@ export function createApp(deps: AppDependencies) {
         // configuration said. An operator checking whether metering is on got
         // "yes" either way.
         analysisBudget:
-          config.budgetEnforced && config.analysisBudgeted ? "rationed" : "unlimited",
+          config.budgetEnforced && config.analysisBudgeted
+            ? "rationed"
+            : "unlimited",
         botBudget: config.budgetEnforced ? "rationed" : "unlimited",
         ...(config.budgetEnforced
-          ? { budgetPerWindow: config.budgetPerWindow, budgetWindowMs: config.budgetWindowMs }
+          ? {
+              budgetPerWindow: config.budgetPerWindow,
+              budgetWindowMs: config.budgetWindowMs,
+            }
           : {}),
       },
     }),
@@ -432,6 +482,17 @@ export function createApp(deps: AppDependencies) {
     const token = bearerFrom(c.req.header("Authorization"));
     if (!token) throw new UnauthenticatedError("An access token is required.");
     return verify(token);
+  }
+
+  async function requireAnalysisTool(
+    context: EngineRoomContext,
+    token: string,
+  ): Promise<void> {
+    if (!(await source.hasModeTool(context.modeKey, "analysis", token))) {
+      throw new AnalysisNotAllowedError(
+        "Analysis is unavailable in this game mode.",
+      );
+    }
   }
 
   async function readBody(c: Context): Promise<Record<string, unknown>> {
@@ -501,6 +562,7 @@ export function createApp(deps: AppDependencies) {
     admittedRevision: number;
     request: unknown;
     timeoutMs: number;
+    runner?: typeof engine;
     signal: AbortSignal;
     hooks: RunHooks;
     /**
@@ -535,14 +597,20 @@ export function createApp(deps: AppDependencies) {
           if (waited) {
             if (options.revalidate) await options.revalidate();
             else {
-              const fresh = await source.loadContext(options.gameId, options.caller.token);
+              const fresh = await source.loadContext(
+                options.gameId,
+                options.caller.token,
+              );
               if (fresh.revision !== options.admittedRevision) {
-                throw new StaleRevisionError(fresh.revision, options.admittedRevision);
+                throw new StaleRevisionError(
+                  fresh.revision,
+                  options.admittedRevision,
+                );
               }
             }
             if (signal.aborted) throw new EngineCancelledError();
           }
-          return engine({
+          return (options.runner ?? engine)({
             binaryPath: config.enginePath,
             request: options.request,
             timeoutMs: options.timeoutMs,
@@ -564,7 +632,10 @@ export function createApp(deps: AppDependencies) {
     // separate, deliberate decision the registry makes (superseded/explicit/
     // timeout), never a consequence of a lost connection.
     if (options.signal.aborted) attachment.detach();
-    else options.signal.addEventListener("abort", () => attachment.detach(), { once: true });
+    else
+      options.signal.addEventListener("abort", () => attachment.detach(), {
+        once: true,
+      });
     return attachment.promise;
   }
 
@@ -590,7 +661,8 @@ export function createApp(deps: AppDependencies) {
 
       let lastSent = 0;
       const observer: JobObserver = {
-        onQueued: (state) => send("queued", { ahead: state.ahead, position: state.position }),
+        onQueued: (state) =>
+          send("queued", { ahead: state.ahead, position: state.position }),
         onRunning: () => send("running", {}),
         onProgress: (progress) => {
           const now = Date.now();
@@ -681,10 +753,12 @@ export function createApp(deps: AppDependencies) {
       throw new ForbiddenError("You do not control this game.");
     }
 
+    const authur = context.modeKey === "authur_strong";
     const tier = BOT_TIER_CONFIG[context.botDifficulty];
-    const cost = tier.cost;
+    const cost = authur ? BOT_TIER_CONFIG.super.cost : tier.cost;
     const charged = budget.charge(caller.userId, cost);
-    if (!charged.allowed) throw new BudgetError(charged.retryAfterMs, charged.remaining);
+    if (!charged.allowed)
+      throw new BudgetError(charged.retryAfterMs, charged.remaining);
     timing.mark("gates");
     // A charge is undone at most once per request. Reuse and failure can both
     // ask for it, and crediting twice would hand out budget that was never
@@ -696,18 +770,20 @@ export function createApp(deps: AppDependencies) {
       budget.refund(caller.userId, cost);
     };
 
-    const request = toEngineRequest(context.canonical, {
-      side: context.botSide,
-      difficulty: context.botDifficulty,
-      solver: tier.solver,
-      ...(tier.budgetMs != null ? { budgetMs: tier.budgetMs } : {}),
-      ...(tier.unlimited ? { unlimited: true } : {}),
-      // Ask for a full ranking rather than the engine's default handful. This
-      // changes nothing about the search or the move — see BOT_REPORT_TOP_N —
-      // and it is what the reasoning endpoint below pages through.
-      topN: BOT_REPORT_TOP_N,
-      events,
-    });
+    const request = authur
+      ? authurRequest(context.canonical, events, gameId)
+      : toEngineRequest(context.canonical, {
+          side: context.botSide,
+          difficulty: context.botDifficulty,
+          solver: tier.solver,
+          ...(tier.budgetMs != null ? { budgetMs: tier.budgetMs } : {}),
+          ...(tier.unlimited ? { unlimited: true } : {}),
+          // Ask for a full ranking rather than the engine's default handful. This
+          // changes nothing about the search or the move — see BOT_REPORT_TOP_N —
+          // and it is what the reasoning endpoint below pages through.
+          topN: BOT_REPORT_TOP_N,
+          events,
+        });
 
     // Only the move goes back on THIS response. The candidate report describes
     // the bot's own rack, so it is not shipped alongside a move the opponent's
@@ -751,7 +827,9 @@ export function createApp(deps: AppDependencies) {
         caller,
         admittedRevision: context.revision,
         request,
-        timeoutMs: tier.timeoutMs,
+        // A free-play bot turn needs a hard cost ceiling even if STRONG stalls.
+        timeoutMs: authur ? 30_000 : tier.timeoutMs,
+        ...(authur ? { runner: runAuthurOnServer } : {}),
         signal: c.req.raw.signal,
         hooks,
         onReused: refund,
@@ -797,7 +875,9 @@ export function createApp(deps: AppDependencies) {
       // deployment no longer carries must fail loudly and fall back to the
       // backend engine, because answering with DIFFERENT weights under the
       // requested version's name is the one outcome pinning exists to prevent.
-      throw new BadRequestError(`This deployment does not carry weights version "${requested}".`);
+      throw new BadRequestError(
+        `This deployment does not carry weights version "${requested}".`,
+      );
     }
     // Cacheable for a short while and never shared: the flag is per-deployment
     // but the response is behind an Authorization header, and a shared cache
@@ -914,7 +994,9 @@ export function createApp(deps: AppDependencies) {
     const gameId = c.req.param("gameId");
     const body = await readBody(c);
 
-    const level: AnalysisLevel = isAnalysisLevel(body.level) ? body.level : "quick";
+    const level: AnalysisLevel = isAnalysisLevel(body.level)
+      ? body.level
+      : "quick";
     const tier = ANALYSIS_LEVEL_CONFIG[level];
 
     const { context, events } = await loadContextAndCommands(
@@ -927,6 +1009,8 @@ export function createApp(deps: AppDependencies) {
     timing.mark("context");
     requireRevision(context, body.expectedRevision);
     requirePlayable(context);
+
+    await requireAnalysisTool(context, caller.token);
 
     // ── the analysis permission rule ──────────────────────────────────────────
     //
@@ -948,7 +1032,9 @@ export function createApp(deps: AppDependencies) {
       );
     }
     if (!context.callerControlsActiveSide) {
-      throw new AnalysisNotAllowedError("Analysis is only available on your own turn.");
+      throw new AnalysisNotAllowedError(
+        "Analysis is only available on your own turn.",
+      );
     }
 
     const key = `analysis:${gameId}:${context.revision}:${level}`;
@@ -1021,6 +1107,17 @@ export function createApp(deps: AppDependencies) {
         events,
         seedSalt: `analysis:${level}`,
       });
+      if (level === "stage5b64") {
+        request.turnNumber = context.turnNumber;
+        request.board = request.board.map((cell) => {
+          const placed = context.canonical.inventory.find((item) =>
+            item.at === "board" && item.row === cell.r && item.col === cell.c,
+          );
+          return placed?.at === "board"
+            ? { ...cell, by: placed.by, placedTurn: placed.placedTurn }
+            : cell;
+        });
+      }
 
       const start = (hooks: RunHooks) =>
         runQueued({
@@ -1033,8 +1130,20 @@ export function createApp(deps: AppDependencies) {
           admittedRevision: context.revision,
           request,
           timeoutMs: tier.timeoutMs,
+          ...(level === "stage5b64" ? { runner: runStage5bOnServer } : {}),
           signal: c.req.raw.signal,
           hooks,
+          revalidate: async () => {
+            const fresh = await source.loadContext(gameId, caller.token);
+            requireRevision(fresh, context.revision);
+            requirePlayable(fresh);
+            await requireAnalysisTool(fresh, caller.token);
+            if (fresh.activeSideIsBot || !fresh.callerControlsActiveSide) {
+              throw new AnalysisNotAllowedError(
+                "Analysis is only available on your own turn.",
+              );
+            }
+          },
           onReused: () => {
             refund();
             releaseSlot();
@@ -1159,6 +1268,13 @@ export function createApp(deps: AppDependencies) {
     // A SELECT gated on `can_read_live_game`: no read access is a 404 here, as
     // everywhere else, and says nothing about whether the room exists.
     const context = await source.loadContext(gameId, caller.token);
+    if (
+      !(await source.hasModeTool(context.modeKey, "bot_insight", caller.token))
+    ) {
+      throw new ForbiddenError(
+        "Bot explanation is unavailable in this game mode.",
+      );
+    }
     if (!context.botSide || !context.botDifficulty) {
       throw new TurnRuleError("This game has no engine player.");
     }
@@ -1173,16 +1289,22 @@ export function createApp(deps: AppDependencies) {
     // have ENDED on that very move. Refusing either case would hide the report
     // for the one position players most want it — the last one.
     const requested = c.req.query("revision");
-    if (requested === undefined) throw new BadRequestError("revision is required.");
+    if (requested === undefined)
+      throw new BadRequestError("revision is required.");
     const revision = Number(requested);
     if (!Number.isInteger(revision) || revision < 0) {
       throw new BadRequestError("revision must be a whole number.");
     }
-    if (revision > context.revision || context.revision - revision > REASONING_LOOKBACK) {
+    if (
+      revision > context.revision ||
+      context.revision - revision > REASONING_LOOKBACK
+    ) {
       throw new StaleRevisionError(context.revision, revision);
     }
 
-    const snapshot = registry.inspect(`bot:${gameId}:${revision}:${context.botDifficulty}`);
+    const snapshot = registry.inspect(
+      `bot:${gameId}:${revision}:${context.botDifficulty}`,
+    );
     if (!snapshot) {
       // Nothing is held for this position. Retention is bounded and in-memory,
       // so an old move or a restarted service is an ordinary, expected outcome —
@@ -1199,8 +1321,18 @@ export function createApp(deps: AppDependencies) {
     // Ranked by value, chosen move first among equals — the engine's own order,
     // preserved. Paging is a window onto it, never a re-sort.
     const ranked = result.candidates ?? [];
-    const offset = pageNumber(c.req.query("offset"), 0, 0, Math.max(0, ranked.length));
-    const limit = pageNumber(c.req.query("limit"), REASONING_PAGE_DEFAULT, 1, REASONING_PAGE_MAX);
+    const offset = pageNumber(
+      c.req.query("offset"),
+      0,
+      0,
+      Math.max(0, ranked.length),
+    );
+    const limit = pageNumber(
+      c.req.query("limit"),
+      REASONING_PAGE_DEFAULT,
+      1,
+      REASONING_PAGE_MAX,
+    );
     const chosenIndex = ranked.findIndex((candidate) => candidate.chosen);
 
     return c.json({
@@ -1210,7 +1342,9 @@ export function createApp(deps: AppDependencies) {
       difficulty: context.botDifficulty,
       solver: result.solver,
       endgameSolved: result.endgameSolved,
-      ...(result.expectedFinalDiff != null ? { expectedFinalDiff: result.expectedFinalDiff } : {}),
+      ...(result.expectedFinalDiff != null
+        ? { expectedFinalDiff: result.expectedFinalDiff }
+        : {}),
       score: result.score,
       equity: result.equity,
       stats: {
@@ -1219,7 +1353,9 @@ export function createApp(deps: AppDependencies) {
         elapsedMs: Math.round(result.stats.elapsedMs),
         candidates: result.stats.candidates,
         samples: result.stats.samples,
-        ...(result.stats.genCalls != null ? { genCalls: result.stats.genCalls } : {}),
+        ...(result.stats.genCalls != null
+          ? { genCalls: result.stats.genCalls }
+          : {}),
       },
       page: { offset, limit, total: ranked.length },
       candidates: ranked.slice(offset, offset + limit),
@@ -1244,16 +1380,23 @@ export function createApp(deps: AppDependencies) {
     const caller = await authenticate(c);
     const gameId = c.req.param("gameId");
     const levelParam = c.req.query("level");
-    const level: AnalysisLevel = isAnalysisLevel(levelParam) ? levelParam : "quick";
+    const level: AnalysisLevel = isAnalysisLevel(levelParam)
+      ? levelParam
+      : "quick";
 
     const context = await source.loadContext(gameId, caller.token);
     requireRevision(context, c.req.query("revision"));
     requirePlayable(context);
+    await requireAnalysisTool(context, caller.token);
     if (context.activeSideIsBot) {
-      throw new AnalysisNotAllowedError("Analysis is only available on a turn a human is playing.");
+      throw new AnalysisNotAllowedError(
+        "Analysis is only available on a turn a human is playing.",
+      );
     }
     if (!context.callerControlsActiveSide) {
-      throw new AnalysisNotAllowedError("Analysis is only available on your own turn.");
+      throw new AnalysisNotAllowedError(
+        "Analysis is only available on your own turn.",
+      );
     }
 
     const side = context.activeSide;
@@ -1307,18 +1450,25 @@ export function createApp(deps: AppDependencies) {
       context.botSide !== null &&
       context.activeSide === context.botSide &&
       controlsActiveSide;
-    const mayDiscoverAnalysis = !context.activeSideIsBot && controlsActiveSide;
+    const mayDiscoverAnalysis =
+      !context.activeSideIsBot &&
+      controlsActiveSide &&
+      (await source.hasModeTool(context.modeKey, "analysis", caller.token));
 
     const jobs = registry
       .listForGame(gameId, context.revision)
-      .filter((job) => (job.kind === "bot" ? mayDiscoverBot : mayDiscoverAnalysis))
+      .filter((job) =>
+        job.kind === "bot" ? mayDiscoverBot : mayDiscoverAnalysis,
+      )
       .map((job) => ({
         kind: job.kind,
         // Only the discriminator its own kind uses. A bot job's difficulty is
         // already a column the caller can read; an analysis level is the
         // caller's own choice coming back to them.
         ...(job.params.level != null ? { level: job.params.level } : {}),
-        ...(job.params.difficulty != null ? { difficulty: job.params.difficulty } : {}),
+        ...(job.params.difficulty != null
+          ? { difficulty: job.params.difficulty }
+          : {}),
         status: job.status,
         // The engine's own numbers, identical to what the attach stream would
         // replay one round trip later. Included so a returning client paints the
@@ -1334,7 +1484,14 @@ export function createApp(deps: AppDependencies) {
               },
             }
           : {}),
-        ...(job.position ? { queue: { ahead: job.position.ahead, position: job.position.position } } : {}),
+        ...(job.position
+          ? {
+              queue: {
+                ahead: job.position.ahead,
+                position: job.position.position,
+              },
+            }
+          : {}),
       }));
 
     return c.json({ gameId, revision: context.revision, jobs });
@@ -1349,12 +1506,16 @@ export function createApp(deps: AppDependencies) {
     const caller = await authenticate(c);
     const gameId = c.req.param("gameId");
     const body = await readBody(c);
-    const level: AnalysisLevel = isAnalysisLevel(body.level) ? body.level : "quick";
+    const level: AnalysisLevel = isAnalysisLevel(body.level)
+      ? body.level
+      : "quick";
 
     const context = await source.loadContext(gameId, caller.token);
     requireRevision(context, body.expectedRevision);
     if (!context.callerControlsActiveSide) {
-      throw new AnalysisNotAllowedError("Analysis is only available on your own turn.");
+      throw new AnalysisNotAllowedError(
+        "Analysis is only available on your own turn.",
+      );
     }
 
     const key = `analysis:${gameId}:${context.revision}:${level}`;
@@ -1395,19 +1556,21 @@ export function createApp(deps: AppDependencies) {
     timing.mark("auth");
     const body = await readBody(c);
 
-    if (!isBotTier(body.level)) {
+    if (!isBotTier(body.level) && body.level !== "stage5b64") {
       throw new BadRequestError(
-        `level must be one of ${BOT_TIERS.join(", ")}; got "${String(body.level)}".`,
+        `level must be one of ${[...BOT_TIERS, "stage5b64"].join(", ")}; got "${String(body.level)}".`,
       );
     }
     const level = body.level;
-    const tier = BOT_TIER_CONFIG[level];
+    const stage5b = level === "stage5b64";
+    const tier = stage5b ? ANALYSIS_LEVEL_CONFIG.stage5b64 : BOT_TIER_CONFIG[level];
 
     let position;
     try {
       position = parseStudyPosition(body);
     } catch (error) {
-      if (error instanceof StudyPositionError) throw new BadRequestError(error.message);
+      if (error instanceof StudyPositionError)
+        throw new BadRequestError(error.message);
       throw error;
     }
     timing.mark("context");
@@ -1445,15 +1608,19 @@ export function createApp(deps: AppDependencies) {
 
     let streamOwnsSlot = false;
     try {
-      const request = toStudyEngineRequest(position, {
-        difficulty: level,
-        solver: tier.solver,
-        ...(tier.budgetMs != null ? { budgetMs: tier.budgetMs } : {}),
-        ...(tier.unlimited ? { unlimited: true } : {}),
-        // Ask for more than the ten that are kept, so the ten are the top of a
-        // real ranking rather than everything the engine happened to report.
-        topN: BOT_REPORT_TOP_N,
-      });
+      const request = stage5b
+        ? toStudyEngineRequest(position, {
+            difficulty: level,
+            topN: BOT_REPORT_TOP_N,
+          })
+        : toStudyEngineRequest(position, {
+            difficulty: level,
+            solver: BOT_TIER_CONFIG[level].solver,
+            ...(BOT_TIER_CONFIG[level].budgetMs != null
+              ? { budgetMs: BOT_TIER_CONFIG[level].budgetMs! } : {}),
+            ...(BOT_TIER_CONFIG[level].unlimited ? { unlimited: true } : {}),
+            topN: BOT_REPORT_TOP_N,
+          });
 
       const start = (hooks: RunHooks) =>
         runQueued({
@@ -1466,6 +1633,7 @@ export function createApp(deps: AppDependencies) {
           admittedRevision: 0,
           request,
           timeoutMs: tier.timeoutMs,
+          ...(stage5b ? { runner: runStage5bOnServer } : {}),
           signal: c.req.raw.signal,
           hooks,
           // Nothing to re-check: see `revalidate` on runQueued.
@@ -1476,7 +1644,9 @@ export function createApp(deps: AppDependencies) {
           },
         });
 
-      const present = async (response: EngineResponse): Promise<StudyAnalysisResponse> => {
+      const present = async (
+        response: EngineResponse,
+      ): Promise<StudyAnalysisResponse> => {
         const described = buildStudyAnalysis({
           response,
           // Bot tiers bound time, not samples, so "did it finish the schedule"
@@ -1507,7 +1677,10 @@ export function createApp(deps: AppDependencies) {
             caller.token,
           );
         } catch (error) {
-          saveError = error instanceof Error ? error.message : "The result could not be saved.";
+          saveError =
+            error instanceof Error
+              ? error.message
+              : "The result could not be saved.";
           console.error("study save failed", saveError);
         }
 
@@ -1583,17 +1756,29 @@ export function createApp(deps: AppDependencies) {
       return c.json(fail("bad_request", error.message), 400);
     }
     if (error instanceof BodyTooLargeError) {
-      return c.json(fail("body_too_large", "The request body is too large."), 413);
+      return c.json(
+        fail("body_too_large", "The request body is too large."),
+        413,
+      );
     }
     if (error instanceof CanonicalStateError) {
       // The stored position is not the 100-tile set. Reported, never repaired.
-      return c.json(fail("invalid_state", "The stored game state is not a lawful position."), 422);
+      return c.json(
+        fail(
+          "invalid_state",
+          "The stored game state is not a lawful position.",
+        ),
+        422,
+      );
     }
     if (error instanceof BudgetError) {
       c.header("Retry-After", String(Math.ceil(error.retryAfterMs / 1000)));
       return c.json(
         {
-          ...fail("budget_exhausted", "You have used your engine budget for now."),
+          ...fail(
+            "budget_exhausted",
+            "You have used your engine budget for now.",
+          ),
           retryAfterMs: error.retryAfterMs,
         },
         429,
@@ -1601,21 +1786,39 @@ export function createApp(deps: AppDependencies) {
     }
     if (error instanceof TooManyAnalysesError) {
       return c.json(
-        fail("analysis_in_progress", "An analysis is already running for you. Wait for it or cancel it."),
+        fail(
+          "analysis_in_progress",
+          "An analysis is already running for you. Wait for it or cancel it.",
+        ),
         429,
       );
     }
-    if (error instanceof QueueFullError || error instanceof QueueWaitTimeoutError) {
+    if (
+      error instanceof QueueFullError ||
+      error instanceof QueueWaitTimeoutError
+    ) {
       // An overload is an EXPECTED condition, not a fault. It gets its own code
       // and a retry hint, never a generic 500 the client has to guess about.
       c.header("Retry-After", "10");
-      return c.json(fail("queue_full", "The engine is busy. Try again shortly."), 503);
+      return c.json(
+        fail("queue_full", "The engine is busy. Try again shortly."),
+        503,
+      );
     }
     if (error instanceof EngineTimeoutError) {
-      return c.json(fail("engine_timeout", "The engine ran out of time on this position."), 504);
+      return c.json(
+        fail("engine_timeout", "The engine ran out of time on this position."),
+        504,
+      );
     }
-    if (error instanceof EngineCancelledError || error instanceof QueueCancelledError) {
-      return c.json(fail("cancelled", "The request was cancelled."), 499 as 500);
+    if (
+      error instanceof EngineCancelledError ||
+      error instanceof QueueCancelledError
+    ) {
+      return c.json(
+        fail("cancelled", "The request was cancelled."),
+        499 as 500,
+      );
     }
     if (error instanceof AnalysisUnavailableError) {
       return c.json(fail("analysis_unavailable", error.message), 422);
@@ -1624,7 +1827,10 @@ export function createApp(deps: AppDependencies) {
       // The engine's own message is operational detail; the caller gets the
       // fact, the log gets the cause.
       console.error("engine failure", error.message, error.detail ?? "");
-      return c.json(fail("engine_failed", "The engine could not complete this request."), 502);
+      return c.json(
+        fail("engine_failed", "The engine could not complete this request."),
+        502,
+      );
     }
     console.error("unhandled", error);
     return c.json(fail("internal", "Something went wrong."), 500);
@@ -1660,7 +1866,10 @@ export class ReasoningUnavailableError extends Error {
 }
 export class StaleRevisionError extends Error {
   override readonly name = "StaleRevisionError";
-  constructor(readonly current: number, readonly requested: number) {
+  constructor(
+    readonly current: number,
+    readonly requested: number,
+  ) {
     super(
       `This request was composed against revision ${requested}, but the game is at revision ${current}.`,
     );
@@ -1668,7 +1877,10 @@ export class StaleRevisionError extends Error {
 }
 export class BudgetError extends Error {
   override readonly name = "BudgetError";
-  constructor(readonly retryAfterMs: number, readonly remaining: number) {
+  constructor(
+    readonly retryAfterMs: number,
+    readonly remaining: number,
+  ) {
     super("Engine budget exhausted.");
   }
 }

@@ -36,7 +36,7 @@ import {
 import { studyExchangeAllowed, studyFingerprint, type StudyPosition } from "./study.js";
 
 export type EngineRequest = {
-  board: Array<{ r: number; c: number; kind: string; token: string }>;
+  board: Array<{ r: number; c: number; kind: string; token: string; by?: Side; placedTurn?: number }>;
   rack: string[];
   bagCount: number;
   oppRackCount: number;
@@ -56,6 +56,7 @@ export type EngineRequest = {
   sampleCap?: number;
   topN?: number;
   seed: number;
+  turnNumber?: number;
 };
 
 /**

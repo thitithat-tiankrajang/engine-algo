@@ -6,12 +6,17 @@
 import { describe, expect, it, vi } from "vitest";
 
 import { createApp } from "../src/app.js";
-import { EngineCancelledError, EngineFailureError, EngineTimeoutError } from "../src/engineRunner.js";
+import {
+  EngineCancelledError,
+  EngineFailureError,
+  EngineTimeoutError,
+} from "../src/engineRunner.js";
 import { BOT_TIER_CONFIG } from "../src/levels.js";
 import { EngineQueue } from "../src/queue.js";
 import { JobRegistry } from "../src/jobRegistry.js";
 import { ComputeBudget, ConcurrencyLimit } from "../src/rateLimit.js";
 import { RoomAccessError } from "../src/roomContext.js";
+import { runAuthurOnServer } from "../src/authurRunner.js";
 import {
   GAME_ID,
   baseConfig,
@@ -20,6 +25,15 @@ import {
   fakeVerify,
   type FakeSourceOptions,
 } from "./helpers.js";
+
+vi.mock("../src/authurRunner.js", async (importOriginal) => {
+  const actual =
+    await importOriginal<typeof import("../src/authurRunner.js")>();
+  return {
+    ...actual,
+    runAuthurOnServer: vi.fn(async () => fakeEngineResponse()),
+  };
+});
 
 type Overrides = {
   source?: FakeSourceOptions;
@@ -60,9 +74,9 @@ function harness(overrides: Overrides = {}) {
   const analysisSlots = new ConcurrencyLimit(config.maxAnalysisPerUser);
   // Typed so `mock.calls[0][0].request` is checkable — several tests assert on
   // exactly what the adapter handed the engine.
-  const runEngine = vi.fn<(options: { request: Record<string, unknown> }) => Promise<unknown>>(
-    overrides.engine ?? (async () => fakeEngineResponse()),
-  );
+  const runEngine = vi.fn<
+    (options: { request: Record<string, unknown> }) => Promise<unknown>
+  >(overrides.engine ?? (async () => fakeEngineResponse()));
 
   const app = createApp({
     config,
@@ -71,11 +85,17 @@ function harness(overrides: Overrides = {}) {
     registry,
     budget,
     analysisSlots,
-    runEngine: runEngine as unknown as Parameters<typeof createApp>[0]["runEngine"],
+    runEngine: runEngine as unknown as Parameters<
+      typeof createApp
+    >[0]["runEngine"],
     verifyToken: fakeVerify,
   });
 
-  const call = (path: string, body: unknown, headers: Record<string, string> = {}) =>
+  const call = (
+    path: string,
+    body: unknown,
+    headers: Record<string, string> = {},
+  ) =>
     app.request(`/v1/games/${GAME_ID}${path}`, {
       method: "POST",
       headers: {
@@ -86,13 +106,25 @@ function harness(overrides: Overrides = {}) {
       body: JSON.stringify(body),
     });
 
-  return { app, call, runEngine, source, queue, registry, budget, analysisSlots };
+  return {
+    app,
+    call,
+    runEngine,
+    source,
+    queue,
+    registry,
+    budget,
+    analysisSlots,
+  };
 }
 
 /** A second caller on the SAME instance: same registry and queue, a different
  *  view of who they are. What discovery must never do is let this one learn
  *  about work the first one's authorization would not have shown them. */
-function harnessSharing(base: ReturnType<typeof harness>, source: FakeSourceOptions) {
+function harnessSharing(
+  base: ReturnType<typeof harness>,
+  source: FakeSourceOptions,
+) {
   return harness({ source, registry: base.registry, queue: base.queue });
 }
 
@@ -114,7 +146,12 @@ describe("room authorization", () => {
     // The RPC is gated on can_read_live_game and returns zero rows either way,
     // so "forbidden" and "no such game" must be indistinguishable.
     const { call, runEngine } = harness({
-      source: { failWith: new RoomAccessError("No such game, or it is not yours to read.", 404) },
+      source: {
+        failWith: new RoomAccessError(
+          "No such game, or it is not yours to read.",
+          404,
+        ),
+      },
     });
     const response = await call("/analysis", { expectedRevision: 7 });
     expect(response.status).toBe(404);
@@ -128,7 +165,35 @@ describe("room authorization", () => {
     });
     const response = await call("/analysis", { expectedRevision: 7 });
     expect(response.status).toBe(403);
-    expect(await response.json()).toMatchObject({ code: "analysis_not_allowed" });
+    expect(await response.json()).toMatchObject({
+      code: "analysis_not_allowed",
+    });
+    expect(runEngine).not.toHaveBeenCalled();
+  });
+
+  it("refuses analysis when the mode has no analysis tool", async () => {
+    const { app, call, runEngine } = harness({
+      source: { modeKey: "future_no_analysis", analysisToolAllowed: false },
+    });
+    const response = await call("/analysis", { expectedRevision: 7 });
+    expect(response.status).toBe(403);
+    expect(await response.json()).toMatchObject({
+      code: "analysis_not_allowed",
+    });
+
+    const attach = await app.request(
+      `/v1/games/${GAME_ID}/analysis?revision=7`,
+      {
+        headers: { Authorization: "Bearer token-1" },
+      },
+    );
+    expect(attach.status).toBe(403);
+
+    const jobs = await app.request(`/v1/games/${GAME_ID}/jobs?revision=7`, {
+      headers: { Authorization: "Bearer token-1" },
+    });
+    expect(jobs.status).toBe(200);
+    expect(await jobs.json()).toMatchObject({ jobs: [] });
     expect(runEngine).not.toHaveBeenCalled();
   });
 });
@@ -148,11 +213,19 @@ describe("revision validation", () => {
 
   it("rejects a bot move composed against a revision the game has passed", async () => {
     const { call } = harness({
-      source: { revision: 12, botSide: "B", botDifficulty: "medium", activeSide: "B" },
+      source: {
+        revision: 12,
+        botSide: "B",
+        botDifficulty: "medium",
+        activeSide: "B",
+      },
     });
     const response = await call("/bot-move", { expectedRevision: 11 });
     expect(response.status).toBe(409);
-    expect(await response.json()).toMatchObject({ code: "stale_revision", currentRevision: 12 });
+    expect(await response.json()).toMatchObject({
+      code: "stale_revision",
+      currentRevision: 12,
+    });
   });
 
   it("requires an expected revision at all", async () => {
@@ -170,6 +243,30 @@ describe("revision validation", () => {
 });
 
 describe("turn rules", () => {
+  it("routes Authur rooms to Authur on the server and reconnects to that job", async () => {
+    const { app, call, runEngine } = harness({
+      source: {
+        modeKey: "authur_strong",
+        botSide: "B",
+        botDifficulty: "super",
+        activeSide: "B",
+      },
+    });
+    const response = await call("/bot-move", { expectedRevision: 7 });
+    expect(response.status).toBe(200);
+    expect(await response.json()).toMatchObject({ revision: 7 });
+    const attach = await app.request(
+      `/v1/games/${GAME_ID}/bot-move?revision=7`,
+      {
+        headers: { Authorization: "Bearer token-1" },
+      },
+    );
+    expect(attach.status).toBe(200);
+    expect(await attach.text()).toContain('"revision":7');
+    expect(runEngine).not.toHaveBeenCalled();
+    expect(runAuthurOnServer).toHaveBeenCalled();
+  });
+
   it("refuses a bot move when it is not the engine's turn", async () => {
     const { call, runEngine } = harness({
       source: { botSide: "B", botDifficulty: "medium", activeSide: "A" },
@@ -200,7 +297,9 @@ describe("turn rules", () => {
     });
     const response = await call("/analysis", { expectedRevision: 7 });
     expect(response.status).toBe(403);
-    expect(await response.json()).toMatchObject({ code: "analysis_not_allowed" });
+    expect(await response.json()).toMatchObject({
+      code: "analysis_not_allowed",
+    });
     expect(runEngine).not.toHaveBeenCalled();
   });
 
@@ -221,7 +320,9 @@ describe("turn rules", () => {
   it("refuses to think about a finished game", async () => {
     const { call } = harness({
       source: {
-        canonical: (await import("./helpers.js")).buildCanonicalPayload({ status: "finished" }),
+        canonical: (await import("./helpers.js")).buildCanonicalPayload({
+          status: "finished",
+        }),
       },
     });
     const response = await call("/analysis", { expectedRevision: 7 });
@@ -237,7 +338,10 @@ describe("hidden information", () => {
     });
     await call("/analysis", { expectedRevision: 7 });
 
-    const request = runEngine.mock.calls[0]?.[0]?.request as Record<string, unknown>;
+    const request = runEngine.mock.calls[0]?.[0]?.request as Record<
+      string,
+      unknown
+    >;
     expect(request).toBeTruthy();
     // The opponent is a COUNT, and the bag is a COUNT. There is no field on the
     // wire that could carry a tile the requester may not see.
@@ -252,7 +356,12 @@ describe("hidden information", () => {
     // The candidate report explains the BOT's rack. Handing it to the opponent
     // would name tiles they are not entitled to know.
     const { call } = harness({
-      source: { botSide: "B", botDifficulty: "medium", activeSide: "B", activeSideIsBot: true },
+      source: {
+        botSide: "B",
+        botDifficulty: "medium",
+        activeSide: "B",
+        activeSideIsBot: true,
+      },
     });
     const response = await call("/bot-move", { expectedRevision: 7 });
     expect(response.status).toBe(200);
@@ -270,22 +379,34 @@ describe("hidden information", () => {
     expect(text).not.toContain("inventory");
     expect(text).not.toContain("appliedCommands");
     expect(text).not.toContain("pendingReturn");
-    expect(text).not.toContain("\"at\":\"bag\"");
+    expect(text).not.toContain('"at":"bag"');
   });
 });
 
 describe("analysis result", () => {
   it("marks exactly one candidate as recommended and ranks the rest behind it", async () => {
     const { call } = harness();
-    const body = (await (await call("/analysis", { expectedRevision: 7 })).json()) as {
-      recommendation: { recommended: boolean; evaluationGap: number; evaluation: number };
-      alternatives: Array<{ recommended: boolean; evaluationGap: number; evaluation: number }>;
+    const body = (await (
+      await call("/analysis", { expectedRevision: 7 })
+    ).json()) as {
+      recommendation: {
+        recommended: boolean;
+        evaluationGap: number;
+        evaluation: number;
+      };
+      alternatives: Array<{
+        recommended: boolean;
+        evaluationGap: number;
+        evaluation: number;
+      }>;
     };
     expect(body.recommendation.recommended).toBe(true);
     expect(body.recommendation.evaluationGap).toBe(0);
     expect(body.alternatives.every((entry) => !entry.recommended)).toBe(true);
     for (const alternative of body.alternatives) {
-      expect(alternative.evaluation).toBeLessThanOrEqual(body.recommendation.evaluation);
+      expect(alternative.evaluation).toBeLessThanOrEqual(
+        body.recommendation.evaluation,
+      );
       expect(alternative.evaluationGap).toBeGreaterThanOrEqual(0);
     }
   });
@@ -296,10 +417,14 @@ describe("analysis result", () => {
     // describe it purely by the extra points and then say it ranks behind,
     // which argues the wrong side and reads as a contradiction.
     const { call } = harness();
-    const body = (await (await call("/analysis", { expectedRevision: 7 })).json()) as {
+    const body = (await (
+      await call("/analysis", { expectedRevision: 7 })
+    ).json()) as {
       alternatives: Array<{ immediateScore: number; note: string }>;
     };
-    const higherScoring = body.alternatives.find((entry) => entry.immediateScore === 30);
+    const higherScoring = body.alternatives.find(
+      (entry) => entry.immediateScore === 30,
+    );
     expect(higherScoring).toBeTruthy();
     // The reason it is not the pick: it concedes more to the opponent.
     expect(higherScoring?.note).toMatch(/hands the opponent/i);
@@ -309,7 +434,9 @@ describe("analysis result", () => {
 
   it("never claims an alternative is behind without naming a term", async () => {
     const { call } = harness();
-    const body = (await (await call("/analysis", { expectedRevision: 7 })).json()) as {
+    const body = (await (
+      await call("/analysis", { expectedRevision: 7 })
+    ).json()) as {
       alternatives: Array<{ note: string }>;
     };
     for (const alternative of body.alternatives) {
@@ -327,17 +454,23 @@ describe("analysis result", () => {
     // chose the 24-point one. Analysis must agree with the engine, or it is
     // explaining a decision nobody made.
     const { call } = harness();
-    const body = (await (await call("/analysis", { expectedRevision: 7 })).json()) as {
+    const body = (await (
+      await call("/analysis", { expectedRevision: 7 })
+    ).json()) as {
       recommendation: { immediateScore: number };
       alternatives: Array<{ immediateScore: number }>;
     };
     expect(body.recommendation.immediateScore).toBe(24);
-    expect(body.alternatives.some((entry) => entry.immediateScore === 30)).toBe(true);
+    expect(body.alternatives.some((entry) => entry.immediateScore === 30)).toBe(
+      true,
+    );
   });
 
   it("grounds every reported factor in a number the engine produced", async () => {
     const { call } = harness();
-    const body = (await (await call("/analysis", { expectedRevision: 7 })).json()) as {
+    const body = (await (
+      await call("/analysis", { expectedRevision: 7 })
+    ).json()) as {
       recommendation: { factors: Array<{ key: string; value: number }> };
     };
     const byKey = Object.fromEntries(
@@ -362,7 +495,9 @@ describe("analysis result", () => {
           })),
         }),
     });
-    const body = (await (await call("/analysis", { expectedRevision: 7 })).json()) as {
+    const body = (await (
+      await call("/analysis", { expectedRevision: 7 })
+    ).json()) as {
       recommendation: { factors: Array<{ key: string }> };
       method: { solver: string };
     };
@@ -397,7 +532,9 @@ describe("analysis result", () => {
           ],
         }),
     });
-    const body = (await (await call("/analysis", { expectedRevision: 7 })).json()) as {
+    const body = (await (
+      await call("/analysis", { expectedRevision: 7 })
+    ).json()) as {
       recommendation: { provenMargin: number | null };
       method: { proven: boolean };
       summary: string;
@@ -411,10 +548,18 @@ describe("analysis result", () => {
     const { call } = harness({
       engine: async () =>
         fakeEngineResponse({
-          stats: { moves: 10, nodes: 10, elapsedMs: 10, candidates: 3, samples: 2 },
+          stats: {
+            moves: 10,
+            nodes: 10,
+            elapsedMs: 10,
+            candidates: 3,
+            samples: 2,
+          },
         }),
     });
-    const body = (await (await call("/analysis", { expectedRevision: 7 })).json()) as {
+    const body = (await (
+      await call("/analysis", { expectedRevision: 7 })
+    ).json()) as {
       method: { complete: boolean };
       summary: string;
     };
@@ -429,7 +574,9 @@ describe("analysis result", () => {
     });
     const response = await call("/analysis", { expectedRevision: 7 });
     expect(response.status).toBe(422);
-    expect(await response.json()).toMatchObject({ code: "analysis_unavailable" });
+    expect(await response.json()).toMatchObject({
+      code: "analysis_unavailable",
+    });
   });
 });
 
@@ -437,7 +584,10 @@ describe("analysis levels", () => {
   it("bounds work by sample count, so a level is reproducible", async () => {
     const { call, runEngine } = harness();
     await call("/analysis", { expectedRevision: 7, level: "deep" });
-    const request = runEngine.mock.calls[0]?.[0]?.request as Record<string, unknown>;
+    const request = runEngine.mock.calls[0]?.[0]?.request as Record<
+      string,
+      unknown
+    >;
     expect(request.sampleCap).toBe(40);
     expect(request.topN).toBe(16);
   });
@@ -465,7 +615,10 @@ describe("analysis levels", () => {
   it("falls back to the cheapest level when asked for one that does not exist", async () => {
     const { call, runEngine } = harness();
     await call("/analysis", { expectedRevision: 7, level: "ultra-max-please" });
-    const request = runEngine.mock.calls[0]?.[0]?.request as Record<string, unknown>;
+    const request = runEngine.mock.calls[0]?.[0]?.request as Record<
+      string,
+      unknown
+    >;
     expect(request.sampleCap).toBe(4);
   });
 });
@@ -485,7 +638,10 @@ describe("engine failures", () => {
   it("does not leak engine internals when the process fails", async () => {
     const { call } = harness({
       engine: async () => {
-        throw new EngineFailureError("engine exited with SIGSEGV", "/opt/amath/src/engine.cpp:812");
+        throw new EngineFailureError(
+          "engine exited with SIGSEGV",
+          "/opt/amath/src/engine.cpp:812",
+        );
       },
     });
     const response = await call("/analysis", { expectedRevision: 7 });
@@ -514,7 +670,10 @@ describe("compute protection", () => {
     const { app } = harness({ config: { maxBodyBytes: 64 } });
     const response = await app.request(`/v1/games/${GAME_ID}/analysis`, {
       method: "POST",
-      headers: { Authorization: "Bearer token-1", "Content-Type": "application/json" },
+      headers: {
+        Authorization: "Bearer token-1",
+        "Content-Type": "application/json",
+      },
       body: JSON.stringify({ expectedRevision: 7, padding: "x".repeat(500) }),
     });
     expect(response.status).toBe(413);
@@ -528,7 +687,10 @@ describe("compute protection", () => {
     const { call, source, runEngine, budget, analysisSlots } = harness();
     for (let revision = 7; revision < 11; revision += 1) {
       source.advanceTo(revision);
-      const response = await call("/analysis", { expectedRevision: revision, level: "max" });
+      const response = await call("/analysis", {
+        expectedRevision: revision,
+        level: "max",
+      });
       expect(response.status).toBe(200);
     }
     expect(runEngine).toHaveBeenCalledTimes(4);
@@ -544,7 +706,11 @@ describe("compute protection", () => {
     // it is done. The waiting job is not cancelled or overtaken to make room:
     // it keeps its place in line and then answers.
     const OTHER_GAME = "99999999-8888-7777-6666-555555555555";
-    const queue = new EngineQueue({ concurrency: 1, maxWaiting: 8, maxWaitMs: 30_000 });
+    const queue = new EngineQueue({
+      concurrency: 1,
+      maxWaiting: 8,
+      maxWaitMs: 30_000,
+    });
     let release: (() => void) | undefined;
     const held = new Promise<void>((resolve) => {
       release = resolve;
@@ -557,25 +723,36 @@ describe("compute protection", () => {
         return fakeEngineResponse();
       },
     });
-    const occupying = occupier.call("/analysis", { expectedRevision: 7, level: "quick" });
+    const occupying = occupier.call("/analysis", {
+      expectedRevision: 7,
+      level: "quick",
+    });
     await new Promise((resolve) => setTimeout(resolve, 10));
 
     const player = harness({ queue });
-    const queued = player.call("/analysis", { expectedRevision: 7, level: "deep" });
+    const queued = player.call("/analysis", {
+      expectedRevision: 7,
+      level: "deep",
+    });
     await new Promise((resolve) => setTimeout(resolve, 10));
     // Nothing of the player's is running yet — and the second game is refused
     // on those grounds alone.
     expect(player.runEngine).not.toHaveBeenCalled();
-    const otherGame = await player.app.request(`/v1/games/${OTHER_GAME}/analysis`, {
-      method: "POST",
-      headers: {
-        Authorization: "Bearer token-1",
-        "Content-Type": "application/json",
+    const otherGame = await player.app.request(
+      `/v1/games/${OTHER_GAME}/analysis`,
+      {
+        method: "POST",
+        headers: {
+          Authorization: "Bearer token-1",
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ expectedRevision: 7, level: "quick" }),
       },
-      body: JSON.stringify({ expectedRevision: 7, level: "quick" }),
-    });
+    );
     expect(otherGame.status).toBe(429);
-    expect(await otherGame.json()).toMatchObject({ code: "analysis_in_progress" });
+    expect(await otherGame.json()).toMatchObject({
+      code: "analysis_in_progress",
+    });
 
     release?.();
     expect((await occupying).status).toBe(200);
@@ -583,14 +760,17 @@ describe("compute protection", () => {
     // Once it is done the account is clear, and the game it was refused for
     // goes through — the refusal was "wait", not "no".
     expect(player.analysisSlots.heldBy("user-1")).toBe(0);
-    const retried = await player.app.request(`/v1/games/${OTHER_GAME}/analysis`, {
-      method: "POST",
-      headers: {
-        Authorization: "Bearer token-1",
-        "Content-Type": "application/json",
+    const retried = await player.app.request(
+      `/v1/games/${OTHER_GAME}/analysis`,
+      {
+        method: "POST",
+        headers: {
+          Authorization: "Bearer token-1",
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ expectedRevision: 7, level: "quick" }),
       },
-      body: JSON.stringify({ expectedRevision: 7, level: "quick" }),
-    });
+    );
     expect(retried.status).toBe(200);
   });
 
@@ -611,10 +791,17 @@ describe("compute protection", () => {
   });
 
   it("stops a user who has spent their budget", async () => {
-    const { call } = harness({ config: { budgetPerWindow: 12, analysisBudgeted: true } });
+    const { call } = harness({
+      config: { budgetPerWindow: 12, analysisBudgeted: true },
+    });
     // deep costs 10, so the first succeeds and the second is over.
-    expect((await call("/analysis", { expectedRevision: 7, level: "deep" })).status).toBe(200);
-    const second = await call("/analysis", { expectedRevision: 7, level: "deep" });
+    expect(
+      (await call("/analysis", { expectedRevision: 7, level: "deep" })).status,
+    ).toBe(200);
+    const second = await call("/analysis", {
+      expectedRevision: 7,
+      level: "deep",
+    });
     expect(second.status).toBe(429);
     expect(await second.json()).toMatchObject({ code: "budget_exhausted" });
     expect(second.headers.get("Retry-After")).toBeTruthy();
@@ -637,7 +824,10 @@ describe("compute protection", () => {
     const first = call("/analysis", { expectedRevision: 7, level: "quick" });
     // Give the first request time to acquire the slot.
     await new Promise((resolve) => setTimeout(resolve, 10));
-    const second = await call("/analysis", { expectedRevision: 7, level: "deep" });
+    const second = await call("/analysis", {
+      expectedRevision: 7,
+      level: "deep",
+    });
     expect(second.status).toBe(429);
     expect(await second.json()).toMatchObject({ code: "analysis_in_progress" });
     release?.();
@@ -677,17 +867,24 @@ describe("compute protection", () => {
   });
 
   it("does not charge an analysis slot against a request refused on turn rules", async () => {
-    const { call, analysisSlots } = harness({ source: { activeSideIsBot: true } });
+    const { call, analysisSlots } = harness({
+      source: { activeSideIsBot: true },
+    });
     await call("/analysis", { expectedRevision: 7 });
     expect(analysisSlots.heldBy("user-1")).toBe(0);
   });
 });
 
 describe("streaming", () => {
-  const sse = (call: ReturnType<typeof harness>["call"], path: string, body: unknown) =>
-    call(path, body, { Accept: "text/event-stream" });
+  const sse = (
+    call: ReturnType<typeof harness>["call"],
+    path: string,
+    body: unknown,
+  ) => call(path, body, { Accept: "text/event-stream" });
 
-  async function collect(response: Response): Promise<Array<{ event: string; data: unknown }>> {
+  async function collect(
+    response: Response,
+  ): Promise<Array<{ event: string; data: unknown }>> {
     const text = await response.text();
     return text
       .split("\n\n")
@@ -722,7 +919,11 @@ describe("streaming", () => {
     const events = await collect(response);
     // No `queued`: a free slot means the search started at once, and saying
     // otherwise would be a lie the UI would faithfully render.
-    expect(events.map((entry) => entry.event)).toEqual(["running", "progress", "result"]);
+    expect(events.map((entry) => entry.event)).toEqual([
+      "running",
+      "progress",
+      "result",
+    ]);
     expect(events.at(-1)?.data).toMatchObject({ revision: 7 });
   });
 
@@ -732,7 +933,9 @@ describe("streaming", () => {
     const { call } = harness({ source: { activeSideIsBot: true } });
     const response = await sse(call, "/analysis", { expectedRevision: 7 });
     expect(response.status).toBe(403);
-    expect(response.headers.get("Content-Type")).not.toContain("text/event-stream");
+    expect(response.headers.get("Content-Type")).not.toContain(
+      "text/event-stream",
+    );
   });
 
   it("reports an engine failure as an error event, not a broken stream", async () => {
@@ -741,7 +944,9 @@ describe("streaming", () => {
         throw new EngineTimeoutError(1000);
       },
     });
-    const events = await collect(await sse(call, "/analysis", { expectedRevision: 7 }));
+    const events = await collect(
+      await sse(call, "/analysis", { expectedRevision: 7 }),
+    );
     expect(events.at(-1)).toMatchObject({
       event: "error",
       data: { code: "engine_timeout" },
@@ -756,19 +961,31 @@ describe("streaming", () => {
 
   it("streams a bot move too, so a long max search keeps the connection warm", async () => {
     const { call } = harness({
-      source: { botSide: "B", botDifficulty: "max", activeSide: "B", activeSideIsBot: true },
+      source: {
+        botSide: "B",
+        botDifficulty: "max",
+        activeSide: "B",
+        activeSideIsBot: true,
+      },
     });
-    const events = await collect(await sse(call, "/bot-move", { expectedRevision: 7 }));
+    const events = await collect(
+      await sse(call, "/bot-move", { expectedRevision: 7 }),
+    );
     expect(events.at(-1)?.event).toBe("result");
     expect(JSON.stringify(events.at(-1)?.data)).not.toContain("oppReply");
   });
 });
 
 describe("the queue, through the API", () => {
-  const sse = (call: ReturnType<typeof harness>["call"], path: string, body: unknown) =>
-    call(path, body, { Accept: "text/event-stream" });
+  const sse = (
+    call: ReturnType<typeof harness>["call"],
+    path: string,
+    body: unknown,
+  ) => call(path, body, { Accept: "text/event-stream" });
 
-  async function collect(response: Response): Promise<Array<{ event: string; data: unknown }>> {
+  async function collect(
+    response: Response,
+  ): Promise<Array<{ event: string; data: unknown }>> {
     const text = await response.text();
     return text
       .split("\n\n")
@@ -794,7 +1011,11 @@ describe("the queue, through the API", () => {
     // One CPU, one slot. The second caller must be able to distinguish "the
     // server has not begun" from "the server is thinking", or the UI can only
     // draw a spinner that might be dead.
-    const queue = new EngineQueue({ concurrency: 1, maxWaiting: 4, maxWaitMs: 30_000 });
+    const queue = new EngineQueue({
+      concurrency: 1,
+      maxWaiting: 4,
+      maxWaitMs: 30_000,
+    });
     const held = gate();
     let first = true;
     const occupier = harness({
@@ -808,7 +1029,10 @@ describe("the queue, through the API", () => {
       },
     });
 
-    const running = sse(occupier.call, "/analysis", { expectedRevision: 7, level: "quick" });
+    const running = sse(occupier.call, "/analysis", {
+      expectedRevision: 7,
+      level: "quick",
+    });
     await new Promise((resolve) => setTimeout(resolve, 10));
 
     const waiter = harness({ queue, source: { revision: 7 } });
@@ -832,7 +1056,11 @@ describe("the queue, through the API", () => {
   });
 
   it("puts a bot turn ahead of analysis that was already waiting", async () => {
-    const queue = new EngineQueue({ concurrency: 1, maxWaiting: 8, maxWaitMs: 30_000 });
+    const queue = new EngineQueue({
+      concurrency: 1,
+      maxWaiting: 8,
+      maxWaitMs: 30_000,
+    });
     const held = gate();
     const order: string[] = [];
     let occupied = false;
@@ -849,17 +1077,28 @@ describe("the queue, through the API", () => {
     };
 
     const occupier = harness({ queue, engine: engineFor("occupier") });
-    const running = occupier.call("/analysis", { expectedRevision: 7, level: "quick" });
+    const running = occupier.call("/analysis", {
+      expectedRevision: 7,
+      level: "quick",
+    });
     await new Promise((resolve) => setTimeout(resolve, 10));
 
     const analyst = harness({ queue, engine: engineFor("analysis") });
-    const analysis = analyst.call("/analysis", { expectedRevision: 7, level: "deep" });
+    const analysis = analyst.call("/analysis", {
+      expectedRevision: 7,
+      level: "deep",
+    });
     await new Promise((resolve) => setTimeout(resolve, 10));
 
     const player = harness({
       queue,
       engine: engineFor("bot"),
-      source: { botSide: "B", botDifficulty: "hard", activeSide: "B", activeSideIsBot: true },
+      source: {
+        botSide: "B",
+        botDifficulty: "hard",
+        activeSide: "B",
+        activeSideIsBot: true,
+      },
     });
     const bot = player.call("/bot-move", { expectedRevision: 7 });
     await new Promise((resolve) => setTimeout(resolve, 10));
@@ -878,7 +1117,11 @@ describe("the queue, through the API", () => {
   });
 
   it("refuses an overflowing queue with a coded 503, never an ambiguous 500", async () => {
-    const queue = new EngineQueue({ concurrency: 1, maxWaiting: 1, maxWaitMs: 30_000 });
+    const queue = new EngineQueue({
+      concurrency: 1,
+      maxWaiting: 1,
+      maxWaitMs: 30_000,
+    });
     const held = gate();
     let first = true;
     const engine = async () => {
@@ -890,15 +1133,24 @@ describe("the queue, through the API", () => {
     };
 
     const a = harness({ queue, engine });
-    const running = a.call("/analysis", { expectedRevision: 7, level: "quick" });
+    const running = a.call("/analysis", {
+      expectedRevision: 7,
+      level: "quick",
+    });
     await new Promise((resolve) => setTimeout(resolve, 10));
 
     const b = harness({ queue, engine });
-    const waiting = b.call("/analysis", { expectedRevision: 7, level: "normal" });
+    const waiting = b.call("/analysis", {
+      expectedRevision: 7,
+      level: "normal",
+    });
     await new Promise((resolve) => setTimeout(resolve, 10));
 
     const c = harness({ queue, engine });
-    const refused = await c.call("/analysis", { expectedRevision: 7, level: "deep" });
+    const refused = await c.call("/analysis", {
+      expectedRevision: 7,
+      level: "deep",
+    });
     expect(refused.status).toBe(503);
     expect(await refused.json()).toMatchObject({ code: "queue_full" });
     expect(refused.headers.get("Retry-After")).toBeTruthy();
@@ -908,7 +1160,11 @@ describe("the queue, through the API", () => {
   });
 
   it("reports a full queue as an error event once a stream is already open", async () => {
-    const queue = new EngineQueue({ concurrency: 1, maxWaiting: 1, maxWaitMs: 30_000 });
+    const queue = new EngineQueue({
+      concurrency: 1,
+      maxWaiting: 1,
+      maxWaitMs: 30_000,
+    });
     const held = gate();
     let first = true;
     const engine = async () => {
@@ -919,17 +1175,26 @@ describe("the queue, through the API", () => {
       return fakeEngineResponse();
     };
     const a = harness({ queue, engine });
-    const running = a.call("/analysis", { expectedRevision: 7, level: "quick" });
+    const running = a.call("/analysis", {
+      expectedRevision: 7,
+      level: "quick",
+    });
     await new Promise((resolve) => setTimeout(resolve, 10));
     const b = harness({ queue, engine });
-    const waiting = b.call("/analysis", { expectedRevision: 7, level: "normal" });
+    const waiting = b.call("/analysis", {
+      expectedRevision: 7,
+      level: "normal",
+    });
     await new Promise((resolve) => setTimeout(resolve, 10));
 
     const c = harness({ queue, engine });
     const events = await collect(
       await sse(c.call, "/analysis", { expectedRevision: 7, level: "deep" }),
     );
-    expect(events.at(-1)).toMatchObject({ event: "error", data: { code: "queue_full" } });
+    expect(events.at(-1)).toMatchObject({
+      event: "error",
+      data: { code: "queue_full" },
+    });
 
     held.open();
     await Promise.all([running, waiting]);
@@ -940,7 +1205,11 @@ describe("the queue, through the API", () => {
     // the CPU is free the game is at 8. Spending a minute of a shared engine on
     // a board that no longer exists is the thing to avoid, so the check happens
     // BEFORE the process is spawned, not after the answer comes back.
-    const queue = new EngineQueue({ concurrency: 1, maxWaiting: 4, maxWaitMs: 30_000 });
+    const queue = new EngineQueue({
+      concurrency: 1,
+      maxWaiting: 4,
+      maxWaitMs: 30_000,
+    });
     const held = gate();
     const occupier = harness({
       queue,
@@ -949,11 +1218,17 @@ describe("the queue, through the API", () => {
         return fakeEngineResponse();
       },
     });
-    const running = occupier.call("/analysis", { expectedRevision: 7, level: "quick" });
+    const running = occupier.call("/analysis", {
+      expectedRevision: 7,
+      level: "quick",
+    });
     await new Promise((resolve) => setTimeout(resolve, 10));
 
     const waiter = harness({ queue, source: { revision: 7 } });
-    const queued = waiter.call("/analysis", { expectedRevision: 7, level: "deep" });
+    const queued = waiter.call("/analysis", {
+      expectedRevision: 7,
+      level: "deep",
+    });
     await new Promise((resolve) => setTimeout(resolve, 10));
 
     // A move lands while the analysis is still in line.
@@ -973,7 +1248,11 @@ describe("the queue, through the API", () => {
   });
 
   it("refuses a stale queued bot turn rather than playing into a changed board", async () => {
-    const queue = new EngineQueue({ concurrency: 1, maxWaiting: 4, maxWaitMs: 30_000 });
+    const queue = new EngineQueue({
+      concurrency: 1,
+      maxWaiting: 4,
+      maxWaitMs: 30_000,
+    });
     const held = gate();
     const occupier = harness({
       queue,
@@ -982,12 +1261,20 @@ describe("the queue, through the API", () => {
         return fakeEngineResponse();
       },
     });
-    const running = occupier.call("/analysis", { expectedRevision: 7, level: "quick" });
+    const running = occupier.call("/analysis", {
+      expectedRevision: 7,
+      level: "quick",
+    });
     await new Promise((resolve) => setTimeout(resolve, 10));
 
     const player = harness({
       queue,
-      source: { revision: 7, botSide: "B", botDifficulty: "hard", activeSide: "B" },
+      source: {
+        revision: 7,
+        botSide: "B",
+        botDifficulty: "hard",
+        activeSide: "B",
+      },
     });
     const bot = player.call("/bot-move", { expectedRevision: 7 });
     await new Promise((resolve) => setTimeout(resolve, 10));
@@ -997,7 +1284,10 @@ describe("the queue, through the API", () => {
 
     const response = await bot;
     expect(response.status).toBe(409);
-    expect(await response.json()).toMatchObject({ code: "stale_revision", currentRevision: 9 });
+    expect(await response.json()).toMatchObject({
+      code: "stale_revision",
+      currentRevision: 9,
+    });
     expect(player.runEngine).not.toHaveBeenCalled();
     await running;
   });
@@ -1006,9 +1296,16 @@ describe("the queue, through the API", () => {
     // The client's last line of defence: a result that arrives after the game
     // moved on is detectable without trusting the timing of anything.
     const { call } = harness({
-      source: { revision: 12, botSide: "B", botDifficulty: "hard", activeSide: "B" },
+      source: {
+        revision: 12,
+        botSide: "B",
+        botDifficulty: "hard",
+        activeSide: "B",
+      },
     });
-    const body = (await (await call("/bot-move", { expectedRevision: 12 })).json()) as {
+    const body = (await (
+      await call("/bot-move", { expectedRevision: 12 })
+    ).json()) as {
       revision: number;
     };
     expect(body.revision).toBe(12);
@@ -1022,7 +1319,11 @@ describe("the queue, through the API", () => {
     // still in line, still going to run. Capacity is reclaimed by usefulness
     // (superseded / explicit cancel / timeout), never by a closed connection —
     // that policy is exercised directly in jobRegistry.test.ts.
-    const queue = new EngineQueue({ concurrency: 1, maxWaiting: 2, maxWaitMs: 30_000 });
+    const queue = new EngineQueue({
+      concurrency: 1,
+      maxWaiting: 2,
+      maxWaitMs: 30_000,
+    });
     const held = gate();
     const occupier = harness({
       queue,
@@ -1031,7 +1332,10 @@ describe("the queue, through the API", () => {
         return fakeEngineResponse();
       },
     });
-    const running = occupier.call("/analysis", { expectedRevision: 7, level: "quick" });
+    const running = occupier.call("/analysis", {
+      expectedRevision: 7,
+      level: "quick",
+    });
     await new Promise((resolve) => setTimeout(resolve, 10));
 
     const abandoning = new AbortController();
@@ -1039,7 +1343,10 @@ describe("the queue, through the API", () => {
     const abandoned = Promise.resolve(
       waiter.app.request(`/v1/games/${GAME_ID}/analysis`, {
         method: "POST",
-        headers: { Authorization: "Bearer token-1", "Content-Type": "application/json" },
+        headers: {
+          Authorization: "Bearer token-1",
+          "Content-Type": "application/json",
+        },
         body: JSON.stringify({ expectedRevision: 7, level: "deep" }),
         signal: abandoning.signal,
       }),
@@ -1069,7 +1376,10 @@ describe("the queue, through the API", () => {
 describe("health", () => {
   it("reports the queue state an operator needs and nothing about anybody", async () => {
     const { app, queue } = harness();
-    const body = (await (await app.request("/health")).json()) as Record<string, unknown>;
+    const body = (await (await app.request("/health")).json()) as Record<
+      string,
+      unknown
+    >;
     expect(body.ok).toBe(true);
     expect(body.queue).toMatchObject({
       running: 0,
@@ -1098,13 +1408,25 @@ describe("health", () => {
     });
 
     const text = JSON.stringify(body);
-    for (const leak of ["user", "game", "token", GAME_ID, "rack", "canonical", "key"]) {
+    for (const leak of [
+      "user",
+      "game",
+      "token",
+      GAME_ID,
+      "rack",
+      "canonical",
+      "key",
+    ]) {
       expect(text.toLowerCase()).not.toContain(leak.toLowerCase());
     }
   });
 
   it("shows live depth without naming a single job", async () => {
-    const queue = new EngineQueue({ concurrency: 1, maxWaiting: 4, maxWaitMs: 30_000 });
+    const queue = new EngineQueue({
+      concurrency: 1,
+      maxWaiting: 4,
+      maxWaitMs: 30_000,
+    });
     let open!: () => void;
     const held = new Promise<void>((resolve) => {
       open = resolve;
@@ -1116,10 +1438,16 @@ describe("health", () => {
         return fakeEngineResponse();
       },
     });
-    const running = busy.call("/analysis", { expectedRevision: 7, level: "quick" });
+    const running = busy.call("/analysis", {
+      expectedRevision: 7,
+      level: "quick",
+    });
     await new Promise((resolve) => setTimeout(resolve, 10));
     const waiter = harness({ queue });
-    const queued = waiter.call("/analysis", { expectedRevision: 7, level: "deep" });
+    const queued = waiter.call("/analysis", {
+      expectedRevision: 7,
+      level: "deep",
+    });
     await new Promise((resolve) => setTimeout(resolve, 10));
 
     const body = (await (await busy.app.request("/health")).json()) as {
@@ -1149,12 +1477,19 @@ describe("concurrent requests", () => {
     const { call } = harness({ config: { maxAnalysisPerUser: 4 } });
     const bodies = (await Promise.all(
       [1, 2, 3].map(async () =>
-        (await call("/analysis", { expectedRevision: 7, level: "quick" })).json(),
+        (
+          await call("/analysis", { expectedRevision: 7, level: "quick" })
+        ).json(),
       ),
-    )) as Array<{ recommendation: { immediateScore: number }; revision: number }>;
+    )) as Array<{
+      recommendation: { immediateScore: number };
+      revision: number;
+    }>;
     const [first, ...rest] = bodies;
     for (const body of rest) {
-      expect(body.recommendation.immediateScore).toBe(first?.recommendation.immediateScore);
+      expect(body.recommendation.immediateScore).toBe(
+        first?.recommendation.immediateScore,
+      );
       expect(body.revision).toBe(first?.revision);
     }
   });
@@ -1175,7 +1510,9 @@ describe("reconnect + cancel", () => {
     return { promise, open };
   }
 
-  async function collect(response: Response): Promise<Array<{ event: string; data: unknown }>> {
+  async function collect(
+    response: Response,
+  ): Promise<Array<{ event: string; data: unknown }>> {
     const text = await response.text();
     return text
       .split("\n\n")
@@ -1202,9 +1539,13 @@ describe("reconnect + cancel", () => {
       },
     });
     // Start the analysis (streaming), leave it running.
-    const started = h.call("/analysis", { expectedRevision: 7, level: "quick" }, {
-      Accept: "text/event-stream",
-    });
+    const started = h.call(
+      "/analysis",
+      { expectedRevision: 7, level: "quick" },
+      {
+        Accept: "text/event-stream",
+      },
+    );
     const startResp = await started;
     await tick();
 
@@ -1217,25 +1558,40 @@ describe("reconnect + cancel", () => {
       collect(startResp),
       collect(reconnect),
     ]);
-    expect(startEvents.at(-1)).toMatchObject({ event: "result", data: { revision: 7 } });
+    expect(startEvents.at(-1)).toMatchObject({
+      event: "result",
+      data: { revision: 7 },
+    });
     expect(reconnectEvents.map((e) => e.event)).toContain("running");
-    expect(reconnectEvents.at(-1)).toMatchObject({ event: "result", data: { revision: 7 } });
+    expect(reconnectEvents.at(-1)).toMatchObject({
+      event: "result",
+      data: { revision: 7 },
+    });
     // One search served both.
     expect(h.runEngine).toHaveBeenCalledTimes(1);
   });
 
   it("serves a completed result on reconnect without recomputing", async () => {
     const h = harness();
-    await (await h.call("/analysis", { expectedRevision: 7, level: "quick" })).json();
-    const events = await collect(await get(h, "/analysis?revision=7&level=quick"));
-    expect(events.at(-1)).toMatchObject({ event: "result", data: { revision: 7 } });
+    await (
+      await h.call("/analysis", { expectedRevision: 7, level: "quick" })
+    ).json();
+    const events = await collect(
+      await get(h, "/analysis?revision=7&level=quick"),
+    );
+    expect(events.at(-1)).toMatchObject({
+      event: "result",
+      data: { revision: 7 },
+    });
     // The cache answered the reconnect; the engine ran exactly once, for the POST.
     expect(h.runEngine).toHaveBeenCalledTimes(1);
   });
 
   it("reports idle when there is no job for the position", async () => {
     const h = harness();
-    const events = await collect(await get(h, "/analysis?revision=7&level=quick"));
+    const events = await collect(
+      await get(h, "/analysis?revision=7&level=quick"),
+    );
     expect(events).toEqual([{ event: "idle", data: {} }]);
     expect(h.runEngine).not.toHaveBeenCalled();
   });
@@ -1243,7 +1599,12 @@ describe("reconnect + cancel", () => {
   it("reconnects to a running bot job the same way", async () => {
     const held = gate();
     const h = harness({
-      source: { botSide: "B", botDifficulty: "hard", activeSide: "B", activeSideIsBot: true },
+      source: {
+        botSide: "B",
+        botDifficulty: "hard",
+        activeSide: "B",
+        activeSideIsBot: true,
+      },
       engine: (async (options: {
         onProgress?: (progress: Record<string, unknown>) => void;
       }) => {
@@ -1258,22 +1619,34 @@ describe("reconnect + cancel", () => {
         return fakeEngineResponse();
       }) as unknown as () => Promise<ReturnType<typeof fakeEngineResponse>>,
     });
-    const started = h.call("/bot-move", { expectedRevision: 7 }, { Accept: "text/event-stream" });
+    const started = h.call(
+      "/bot-move",
+      { expectedRevision: 7 },
+      { Accept: "text/event-stream" },
+    );
     const startResp = await started;
     await tick();
     const reconnect = await get(h, "/bot-move?revision=7");
     await tick();
     held.open();
-    const [, reconnectEvents] = await Promise.all([collect(startResp), collect(reconnect)]);
+    const [, reconnectEvents] = await Promise.all([
+      collect(startResp),
+      collect(reconnect),
+    ]);
     expect(reconnectEvents).toContainEqual(
       expect.objectContaining({
         event: "progress",
         data: expect.objectContaining({ percent: 50 }),
       }),
     );
-    expect(reconnectEvents.at(-1)).toMatchObject({ event: "result", data: { revision: 7 } });
+    expect(reconnectEvents.at(-1)).toMatchObject({
+      event: "result",
+      data: { revision: 7 },
+    });
     // The bot's reasoning about its own rack never crosses the wire.
-    expect(JSON.stringify(reconnectEvents.at(-1)?.data)).not.toContain("oppReply");
+    expect(JSON.stringify(reconnectEvents.at(-1)?.data)).not.toContain(
+      "oppReply",
+    );
     expect(h.runEngine).toHaveBeenCalledTimes(1);
   });
 
@@ -1281,7 +1654,9 @@ describe("reconnect + cancel", () => {
     const h = harness({ source: { callerControlsActiveSide: false } });
     const response = await get(h, "/analysis?revision=7&level=quick");
     expect(response.status).toBe(403);
-    expect(await response.json()).toMatchObject({ code: "analysis_not_allowed" });
+    expect(await response.json()).toMatchObject({
+      code: "analysis_not_allowed",
+    });
     expect(h.runEngine).not.toHaveBeenCalled();
   });
 
@@ -1289,7 +1664,10 @@ describe("reconnect + cancel", () => {
     const h = harness({ source: { revision: 9 } });
     const response = await get(h, "/analysis?revision=7&level=quick");
     expect(response.status).toBe(409);
-    expect(await response.json()).toMatchObject({ code: "stale_revision", currentRevision: 9 });
+    expect(await response.json()).toMatchObject({
+      code: "stale_revision",
+      currentRevision: 9,
+    });
   });
 
   it("cancels an in-flight analysis on an explicit request", async () => {
@@ -1306,30 +1684,49 @@ describe("reconnect + cancel", () => {
           void held;
         })) as unknown as () => Promise<ReturnType<typeof fakeEngineResponse>>,
     });
-    const started = h.call("/analysis", { expectedRevision: 7, level: "quick" }, {
-      Accept: "text/event-stream",
-    });
+    const started = h.call(
+      "/analysis",
+      { expectedRevision: 7, level: "quick" },
+      {
+        Accept: "text/event-stream",
+      },
+    );
     const startResp = await started;
     await tick();
 
-    const cancelled = await h.app.request(`/v1/games/${GAME_ID}/analysis/cancel`, {
-      method: "POST",
-      headers: { Authorization: "Bearer token-1", "Content-Type": "application/json" },
-      body: JSON.stringify({ expectedRevision: 7, level: "quick" }),
-    });
+    const cancelled = await h.app.request(
+      `/v1/games/${GAME_ID}/analysis/cancel`,
+      {
+        method: "POST",
+        headers: {
+          Authorization: "Bearer token-1",
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ expectedRevision: 7, level: "quick" }),
+      },
+    );
     expect(await cancelled.json()).toEqual({ cancelled: true });
 
     const events = await collect(startResp);
-    expect(events.at(-1)).toMatchObject({ event: "error", data: { code: "cancelled" } });
+    expect(events.at(-1)).toMatchObject({
+      event: "error",
+      data: { code: "cancelled" },
+    });
   });
 
   it("refuses to cancel for someone who does not control the turn", async () => {
     const h = harness({ source: { callerControlsActiveSide: false } });
-    const response = await h.app.request(`/v1/games/${GAME_ID}/analysis/cancel`, {
-      method: "POST",
-      headers: { Authorization: "Bearer token-1", "Content-Type": "application/json" },
-      body: JSON.stringify({ expectedRevision: 7, level: "quick" }),
-    });
+    const response = await h.app.request(
+      `/v1/games/${GAME_ID}/analysis/cancel`,
+      {
+        method: "POST",
+        headers: {
+          Authorization: "Bearer token-1",
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ expectedRevision: 7, level: "quick" }),
+      },
+    );
     expect(response.status).toBe(403);
   });
 });
@@ -1360,7 +1757,11 @@ describe("job discovery", () => {
     const h = harness();
     const response = await jobs(h, "?revision=7");
     expect(response.status).toBe(200);
-    expect(await response.json()).toEqual({ gameId: GAME_ID, revision: 7, jobs: [] });
+    expect(await response.json()).toEqual({
+      gameId: GAME_ID,
+      revision: 7,
+      jobs: [],
+    });
     expect(h.runEngine).not.toHaveBeenCalled();
   });
 
@@ -1372,9 +1773,13 @@ describe("job discovery", () => {
         return fakeEngineResponse();
       },
     });
-    void h.call("/analysis", { expectedRevision: 7, level: "deep" }, {
-      Accept: "text/event-stream",
-    });
+    void h.call(
+      "/analysis",
+      { expectedRevision: 7, level: "deep" },
+      {
+        Accept: "text/event-stream",
+      },
+    );
     await tick();
 
     const found = (await (await jobs(h, "?revision=7")).json()) as {
@@ -1383,7 +1788,11 @@ describe("job discovery", () => {
     expect(found.jobs).toHaveLength(1);
     // The level is the whole point: it is the one part of the job's identity a
     // returning client cannot derive from the game row.
-    expect(found.jobs[0]).toMatchObject({ kind: "analysis", level: "deep", status: "running" });
+    expect(found.jobs[0]).toMatchObject({
+      kind: "analysis",
+      level: "deep",
+      status: "running",
+    });
     held.open();
   });
 
@@ -1405,27 +1814,41 @@ describe("job discovery", () => {
         return fakeEngineResponse();
       }) as unknown as () => Promise<ReturnType<typeof fakeEngineResponse>>,
     });
-    void h.call("/analysis", { expectedRevision: 7, level: "quick" }, {
-      Accept: "text/event-stream",
-    });
+    void h.call(
+      "/analysis",
+      { expectedRevision: 7, level: "quick" },
+      {
+        Accept: "text/event-stream",
+      },
+    );
     await tick();
 
     const found = (await (await jobs(h, "?revision=7")).json()) as {
       jobs: Array<{ progress?: { percent: number; phase: string } }>;
     };
-    expect(found.jobs[0]?.progress).toMatchObject({ percent: 63, phase: "sim" });
+    expect(found.jobs[0]?.progress).toMatchObject({
+      percent: 63,
+      phase: "sim",
+    });
     held.open();
   });
 
   it("reports a completed job so a returning client reads the answer instead of recomputing", async () => {
     const h = harness();
-    expect((await h.call("/analysis", { expectedRevision: 7, level: "quick" })).status).toBe(200);
+    expect(
+      (await h.call("/analysis", { expectedRevision: 7, level: "quick" }))
+        .status,
+    ).toBe(200);
 
     const found = (await (await jobs(h, "?revision=7")).json()) as {
       jobs: Array<Record<string, unknown>>;
     };
     expect(found.jobs).toEqual([
-      expect.objectContaining({ kind: "analysis", level: "quick", status: "completed" }),
+      expect.objectContaining({
+        kind: "analysis",
+        level: "quick",
+        status: "completed",
+      }),
     ]);
     // The listing describes; it never answers. Reading the result still goes
     // through the attach endpoint, which applies the presentation rules.
@@ -1446,18 +1869,28 @@ describe("job discovery", () => {
     const h = harness({ source: { revision: 9 } });
     const response = await jobs(h, "?revision=7");
     expect(response.status).toBe(409);
-    expect(await response.json()).toMatchObject({ code: "stale_revision", currentRevision: 9 });
+    expect(await response.json()).toMatchObject({
+      code: "stale_revision",
+      currentRevision: 9,
+    });
   });
 
   it("requires authentication", async () => {
     const h = harness();
-    const response = await h.app.request(`/v1/games/${GAME_ID}/jobs?revision=7`);
+    const response = await h.app.request(
+      `/v1/games/${GAME_ID}/jobs?revision=7`,
+    );
     expect(response.status).toBe(401);
   });
 
   it("reports a game it may not read as absent", async () => {
     const h = harness({
-      source: { failWith: new RoomAccessError("No such game, or it is not yours to read.", 404) },
+      source: {
+        failWith: new RoomAccessError(
+          "No such game, or it is not yours to read.",
+          404,
+        ),
+      },
     });
     const response = await jobs(h, "?revision=7");
     expect(response.status).toBe(404);
@@ -1473,13 +1906,19 @@ describe("job discovery", () => {
         return fakeEngineResponse();
       },
     });
-    void running.call("/analysis", { expectedRevision: 7, level: "quick" }, {
-      Accept: "text/event-stream",
-    });
+    void running.call(
+      "/analysis",
+      { expectedRevision: 7, level: "quick" },
+      {
+        Accept: "text/event-stream",
+      },
+    );
     await tick();
 
     // Same registry, a caller who does not control the turn.
-    const spectator = harnessSharing(running, { callerControlsActiveSide: false });
+    const spectator = harnessSharing(running, {
+      callerControlsActiveSide: false,
+    });
     const found = (await (
       await spectator.app.request(`/v1/games/${GAME_ID}/jobs?revision=7`, {
         headers: { Authorization: "Bearer token-1" },
@@ -1498,7 +1937,11 @@ describe("job discovery", () => {
         return fakeEngineResponse();
       },
     });
-    void running.call("/bot-move", { expectedRevision: 7 }, { Accept: "text/event-stream" });
+    void running.call(
+      "/bot-move",
+      { expectedRevision: 7 },
+      { Accept: "text/event-stream" },
+    );
     await tick();
 
     const owner = (await (
@@ -1507,7 +1950,11 @@ describe("job discovery", () => {
       })
     ).json()) as { jobs: Array<Record<string, unknown>> };
     expect(owner.jobs).toEqual([
-      expect.objectContaining({ kind: "bot", difficulty: "hard", status: "running" }),
+      expect.objectContaining({
+        kind: "bot",
+        difficulty: "hard",
+        status: "running",
+      }),
     ]);
 
     const spectator = harnessSharing(running, {
@@ -1541,7 +1988,10 @@ describe("canonical context acquisition", () => {
     // request is refused either way, but the engine must never be handed a
     // command window opened at a revision the database does not hold.
     const h = harness({ source: { revision: 9 } });
-    const response = await h.call("/analysis", { expectedRevision: 7, level: "quick" });
+    const response = await h.call("/analysis", {
+      expectedRevision: 7,
+      level: "quick",
+    });
     expect(response.status).toBe(409);
     expect(h.source.commandWindows).toEqual([7, 9]);
     expect(h.runEngine).not.toHaveBeenCalled();
@@ -1549,7 +1999,10 @@ describe("canonical context acquisition", () => {
 
   it("reports where the pre-engine time went, in durations and nothing else", async () => {
     const h = harness();
-    const response = await h.call("/analysis", { expectedRevision: 7, level: "quick" });
+    const response = await h.call("/analysis", {
+      expectedRevision: 7,
+      level: "quick",
+    });
     const timing = response.headers.get("Server-Timing");
     expect(timing).toMatch(/auth;dur=/);
     expect(timing).toMatch(/context;dur=/);
@@ -1608,8 +2061,12 @@ describe("two callers, one canonical turn", () => {
   });
 
   it("serves a second caller from the cached result rather than re-searching", async () => {
-    const h = harness({ source: { botSide: "B", botDifficulty: "medium", activeSide: "B" } });
-    expect((await h.call("/bot-move", { expectedRevision: 7 })).status).toBe(200);
+    const h = harness({
+      source: { botSide: "B", botDifficulty: "medium", activeSide: "B" },
+    });
+    expect((await h.call("/bot-move", { expectedRevision: 7 })).status).toBe(
+      200,
+    );
     const again = await h.call("/bot-move", { expectedRevision: 7 });
     expect(again.status).toBe(200);
     expect(h.runEngine).toHaveBeenCalledTimes(1);
@@ -1621,7 +2078,9 @@ describe("two callers, one canonical turn", () => {
   it("does not let a cached turn answer for the NEXT position", async () => {
     // The retention that makes a reconnect cheap must not make the bot
     // deterministic across turns: the revision is part of the key.
-    const h = harness({ source: { botSide: "B", botDifficulty: "medium", activeSide: "B" } });
+    const h = harness({
+      source: { botSide: "B", botDifficulty: "medium", activeSide: "B" },
+    });
     await h.call("/bot-move", { expectedRevision: 7 });
     h.source.advanceTo(8);
     await h.call("/bot-move", { expectedRevision: 8 });
@@ -1647,7 +2106,13 @@ describe("bot reasoning", () => {
   function rankedResponse(count = 20) {
     return fakeEngineResponse({
       equity: 31.5,
-      stats: { moves: 410, nodes: 81234, elapsedMs: 1830, candidates: count, samples: 4 },
+      stats: {
+        moves: 410,
+        nodes: 81234,
+        elapsedMs: 1830,
+        candidates: count,
+        samples: 4,
+      },
       candidates: Array.from({ length: count }, (_, index) => ({
         type: "place" as const,
         placements: [{ r: 7, c: 7 + index, kind: "5", token: "5" }],
@@ -1677,7 +2142,9 @@ describe("bot reasoning", () => {
       source: { ...BOT_ROOM, ...overrides },
       engine: async () => rankedResponse(),
     });
-    expect((await h.call("/bot-move", { expectedRevision: 7 })).status).toBe(200);
+    expect((await h.call("/bot-move", { expectedRevision: 7 })).status).toBe(
+      200,
+    );
     h.source.advanceTo(8);
     return h;
   }
@@ -1713,18 +2180,27 @@ describe("bot reasoning", () => {
     expect(h.runEngine).toHaveBeenCalledTimes(1);
   });
 
+  it("keeps a bot explanation closed when its mode disables that tool", async () => {
+    const h = await playedTurn({ botInsightAllowed: false });
+    const response = await read(h, "?revision=7");
+    expect(response.status).toBe(403);
+    expect(await response.json()).toMatchObject({ code: "forbidden" });
+  });
+
   it("pages through the ranking without re-running the search", async () => {
     const h = await playedTurn();
-    const body = (await (await read(h, "?revision=7&offset=6&limit=6")).json()) as {
+    const body = (await (
+      await read(h, "?revision=7&offset=6&limit=6")
+    ).json()) as {
       page: { offset: number; total: number };
       candidates: Array<{ value: number }>;
       chosen: { value: number };
       runnerUp: { value: number };
     };
     expect(body.page).toMatchObject({ offset: 6, total: 20 });
-    expect(body.candidates.map((candidate) => Math.round(candidate.value * 10) / 10)).toEqual([
-      18.1, 17.1, 16.1, 15.1, 14.1, 13.1,
-    ]);
+    expect(
+      body.candidates.map((candidate) => Math.round(candidate.value * 10) / 10),
+    ).toEqual([18.1, 17.1, 16.1, 15.1, 14.1, 13.1]);
     // Repeated on every page, so a client can render page four without ever
     // having fetched page one.
     expect(body.chosen.value).toBe(24.1);
@@ -1734,7 +2210,9 @@ describe("bot reasoning", () => {
 
   it("clamps a page past the end instead of failing, and says what it served", async () => {
     const h = await playedTurn();
-    const body = (await (await read(h, "?revision=7&offset=999&limit=500")).json()) as {
+    const body = (await (
+      await read(h, "?revision=7&offset=999&limit=500")
+    ).json()) as {
       page: { offset: number; limit: number; total: number };
       candidates: unknown[];
     };
@@ -1751,7 +2229,10 @@ describe("bot reasoning", () => {
 
   it("refuses a spectator, exactly as the move endpoint does", async () => {
     const h = await playedTurn();
-    const spectator = harnessSharing(h, { ...BOT_ROOM, callerControlsActiveSide: false });
+    const spectator = harnessSharing(h, {
+      ...BOT_ROOM,
+      callerControlsActiveSide: false,
+    });
     const response = await read(spectator, "?revision=7");
     expect(response.status).toBe(403);
     expect(await response.json()).toMatchObject({ code: "forbidden" });
@@ -1770,7 +2251,9 @@ describe("bot reasoning", () => {
     const h = harness({ source: { ...BOT_ROOM, revision: 8 } });
     const response = await read(h, "?revision=7");
     expect(response.status).toBe(404);
-    expect(await response.json()).toMatchObject({ code: "reasoning_unavailable" });
+    expect(await response.json()).toMatchObject({
+      code: "reasoning_unavailable",
+    });
   });
 
   it("refuses to walk the cache backwards through the game", async () => {

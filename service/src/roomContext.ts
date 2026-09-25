@@ -62,6 +62,8 @@ export class StudySaveError extends Error {
 
 export interface GameStateSource {
   loadContext(gameId: string, token: string): Promise<EngineRoomContext>;
+  /** Read the current mode's tool grants as the caller. */
+  hasModeTool(modeKey: string | null, toolKey: string, token: string): Promise<boolean>;
   /**
    * Persist a study analysis as the caller, returning the new record's id.
    *
@@ -162,6 +164,14 @@ export function createSupabaseSource(
   };
 
   return {
+    async hasModeTool(modeKey, toolKey, token) {
+      if (!modeKey) return false;
+      const { data, error } = await clientFor(token).rpc("get_game_mode_tools", {
+        target_mode_key: modeKey,
+      });
+      if (error) throw new Error(`Could not read Play tools: ${error.message}`);
+      return Array.isArray(data) && data.some((row) => row?.tool_key === toolKey);
+    },
     async saveStudyAnalysis(record, token) {
       const { data, error } = await clientFor(token).rpc("save_study_analysis", {
         p_score_self: record.scoreSelf,

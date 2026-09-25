@@ -45,6 +45,8 @@ export type EngineCandidate = {
   value: number;
   chosen: boolean;
   proven?: boolean;
+  components?: Array<{ name: string; points: number }>;
+  deep?: boolean;
 };
 
 export type EngineResponse = {
@@ -53,7 +55,7 @@ export type EngineResponse = {
   exchange: string[];
   score: number;
   equity: number;
-  solver: "greedy" | "sim" | "endgame";
+  solver: "greedy" | "sim" | "endgame" | "stage5b";
   endgameSolved: boolean;
   expectedFinalDiff?: number;
   stats: {
@@ -62,6 +64,7 @@ export type EngineResponse = {
     elapsedMs: number;
     candidates: number;
     samples: number;
+    depth?: number;
     /** Full move generations this decision performed — the only cost in a
      *  midgame decision worth watching, at ~10 ms a call against under a
      *  microsecond for every heuristic the engine computes. The static path is
@@ -89,13 +92,18 @@ export class EngineCancelledError extends Error {
 
 export class EngineFailureError extends Error {
   override readonly name = "EngineFailureError";
-  constructor(message: string, readonly detail?: string) {
+  constructor(
+    message: string,
+    readonly detail?: string,
+  ) {
     super(message);
   }
 }
 
 export type RunOptions = {
   binaryPath: string;
+  /** An alternate executable may share the JSON-over-stdio transport. */
+  args?: string[];
   request: unknown;
   /** Hard wall-clock ceiling. The engine's own `budgetMs` should be comfortably
    *  below this; reaching this bound means the engine overshot and is killed. */
@@ -128,7 +136,7 @@ export async function runEngineRaw(options: RunOptions): Promise<unknown> {
 
   if (options.signal?.aborted) throw new EngineCancelledError();
 
-  const child = spawn(options.binaryPath, ["worker"], {
+  const child = spawn(options.binaryPath, options.args ?? ["worker"], {
     stdio: ["pipe", "pipe", "pipe"],
     // No shell: the binary path is configuration, but there is never a reason
     // to let a shell interpret it.
@@ -141,13 +149,16 @@ export async function runEngineRaw(options: RunOptions): Promise<unknown> {
   // Held in an object because it is only ever written from callbacks, and
   // narrowing a `let` to its initializer would make the checks after the wait
   // look unreachable.
-  const state: { outcome: "running" | "timeout" | "cancelled" } = { outcome: "running" };
+  const state: { outcome: "running" | "timeout" | "cancelled" } = {
+    outcome: "running",
+  };
 
   const stopProcess = async () => {
     if (child.exitCode !== null || child.signalCode !== null) return;
     child.kill("SIGTERM");
     await delay(KILL_GRACE_MS);
-    if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+    if (child.exitCode === null && child.signalCode === null)
+      child.kill("SIGKILL");
   };
 
   const timer = setTimeout(() => {
@@ -187,19 +198,21 @@ export async function runEngineRaw(options: RunOptions): Promise<unknown> {
       if (!options.onProgress) continue;
       try {
         const parsed = JSON.parse(line) as EngineProgress;
-        if (parsed && typeof parsed.phase === "string") options.onProgress(parsed);
+        if (parsed && typeof parsed.phase === "string")
+          options.onProgress(parsed);
       } catch {
         // not a progress line
       }
     }
   });
 
-  const exit = new Promise<{ code: number | null; signal: NodeJS.Signals | null }>(
-    (resolve, reject) => {
-      child.on("error", reject);
-      child.on("close", (code, signal) => resolve({ code, signal }));
-    },
-  );
+  const exit = new Promise<{
+    code: number | null;
+    signal: NodeJS.Signals | null;
+  }>((resolve, reject) => {
+    child.on("error", reject);
+    child.on("close", (code, signal) => resolve({ code, signal }));
+  });
 
   try {
     child.stdin.end(JSON.stringify(options.request));
@@ -225,9 +238,12 @@ export async function runEngineRaw(options: RunOptions): Promise<unknown> {
   }
 
   if (state.outcome === "cancelled") throw new EngineCancelledError();
-  if (state.outcome === "timeout") throw new EngineTimeoutError(options.timeoutMs);
+  if (state.outcome === "timeout")
+    throw new EngineTimeoutError(options.timeoutMs);
   if (overflowed) {
-    throw new EngineFailureError("The engine produced an implausibly large response.");
+    throw new EngineFailureError(
+      "The engine produced an implausibly large response.",
+    );
   }
   if (closed.code !== 0) {
     throw new EngineFailureError(
@@ -240,26 +256,40 @@ export async function runEngineRaw(options: RunOptions): Promise<unknown> {
   try {
     parsed = JSON.parse(stdout.trim());
   } catch {
-    throw new EngineFailureError("The engine produced output that is not a response.");
+    throw new EngineFailureError(
+      "The engine produced output that is not a response.",
+    );
   }
   const failure = (parsed as { error?: string } | null)?.error;
   if (failure) {
-    throw new EngineFailureError(`The engine rejected the position: ${failure}`);
+    throw new EngineFailureError(
+      `The engine rejected the position: ${failure}`,
+    );
   }
   return parsed;
 }
 
 export async function runEngine(options: RunOptions): Promise<EngineResponse> {
   const parsed = (await runEngineRaw(options)) as EngineResponse;
-  if (parsed.type !== "place" && parsed.type !== "exchange" && parsed.type !== "pass") {
-    throw new EngineFailureError("The engine returned a move of no known kind.");
+  if (
+    parsed.type !== "place" &&
+    parsed.type !== "exchange" &&
+    parsed.type !== "pass"
+  ) {
+    throw new EngineFailureError(
+      "The engine returned a move of no known kind.",
+    );
   }
   return parsed;
 }
 
 /** The engine's verdict on one submitted move. No search: the engine ran the
  *  rules and nothing else. */
-export type EngineValidation = { valid: boolean; score: number; reason?: string };
+export type EngineValidation = {
+  valid: boolean;
+  score: number;
+  reason?: string;
+};
 
 /**
  * Ask the engine whether a move is legal from a position.
@@ -269,8 +299,12 @@ export type EngineValidation = { valid: boolean; score: number; reason?: string 
  * one, and collapsing the two would turn "the bot suggested something the rules
  * reject" into "the engine broke".
  */
-export async function runEngineValidation(options: RunOptions): Promise<EngineValidation> {
-  const parsed = (await runEngineRaw(options)) as Partial<EngineValidation> & { mode?: string };
+export async function runEngineValidation(
+  options: RunOptions,
+): Promise<EngineValidation> {
+  const parsed = (await runEngineRaw(options)) as Partial<EngineValidation> & {
+    mode?: string;
+  };
   if (parsed.mode !== "validate" || typeof parsed.valid !== "boolean") {
     throw new EngineFailureError("The engine returned no legality verdict.");
   }

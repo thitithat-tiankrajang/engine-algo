@@ -96,12 +96,15 @@ export type FakeSourceOptions = Partial<
     | "revision"
     | "botSide"
     | "botDifficulty"
+    | "modeKey"
     | "activeSide"
     | "callerControlsActiveSide"
     | "activeSideIsBot"
     | "status"
   >
 > & {
+  analysisToolAllowed?: boolean;
+  botInsightAllowed?: boolean;
   canonical?: Record<string, unknown>;
   /** Throw this instead of answering — models an RLS refusal. */
   failWith?: Error;
@@ -130,6 +133,11 @@ export function fakeSource(
     advanceTo(next: number) {
       revision = next;
     },
+    async hasModeTool(_modeKey: string | null, toolKey: string) {
+      if (toolKey === "analysis") return options.analysisToolAllowed ?? true;
+      if (toolKey === "bot_insight") return options.botInsightAllowed ?? true;
+      return false;
+    },
     async loadContext(gameId: string): Promise<EngineRoomContext> {
       state.calls += 1;
       if (options.failWith) throw options.failWith;
@@ -140,7 +148,7 @@ export function fakeSource(
         revision,
         status: options.status ?? "playing",
         gameMode: "versus",
-        modeKey: options.botSide ? `aether_${options.botDifficulty ?? "medium"}` : "local_versus",
+        modeKey: options.modeKey ?? (options.botSide ? `aether_${options.botDifficulty ?? "medium"}` : "local_versus"),
         botSide: options.botSide ?? null,
         botDifficulty: options.botDifficulty ?? null,
         activeSide,

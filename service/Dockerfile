@@ -48,6 +48,8 @@ COPY --from=engine /build/build/amath_cli /usr/local/bin/amath_cli
 COPY --from=service /app/dist ./dist
 COPY --from=service /app/node_modules ./node_modules
 COPY service/package.json ./
+COPY service/authur ./authur
+COPY service/stage5b ./stage5b
 
 # Unprivileged: the service spawns processes, so the blast radius of an engine
 # bug is worth keeping small.

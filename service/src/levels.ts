@@ -128,7 +128,7 @@ export function resolveBotTier(value: unknown): BotTier | null {
 export const BOT_REPORT_TOP_N = 24;
 
 /** Analysis levels, chosen by the player and independent of the room's bot. */
-export const ANALYSIS_LEVELS = ["quick", "normal", "deep", "max"] as const;
+export const ANALYSIS_LEVELS = ["quick", "normal", "deep", "max", "stage5b64"] as const;
 export type AnalysisLevel = (typeof ANALYSIS_LEVELS)[number];
 
 export type AnalysisLevelConfig = {
@@ -155,6 +155,7 @@ export const ANALYSIS_LEVEL_CONFIG: Record<AnalysisLevel, AnalysisLevelConfig> =
   // The full sample count the bot's own `max` tier uses. Same search, read out
   // in more detail.
   max: { sampleCap: 160, timeoutMs: 330_000, topN: 24, cost: 30, priority: 40 },
+  stage5b64: { sampleCap: 0, timeoutMs: 330_000, topN: 24, cost: 30, priority: 40 },
 };
 
 export function isAnalysisLevel(value: unknown): value is AnalysisLevel {

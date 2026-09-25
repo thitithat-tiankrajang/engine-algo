@@ -58,12 +58,14 @@ export type ReportCandidate = {
   value: number;
   chosen: boolean;
   proven?: boolean;
+  components?: Array<{ name: string; points: number }>;
+  deep?: boolean;
 };
 
 /** The search as a whole. Structurally the part of `ReportResponse` this file
  *  reads — no move, because a description is not an instruction. */
 export type ReportResponse = {
-  solver: "greedy" | "sim" | "endgame";
+  solver: "greedy" | "sim" | "endgame" | "stage5b";
   endgameSolved: boolean;
   stats: {
     moves: number;
@@ -71,6 +73,7 @@ export type ReportResponse = {
     elapsedMs: number;
     candidates: number;
     samples: number;
+    depth?: number;
   };
   candidates?: ReportCandidate[];
 };
@@ -84,7 +87,7 @@ export class AnalysisReportUnavailable extends Error {
 export type AnalysisMoveKind = "place" | "exchange" | "pass";
 
 export type AnalysisFactor = {
-  key: "score" | "leave" | "potential" | "oppReply" | "risk" | "margin";
+  key: string;
   label: string;
   value: number;
   /** How this candidate compares with the recommendation on this term.
@@ -113,7 +116,7 @@ export type AnalysisCandidate = {
 
 /** How the recommendation was reached, in the engine's own terms. */
 export type AnalysisMethod = {
-  solver: "greedy" | "sim" | "endgame";
+  solver: "greedy" | "sim" | "endgame" | "stage5b";
   /** Opponent-rack scenarios actually simulated. */
   samples: number;
   /** Root moves the generator found. */
@@ -125,6 +128,8 @@ export type AnalysisMethod = {
   proven: boolean;
   /** False when a timeout cut the search short; the ranking is provisional. */
   complete: boolean;
+  /** Stage 5B's deep-pass candidate count, when that solver was used. */
+  depth?: number;
 };
 
 function round(value: number, places = 1): number {
@@ -376,6 +381,52 @@ export function describeSearch(response: ReportResponse, requestedSamples: numbe
     );
   }
 
+  if (response.solver === "stage5b") {
+    const best = rows.find((row) => row.chosen) ?? rows[0]!;
+    const ordered = [best, ...rows.filter((row) => row !== best)];
+    const label: Record<string, string> = {
+      "immediate-score": "แต้มตานี้",
+      "area-potential": "พื้นที่บนกระดาน",
+      "unseen-potential": "โอกาสจากเบี้ยที่ยังไม่เห็น",
+      leave: "เบี้ยที่เหลือ",
+      "future-access": "ทางเล่นต่อ",
+      exposure: "ช่องที่เปิดให้คู่แข่ง",
+      "nn-value": "ค่าโมเดล Stage 5A",
+    };
+    const candidates = ordered.map((row, index) => ({
+      rank: index + 1,
+      kind: row.type,
+      placements: row.placements,
+      exchange: row.exchange,
+      immediateScore: row.score,
+      evaluation: round(row.value, 2),
+      evaluationGap: round(best.value - row.value, 2),
+      factors: (row.components ?? []).map((part) => ({
+        key: part.name,
+        label: label[part.name] ?? part.name,
+        value: round(part.points, 2),
+      })),
+      provenMargin: null,
+      recommended: row === best,
+      note: row.deep ? "ผ่านการประเมินเชิงลึก" : "ประเมินรอบแรก",
+    }));
+    return {
+      candidates,
+      summary: `Stage 5B หาแต้มที่มีค่าดีที่สุดจาก ${response.stats.moves} ทางเลือก โดยใช้โมเดล Stage 5A และตรวจเชิงลึกสูงสุด ${response.stats.depth ?? 64} ตา`,
+      method: {
+        solver: "stage5b",
+        samples: 0,
+        legalMoves: response.stats.moves,
+        candidatesEvaluated: response.stats.candidates,
+        nodes: response.stats.nodes,
+        elapsedMs: Math.round(response.stats.elapsedMs),
+        proven: false,
+        complete: true,
+        depth: response.stats.depth ?? 64,
+      },
+    };
+  }
+
   // The engine already sorted by its ranking key and flagged the move it chose.
   // Trust that flag rather than re-deriving a winner: re-ranking here is exactly
   // how an analysis view starts disagreeing with the bot it claims to explain.
@@ -425,4 +476,3 @@ export function describeSearch(response: ReportResponse, requestedSamples: numbe
     },
   };
 }
-

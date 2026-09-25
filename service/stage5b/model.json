@@ -1,0 +1,260 @@
+{
+  "artifact": "amath-stage5a-value",
+  "artifactVersion": 1,
+  "experiment": "full",
+  "blocks": [
+    "board",
+    "rack",
+    "unseen",
+    "scalars",
+    "history"
+  ],
+  "widths": {
+    "board": 15300,
+    "rack": 29,
+    "unseen": 29,
+    "scalars": 9,
+    "history": 328
+  },
+  "units": {
+    "board": 64,
+    "rack": 16,
+    "unseen": 16,
+    "scalars": 16,
+    "history": 32
+  },
+  "trunkUnits": 64,
+  "standardized": [
+    "board_turn",
+    "rack",
+    "unseen",
+    "scalars",
+    "history"
+  ],
+  "boardPlaneWidth": 15075,
+  "boardTurnWidth": 225,
+  "parameters": 1000257,
+  "representationVersion": "amath-repr-1",
+  "datasetVersion": "amath-ml-value-1",
+  "historyWindow": 8,
+  "rules": "eqlab-compat",
+  "trainedOn": {
+    "run": "runs/stage5a-fine",
+    "datasetPath": "/Users/thitithat_tiankrajang/Desktop/amath-bot-lab/data/stage5a",
+    "datasetDigest": "3c0227423d0161ac",
+    "games": 10000,
+    "trainExamples": 224344,
+    "gitCommit": "72fb0d0a05abb7f006e22f7d5d441287d2ca2260"
+  },
+  "heldOutTest": {
+    "n": 29129,
+    "logLoss": 0.2687581670477086,
+    "brier": 0.08779787273506816,
+    "accuracy": 0.8667307494249716,
+    "auc": 0.9541425274784852,
+    "ece": 0.01664322950503361
+  },
+  "tensors": [
+    {
+      "name": "W_board",
+      "shape": [
+        15300,
+        64
+      ],
+      "offset": 0,
+      "count": 979200
+    },
+    {
+      "name": "b_board",
+      "shape": [
+        64
+      ],
+      "offset": 979200,
+      "count": 64
+    },
+    {
+      "name": "W_rack",
+      "shape": [
+        29,
+        16
+      ],
+      "offset": 979264,
+      "count": 464
+    },
+    {
+      "name": "b_rack",
+      "shape": [
+        16
+      ],
+      "offset": 979728,
+      "count": 16
+    },
+    {
+      "name": "W_unseen",
+      "shape": [
+        29,
+        16
+      ],
+      "offset": 979744,
+      "count": 464
+    },
+    {
+      "name": "b_unseen",
+      "shape": [
+        16
+      ],
+      "offset": 980208,
+      "count": 16
+    },
+    {
+      "name": "W_scalars",
+      "shape": [
+        9,
+        16
+      ],
+      "offset": 980224,
+      "count": 144
+    },
+    {
+      "name": "b_scalars",
+      "shape": [
+        16
+      ],
+      "offset": 980368,
+      "count": 16
+    },
+    {
+      "name": "W_history",
+      "shape": [
+        328,
+        32
+      ],
+      "offset": 980384,
+      "count": 10496
+    },
+    {
+      "name": "b_history",
+      "shape": [
+        32
+      ],
+      "offset": 990880,
+      "count": 32
+    },
+    {
+      "name": "W_trunk",
+      "shape": [
+        144,
+        64
+      ],
+      "offset": 990912,
+      "count": 9216
+    },
+    {
+      "name": "b_trunk",
+      "shape": [
+        64
+      ],
+      "offset": 1000128,
+      "count": 64
+    },
+    {
+      "name": "W_head",
+      "shape": [
+        64,
+        1
+      ],
+      "offset": 1000192,
+      "count": 64
+    },
+    {
+      "name": "b_head",
+      "shape": [
+        1
+      ],
+      "offset": 1000256,
+      "count": 1
+    },
+    {
+      "name": "mean__board_turn",
+      "shape": [
+        225
+      ],
+      "offset": 1000257,
+      "count": 225
+    },
+    {
+      "name": "std__board_turn",
+      "shape": [
+        225
+      ],
+      "offset": 1000482,
+      "count": 225
+    },
+    {
+      "name": "mean__rack",
+      "shape": [
+        29
+      ],
+      "offset": 1000707,
+      "count": 29
+    },
+    {
+      "name": "std__rack",
+      "shape": [
+        29
+      ],
+      "offset": 1000736,
+      "count": 29
+    },
+    {
+      "name": "mean__unseen",
+      "shape": [
+        29
+      ],
+      "offset": 1000765,
+      "count": 29
+    },
+    {
+      "name": "std__unseen",
+      "shape": [
+        29
+      ],
+      "offset": 1000794,
+      "count": 29
+    },
+    {
+      "name": "mean__scalars",
+      "shape": [
+        9
+      ],
+      "offset": 1000823,
+      "count": 9
+    },
+    {
+      "name": "std__scalars",
+      "shape": [
+        9
+      ],
+      "offset": 1000832,
+      "count": 9
+    },
+    {
+      "name": "mean__history",
+      "shape": [
+        328
+      ],
+      "offset": 1000841,
+      "count": 328
+    },
+    {
+      "name": "std__history",
+      "shape": [
+        328
+      ],
+      "offset": 1001169,
+      "count": 328
+    }
+  ],
+  "bytes": 4005988,
+  "sha256": "95ba8c0d3e7040234dc02940ec09fe18"
+}
