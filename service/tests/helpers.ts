@@ -108,6 +108,8 @@ export type FakeSourceOptions = Partial<
   canonical?: Record<string, unknown>;
   /** Throw this instead of answering — models an RLS refusal. */
   failWith?: Error;
+  /** The caller's account status as is_approved()/is_admin() report it (default approved). */
+  approved?: boolean;
   commands?: Array<{ kind: string }>;
 };
 
@@ -158,6 +160,9 @@ export function fakeSource(
         callerControlsActiveSide: options.callerControlsActiveSide ?? true,
         activeSideIsBot: options.activeSideIsBot ?? false,
       };
+    },
+    async isApproved() {
+      return options.approved ?? true;
     },
     async loadRecentCommands(_gameId: string, _token: string, atRevision: number) {
       state.commandWindows.push(atRevision);

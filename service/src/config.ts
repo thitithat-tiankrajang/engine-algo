@@ -142,6 +142,8 @@ export type ServiceConfig = {
    * waited minutes for permission to play it.
    */
   validationConcurrency: number;
+  /** One JSON line per request (method, path, status, duration, request id). */
+  accessLog: boolean;
 };
 
 function required(env: NodeJS.ProcessEnv, name: string): string {
@@ -264,5 +266,6 @@ export function loadConfig(
     // in playing strength, so it must never become a default.
     superAdaptiveBudget: flag(env, "SUPER_ADAPTIVE_BUDGET", false),
     validationConcurrency: boundedInteger(env, "ENGINE_VALIDATION_CONCURRENCY", 4, 1, 64),
+    accessLog: flag(env, "ENGINE_ACCESS_LOG", true),
   };
 }

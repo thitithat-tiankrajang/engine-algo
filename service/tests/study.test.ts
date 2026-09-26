@@ -34,10 +34,13 @@ function position(overrides: Record<string, unknown> = {}) {
   };
 }
 
-function harness(engine?: () => Promise<ReturnType<typeof fakeEngineResponse>>) {
+function harness(
+  engine?: () => Promise<ReturnType<typeof fakeEngineResponse>>,
+  sourceOptions: Parameters<typeof fakeSource>[0] = {},
+) {
   const config = baseConfig() as ReturnType<typeof baseConfig> &
     Parameters<typeof createApp>[0]["config"];
-  const source = fakeSource();
+  const source = fakeSource(sourceOptions);
   const queue = new EngineQueue({
     concurrency: config.concurrency,
     maxWaiting: config.maxWaiting,
@@ -133,6 +136,15 @@ describe("reading a study position", () => {
 });
 
 describe("POST /v1/study/analysis", () => {
+  it("refuses an account that is not approved yet, before any engine work", async () => {
+    const { study, runEngine, source } = harness(undefined, { approved: false });
+    const response = await study(position());
+    expect(response.status).toBe(403);
+    expect(await response.json()).toMatchObject({ code: "forbidden" });
+    expect(runEngine).not.toHaveBeenCalled();
+    expect(source.savedStudies).toHaveLength(0);
+  });
+
   it("analyses the position and writes the top ten to the record", async () => {
     const { study, runEngine, source } = harness();
     const response = await study(position());

@@ -25,6 +25,7 @@
 //   4. TURN RULES       enforced below, and only below — the UI's copy of these
 //                       rules is a convenience, never the decision
 
+import { randomUUID } from "node:crypto";
 import { type Context, Hono } from "hono";
 import { cors } from "hono/cors";
 import { streamSSE } from "hono/streaming";
@@ -386,7 +387,34 @@ export function createApp(deps: AppDependencies) {
       maxCached: config.jobCacheMax,
     });
 
-  const app = new Hono();
+  const app = new Hono<{ Variables: { requestId: string } }>();
+
+  // Every response carries an X-Request-Id (a well-formed incoming one is kept,
+  // so a proxy's id survives), and each request logs one JSON line: method,
+  // path, status, duration and that id. Nothing else: no token, no body, no
+  // user id. Unhandled errors log the same id, so a report quoting it can be
+  // matched to the failure. /health is left out so probes do not drown the log.
+  app.use("*", async (c, next) => {
+    const incoming = c.req.header("X-Request-Id");
+    const requestId = incoming && /^[A-Za-z0-9._-]{8,64}$/.test(incoming) ? incoming : randomUUID();
+    c.set("requestId", requestId);
+    const started = performance.now();
+    await next();
+    c.header("X-Request-Id", requestId);
+    if (config.accessLog && c.req.path !== "/health") {
+      console.log(
+        JSON.stringify({
+          t: "access",
+          ts: new Date().toISOString(),
+          id: requestId,
+          method: c.req.method,
+          path: c.req.path,
+          status: c.res.status,
+          ms: Math.round(performance.now() - started),
+        }),
+      );
+    }
+  });
 
   app.use(
     "*",
@@ -397,7 +425,7 @@ export function createApp(deps: AppDependencies) {
       // Durations only — see RequestTiming. Without this the browser drops the
       // header on a cross-origin read and the client can measure nothing but
       // the round trip as a whole.
-      exposeHeaders: ["Server-Timing"],
+      exposeHeaders: ["Server-Timing", "X-Request-Id"],
       maxAge: 600,
     }),
   );
@@ -1553,6 +1581,13 @@ export function createApp(deps: AppDependencies) {
   app.post("/v1/study/analysis", async (c) => {
     const timing = new RequestTiming();
     const caller = await authenticate(c);
+    // Every other compute endpoint is reached through a game the caller can read,
+    // and only approved members can hold one. This one takes a made-up position,
+    // so it checks membership itself: anyone can create an account by signing in,
+    // and it stays pending until an admin approves it.
+    if (!(await source.isApproved(caller.token))) {
+      throw new ForbiddenError("Study analysis needs an approved account.");
+    }
     timing.mark("auth");
     const body = await readBody(c);
 
@@ -1826,13 +1861,13 @@ export function createApp(deps: AppDependencies) {
     if (error instanceof EngineFailureError) {
       // The engine's own message is operational detail; the caller gets the
       // fact, the log gets the cause.
-      console.error("engine failure", error.message, error.detail ?? "");
+      console.error("engine failure", c.get("requestId"), error.message, error.detail ?? "");
       return c.json(
         fail("engine_failed", "The engine could not complete this request."),
         502,
       );
     }
-    console.error("unhandled", error);
+    console.error("unhandled", c.get("requestId"), error);
     return c.json(fail("internal", "Something went wrong."), 500);
   });
 

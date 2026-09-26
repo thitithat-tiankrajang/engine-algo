@@ -73,6 +73,8 @@ export interface GameStateSource {
    * already been spent.
    */
   saveStudyAnalysis(record: StudyAnalysisRecord, token: string): Promise<string>;
+  /** Whether the caller's account is approved (or an admin), read as the caller. */
+  isApproved(token: string): Promise<boolean>;
   /** The tail of the committed command log, ending at `revision`. */
   loadRecentCommands(
     gameId: string,
@@ -171,6 +173,15 @@ export function createSupabaseSource(
       });
       if (error) throw new Error(`Could not read Play tools: ${error.message}`);
       return Array.isArray(data) && data.some((row) => row?.tool_key === toolKey);
+    },
+    async isApproved(token) {
+      const client = clientFor(token);
+      const approved = await client.rpc("is_approved");
+      if (approved.error) throw new Error(`Could not read account status: ${approved.error.message}`);
+      if (approved.data === true) return true;
+      const admin = await client.rpc("is_admin");
+      if (admin.error) throw new Error(`Could not read account status: ${admin.error.message}`);
+      return admin.data === true;
     },
     async saveStudyAnalysis(record, token) {
       const { data, error } = await clientFor(token).rpc("save_study_analysis", {
