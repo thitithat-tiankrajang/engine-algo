@@ -8,7 +8,7 @@
     "dev": "tsx watch src/server.ts",
     "dev:local": "tsx watch --env-file=.env.local src/server.ts",
     "build": "tsc -b",
-    "start": "node dist/server.js",
+    "start": "node dist/src/server.js",
     "test": "vitest run",
     "typecheck": "tsc -b --force",
     "lint": "eslint src tests --max-warnings=0"
