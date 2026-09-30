@@ -31,8 +31,9 @@ export type ServiceConfig = {
    *  so this is generous by an order of magnitude already. */
   maxBodyBytes: number;
   /**
-   * Per-user compute budget: cost units per window. Always applies to bot
-   * turns; applies to analysis only when `analysisBudgeted` is on.
+   * Per-user compute budget: cost units per window. Applies to legacy bot
+   * turns (not room-authorized Authur); applies to analysis only when
+   * `analysisBudgeted` is on.
    *
    * One unit is roughly four engine-seconds (see `cost` in levels.ts), so the
    * default of 300 is about twice what a single engine process could produce in
@@ -80,8 +81,8 @@ export type ServiceConfig = {
    * without that failure mode: press analyse as often as you like, each one
    * takes its turn in the queue.
    *
-   * Bot moves are budgeted either way — those are not paced by a player sitting
-   * and waiting for the answer.
+   * Legacy bot moves are budgeted either way. Authur is room-authorized and
+   * uses infrastructure admission instead.
    *
    * Set `ENGINE_ANALYSIS_BUDGETED=true` to ration analysis as well.
    */

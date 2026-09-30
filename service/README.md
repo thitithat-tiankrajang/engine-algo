@@ -41,7 +41,7 @@ Four gates, cheapest first:
    nor authorized.
 2. **Metering** — per-user concurrency and compute budget (`rateLimit.ts`).
    An account holds **one analysis at a time**; the sliding-window budget
-   applies to **bot turns**, and to analysis only under
+   applies to **legacy bot turns** (Authur is authorized at room creation), and to analysis only under
    `ENGINE_ANALYSIS_BUDGETED=true`. See below.
 3. **Authorization** — whatever Postgres says (`roomContext.ts`).
 4. **Turn rules** — enforced in `app.ts`, and only there.
@@ -72,8 +72,30 @@ CPU. A saturated instance still answers `queue_full` (503, retry).
 What a caller is no longer told for analysis is `budget_exhausted`: that code
 is reachable for analysis only under `ENGINE_ANALYSIS_BUDGETED=true`, because
 rationing fails a player mid-game, on the turn they stopped to think about, and
-no amount of waiting gets them the answer. Bot moves are budgeted either way —
-nobody is sitting and waiting on a press for those.
+no amount of waiting gets them the answer. Legacy bot moves are budgeted either way. Authur never charges this meter.
+Study retains its existing compute policy.
+
+### Authur infrastructure admission
+
+Room creation consumes allowance or Credit atomically and idempotently in
+PostgreSQL. A valid Authur room does not spend the per-user compute meter on
+moves, retry, read, reload or reconnect. No new authorization marker is required
+for existing rooms. Its strength and 30-second process deadline are unchanged.
+
+Authur allows one outstanding search per account, including queue time. Exact
+duplicate/cached requests attach to the registry without taking another slot.
+The job releases its slot on completion/failure, independently of disconnects.
+A separate 120-POSTs-per-minute account throttle limits request floods, including
+cache hits. These infrastructure conditions return `bot_in_progress` or
+`request_throttled` (429), not `budget_exhausted`. Global queue overload remains
+`queue_full` (503, or an SSE error after streaming starts). All three carry a
+retry delay. Keep Render concurrency at 1 until measured memory/CPU headroom
+justifies a change; these limits and registry remain single-instance in memory.
+
+CORS still trusts only exact ENGINE_ALLOWED_ORIGINS; no wildcard or cookie
+credentials. The centralized policy now exposes Retry-After as well as request
+ID and timing. Platform/proxy responses generated outside the app cannot be
+covered by application middleware.
 
 ### Analysis permission
 
@@ -234,7 +256,7 @@ roughly **1 second per sample**. Midgame and endgame positions differ.
 | `ENGINE_MAX_WAITING` | no | `concurrency × 8`, clamped to 8–64 | Queue depth before refusing |
 | `ENGINE_MAX_QUEUE_WAIT_MS` | no | `120000` | How long a job may wait before it is refused |
 | `ENGINE_MAX_BODY_BYTES` | no | `8192` | Request body ceiling |
-| `ENGINE_BUDGET_PER_WINDOW` | no | `60` | Cost units per user per window. Always charged for bot turns; charged for analysis only when `ENGINE_ANALYSIS_BUDGETED` is on. |
+| `ENGINE_BUDGET_PER_WINDOW` | no | `300` | Cost units per user per fixed window. Charged for legacy bot turns (not Authur); charged for analysis only when `ENGINE_ANALYSIS_BUDGETED` is on. |
 | `ENGINE_BUDGET_WINDOW_MS` | no | `600000` | Budget window |
 | `ENGINE_MAX_ANALYSIS_PER_USER` | no | `1` | Analyses **in flight** per account — queued counts, not only running. This is the analysis limit; a second one is told to wait (`analysis_in_progress`), never that it is out of quota. |
 | `ENGINE_ANALYSIS_BUDGETED` | no | `false` | Whether analysis *also* spends the window budget above. Off: **analysis is never rationed**, only serialised by the cap. On: it can exhaust the budget like a bot turn. |

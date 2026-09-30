@@ -118,6 +118,99 @@ function harness(overrides: Overrides = {}) {
   };
 }
 
+describe("central CORS policy", () => {
+  const origin = "https://eq-log.vercel.app";
+  it.each([
+    "/jobs?revision=7",
+    "/analysis?revision=7&level=stage5b64",
+    "/analysis/cancel",
+    "/bot-move",
+  ])("preflights %s", async (path) => {
+    const h = harness({ config: { allowedOrigins: [origin] } });
+    const response = await h.app.request(`/v1/games/${GAME_ID}${path}`, {
+      method: "OPTIONS",
+      headers: {
+        Origin: origin,
+        "Access-Control-Request-Method": path.includes("?") ? "GET" : "POST",
+        "Access-Control-Request-Headers": "authorization,content-type",
+      },
+    });
+    expect(response.status).toBe(204);
+    expect(response.headers.get("Access-Control-Allow-Origin")).toBe(origin);
+    expect(response.headers.get("Access-Control-Allow-Methods")).toContain(
+      "POST",
+    );
+    expect(response.headers.get("Access-Control-Allow-Headers")).toContain(
+      "Authorization",
+    );
+  });
+  it("keeps CORS on success, validation, stale cancellation, budget and controlled failures", async () => {
+    const h = harness({
+      config: { allowedOrigins: [origin], analysisBudgeted: true },
+      engine: async () => {
+        throw new EngineFailureError("test");
+      },
+    });
+    for (const [path, body, status] of [
+      ["/analysis/cancel", { expectedRevision: 7 }, 200],
+      ["/analysis/cancel", { expectedRevision: 6 }, 409],
+      ["/analysis", {}, 400],
+      ["/analysis", { expectedRevision: 7 }, 502],
+    ] as const) {
+      const response = await h.call(path, body, { Origin: origin });
+      expect(response.status).toBe(status);
+      expect(response.headers.get("Access-Control-Allow-Origin")).toBe(origin);
+    }
+    h.budget.charge("user-1", 60);
+    const response = await h.call(
+      "/analysis",
+      { expectedRevision: 7 },
+      { Origin: origin },
+    );
+    expect(response.status).toBe(429);
+    expect(response.headers.get("Access-Control-Allow-Origin")).toBe(origin);
+  });
+  it("does not trust another origin", async () => {
+    const h = harness({ config: { allowedOrigins: [origin] } });
+    const response = await h.app.request("/health", {
+      headers: { Origin: "https://untrusted.example" },
+    });
+    expect(response.headers.get("Access-Control-Allow-Origin")).toBeNull();
+  });
+  it("retains CORS on GET success, authentication/not-found errors, and controlled 500", async () => {
+    const h = harness({ config: { allowedOrigins: [origin] } });
+    for (const [path, headers, status] of [
+      [
+        `/v1/games/${GAME_ID}/jobs?revision=7`,
+        { Origin: origin, Authorization: "Bearer token-1" },
+        200,
+      ],
+      [
+        `/v1/games/${GAME_ID}/analysis?revision=7&level=stage5b64`,
+        { Origin: origin, Authorization: "Bearer token-1" },
+        200,
+      ],
+      [`/v1/games/${GAME_ID}/jobs?revision=7`, { Origin: origin }, 401],
+      ["/missing", { Origin: origin }, 404],
+    ] as const) {
+      const response = await h.app.request(path, { headers });
+      expect(response.status).toBe(status);
+      expect(response.headers.get("Access-Control-Allow-Origin")).toBe(origin);
+    }
+    const broken = harness({
+      config: { allowedOrigins: [origin] },
+      source: { failWith: new Error("controlled test failure") },
+    });
+    const response = await broken.call(
+      "/analysis",
+      { expectedRevision: 7 },
+      { Origin: origin },
+    );
+    expect(response.status).toBe(500);
+    expect(response.headers.get("Access-Control-Allow-Origin")).toBe(origin);
+  });
+});
+
 /** A second caller on the SAME instance: same registry and queue, a different
  *  view of who they are. What discovery must never do is let this one learn
  *  about work the first one's authorization would not have shown them. */
@@ -243,6 +336,129 @@ describe("revision validation", () => {
 });
 
 describe("turn rules", () => {
+  it("shares duplicate Authur requests but refuses another outstanding game for the account", async () => {
+    let finish!: (value: ReturnType<typeof fakeEngineResponse>) => void;
+    const before = vi.mocked(runAuthurOnServer).mock.calls.length;
+    vi.mocked(runAuthurOnServer).mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          finish = resolve;
+        }),
+    );
+    const h = harness({
+      source: {
+        modeKey: "authur_strong",
+        botSide: "B",
+        botDifficulty: "super",
+        activeSide: "B",
+      },
+    });
+    const first = h.call("/bot-move", { expectedRevision: 7 });
+    await vi.waitFor(() =>
+      expect(runAuthurOnServer).toHaveBeenCalledTimes(before + 1),
+    );
+    const duplicate = h.call("/bot-move", { expectedRevision: 7 });
+    const other = await h.app.request("/v1/games/another-game/bot-move", {
+      method: "POST",
+      headers: {
+        Authorization: "Bearer token-1",
+        "Content-Type": "application/json",
+        Origin: "https://example.com",
+      },
+      body: JSON.stringify({ expectedRevision: 7 }),
+    });
+    expect(other.status).toBe(429);
+    expect(await other.json()).toMatchObject({
+      code: "bot_in_progress",
+      retryAfterMs: 10000,
+    });
+    const streamRefusal = await h.app.request(
+      "/v1/games/another-stream-game/bot-move",
+      {
+        method: "POST",
+        headers: {
+          Authorization: "Bearer token-1",
+          "Content-Type": "application/json",
+          Accept: "text/event-stream",
+        },
+        body: JSON.stringify({ expectedRevision: 7 }),
+      },
+    );
+    const refusalBody = await streamRefusal.text();
+    finish(fakeEngineResponse());
+    expect((await first).status).toBe(200);
+    expect((await duplicate).status).toBe(200);
+    expect(runAuthurOnServer).toHaveBeenCalledTimes(before + 1);
+    expect(refusalBody).toContain('"code":"bot_in_progress"');
+    expect(refusalBody).toContain('"retryAfterMs":10000');
+    h.source.advanceTo(9);
+    expect((await h.call("/bot-move", { expectedRevision: 9 })).status).toBe(
+      200,
+    );
+  });
+
+  it("throttles abusive Authur request volume separately from product funding", async () => {
+    const h = harness({
+      source: {
+        modeKey: "authur_strong",
+        botSide: "B",
+        botDifficulty: "super",
+        activeSide: "B",
+      },
+    });
+    for (let i = 0; i < 120; i += 1)
+      expect((await h.call("/bot-move", { expectedRevision: 7 })).status).toBe(
+        200,
+      );
+    const refused = await h.call("/bot-move", { expectedRevision: 7 });
+    expect(refused.status).toBe(429);
+    expect(await refused.json()).toMatchObject({ code: "request_throttled" });
+    expect(refused.headers.get("Retry-After")).toBeTruthy();
+    expect(h.budget.remaining("user-1")).toBe(60);
+  });
+
+  it("releases Authur job admission after failure without spending product budget", async () => {
+    vi.mocked(runAuthurOnServer).mockRejectedValueOnce(
+      new EngineFailureError("test"),
+    );
+    const h = harness({
+      source: {
+        modeKey: "authur_strong",
+        botSide: "B",
+        botDifficulty: "super",
+        activeSide: "B",
+      },
+    });
+    expect((await h.call("/bot-move", { expectedRevision: 7 })).status).toBe(
+      502,
+    );
+    expect((await h.call("/bot-move", { expectedRevision: 7 })).status).toBe(
+      200,
+    );
+    expect(h.budget.remaining("user-1")).toBe(60);
+  });
+
+  it("continues authorized Authur turns even when the legacy budget is spent", async () => {
+    const { call, budget, source } = harness({
+      source: {
+        modeKey: "authur_strong",
+        botSide: "B",
+        botDifficulty: "super",
+        activeSide: "B",
+      },
+      config: { analysisBudgeted: true },
+    });
+    budget.charge("user-1", 60);
+    for (const revision of [7, 9, 11]) {
+      source.advanceTo(revision);
+      const response = await call("/bot-move", { expectedRevision: revision });
+      expect(await response.clone().json()).not.toMatchObject({
+        code: "budget_exhausted",
+      });
+      expect(response.status).toBe(200);
+      expect(budget.remaining("user-1")).toBe(0);
+    }
+  });
   it("routes Authur rooms to Authur on the server and reconnects to that job", async () => {
     const { app, call, runEngine } = harness({
       source: {
@@ -1401,6 +1617,9 @@ describe("health", () => {
       analysisInFlight: 1,
       analysisBudget: "unlimited",
       botBudget: "rationed",
+      authurBudget: "room_authorized",
+      authurInFlight: 1,
+      authurRequestsPerMinute: 120,
       // Reported so an operator can see what the ration actually is, rather
       // than only that one exists.
       budgetPerWindow: baseConfig().budgetPerWindow,

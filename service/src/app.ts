@@ -19,8 +19,9 @@
 //   2. METERING         per-user concurrency and compute budget (rateLimit.ts).
 //                       An account holds ONE analysis at a time (queued counts
 //                       as held), and that is the whole of the analysis limit:
-//                       the sliding-window budget applies to bot turns, and to
-//                       analysis only under ENGINE_ANALYSIS_BUDGETED.
+//                       the fixed-window budget applies to legacy bot turns, and to
+//                       analysis only under ENGINE_ANALYSIS_BUDGETED. Authur
+//                       uses room authorization and infrastructure admission.
 //   3. AUTHORIZATION    what Postgres says this user may do here (roomContext.ts)
 //   4. TURN RULES       enforced below, and only below — the UI's copy of these
 //                       rules is a convenience, never the decision
@@ -315,6 +316,13 @@ function streamResult<T>(
 /** The same coded errors the JSON path returns, for a failure that arrives
  *  after the status line has already been sent. */
 function describeStreamError(error: unknown): Record<string, unknown> {
+  if (error instanceof BotInProgressError) {
+    return {
+      code: "bot_in_progress",
+      error: "Another bot search is already running for you.",
+      retryAfterMs: 10_000,
+    };
+  }
   if (error instanceof EngineTimeoutError) {
     return {
       code: "engine_timeout",
@@ -336,6 +344,7 @@ function describeStreamError(error: unknown): Record<string, unknown> {
     return {
       code: "queue_full",
       error: "The engine is busy. Try again shortly.",
+      retryAfterMs: 10_000,
     };
   }
   if (error instanceof StaleRevisionError) {
@@ -378,6 +387,14 @@ export function createApp(deps: AppDependencies) {
   // player who computed their bot move in ten seconds then waited minutes for
   // permission to play it.
   const validationSlots = new ConcurrencyLimit(config.validationConcurrency);
+  // Infrastructure admission only: an authorized room never runs out of turns.
+  // Held by the job (including queue time), not by an observer's connection.
+  const authurSlots = new ConcurrencyLimit(1);
+  const authurRequests = new ComputeBudget({
+    perWindow: 120,
+    windowMs: 60_000,
+  });
+  let requestSweepAt = 0;
   const verify = deps.verifyToken ?? createTokenVerifier(config.supabaseUrl);
   const registry =
     deps.registry ??
@@ -425,7 +442,7 @@ export function createApp(deps: AppDependencies) {
       // Durations only — see RequestTiming. Without this the browser drops the
       // header on a cross-origin read and the client can measure nothing but
       // the round trip as a whole.
-      exposeHeaders: ["Server-Timing", "X-Request-Id"],
+      exposeHeaders: ["Server-Timing", "X-Request-Id", "Retry-After"],
       maxAge: 600,
     }),
   );
@@ -494,6 +511,9 @@ export function createApp(deps: AppDependencies) {
             ? "rationed"
             : "unlimited",
         botBudget: config.budgetEnforced ? "rationed" : "unlimited",
+        authurBudget: "room_authorized",
+        authurInFlight: 1,
+        authurRequestsPerMinute: 120,
         ...(config.budgetEnforced
           ? {
               budgetPerWindow: config.budgetPerWindow,
@@ -579,7 +599,7 @@ export function createApp(deps: AppDependencies) {
    * **Invisibility.** Waiting is reported, not hidden. `onQueued` fires only when
    * the job genuinely did not start, and `onRunning` only once a process exists.
    */
-  function runQueued(options: {
+  async function runQueued(options: {
     key: string;
     priority: number;
     kind: JobKind;
@@ -607,48 +627,61 @@ export function createApp(deps: AppDependencies) {
     /** Called with `true` when this request joined an existing search instead of
      *  starting one, so the caller can undo metering it did not earn. */
     onReused?: () => void;
+    authur?: boolean;
   }): Promise<EngineResponse> {
     const observer: JobObserver = {
       onQueued: (state) => options.hooks.onQueued?.(state),
       onRunning: () => options.hooks.onRunning?.(),
       onProgress: (progress) => options.hooks.onProgress?.(progress),
     };
-    const attachment = registry.submit(
-      {
-        key: options.key,
-        priority: options.priority,
-        kind: options.kind,
-        gameId: options.gameId,
-        admittedRevision: options.admittedRevision,
-        params: options.params,
-        run: async ({ signal, waited, onProgress }) => {
-          if (waited) {
-            if (options.revalidate) await options.revalidate();
-            else {
-              const fresh = await source.loadContext(
-                options.gameId,
-                options.caller.token,
-              );
-              if (fresh.revision !== options.admittedRevision) {
-                throw new StaleRevisionError(
-                  fresh.revision,
-                  options.admittedRevision,
+    // No await between checking reuse, acquiring and submitting: duplicate
+    // requests join the same job even while this account's slot is occupied.
+    const held = Boolean(options.authur && !registry.inspect(options.key));
+    if (held && !authurSlots.tryAcquire(options.caller.userId)) {
+      throw new BotInProgressError();
+    }
+    let attachment;
+    try {
+      attachment = registry.submit(
+        {
+          key: options.key,
+          priority: options.priority,
+          kind: options.kind,
+          gameId: options.gameId,
+          admittedRevision: options.admittedRevision,
+          params: options.params,
+          run: async ({ signal, waited, onProgress }) => {
+            if (waited) {
+              if (options.revalidate) await options.revalidate();
+              else {
+                const fresh = await source.loadContext(
+                  options.gameId,
+                  options.caller.token,
                 );
+                if (fresh.revision !== options.admittedRevision) {
+                  throw new StaleRevisionError(
+                    fresh.revision,
+                    options.admittedRevision,
+                  );
+                }
               }
+              if (signal.aborted) throw new EngineCancelledError();
             }
-            if (signal.aborted) throw new EngineCancelledError();
-          }
-          return (options.runner ?? engine)({
-            binaryPath: config.enginePath,
-            request: options.request,
-            timeoutMs: options.timeoutMs,
-            signal,
-            onProgress,
-          });
+            return (options.runner ?? engine)({
+              binaryPath: config.enginePath,
+              request: options.request,
+              timeoutMs: options.timeoutMs,
+              signal,
+              onProgress,
+            });
+          },
         },
-      },
-      observer,
-    );
+        observer,
+      );
+    } catch (error) {
+      if (held) authurSlots.release(options.caller.userId);
+      throw error;
+    }
     // Joining an existing search costs this caller nothing, so it must not be
     // billed for one. Two tabs of the same game, or a reconnect that raced a
     // fresh POST, share one engine process and one charge.
@@ -664,7 +697,11 @@ export function createApp(deps: AppDependencies) {
       options.signal.addEventListener("abort", () => attachment.detach(), {
         once: true,
       });
-    return attachment.promise;
+    try {
+      return await attachment.promise;
+    } finally {
+      if (held) authurSlots.release(options.caller.userId);
+    }
   }
 
   /**
@@ -783,17 +820,31 @@ export function createApp(deps: AppDependencies) {
 
     const authur = context.modeKey === "authur_strong";
     const tier = BOT_TIER_CONFIG[context.botDifficulty];
-    const cost = authur ? BOT_TIER_CONFIG.super.cost : tier.cost;
-    const charged = budget.charge(caller.userId, cost);
-    if (!charged.allowed)
-      throw new BudgetError(charged.retryAfterMs, charged.remaining);
+    if (authur) {
+      const now = Date.now();
+      if (now >= requestSweepAt) {
+        authurRequests.sweep(now);
+        requestSweepAt = now + 60_000;
+      }
+      const admission = authurRequests.charge(caller.userId, 1, now);
+      if (!admission.allowed)
+        throw new RequestThrottledError(admission.retryAfterMs);
+    }
+    // Room creation already atomically paid for Authur. Other bot and Analysis/
+    // Study policy remains unchanged and cannot ration this authorized game.
+    const cost = authur ? 0 : tier.cost;
+    if (!authur) {
+      const charged = budget.charge(caller.userId, cost);
+      if (!charged.allowed)
+        throw new BudgetError(charged.retryAfterMs, charged.remaining);
+    }
     timing.mark("gates");
     // A charge is undone at most once per request. Reuse and failure can both
     // ask for it, and crediting twice would hand out budget that was never
     // spent.
     let refunded = false;
     const refund = () => {
-      if (refunded) return;
+      if (authur || refunded) return;
       refunded = true;
       budget.refund(caller.userId, cost);
     };
@@ -850,6 +901,7 @@ export function createApp(deps: AppDependencies) {
         // longer, and this ordering is what makes that guarantee structural.
         priority: BOT_PRIORITY,
         kind: "bot",
+        authur,
         gameId,
         params: { difficulty },
         caller,
@@ -1819,6 +1871,28 @@ export function createApp(deps: AppDependencies) {
         429,
       );
     }
+    if (
+      error instanceof BotInProgressError ||
+      error instanceof RequestThrottledError
+    ) {
+      const retryAfterMs =
+        error instanceof RequestThrottledError ? error.retryAfterMs : 10_000;
+      c.header("Retry-After", String(Math.ceil(retryAfterMs / 1000)));
+      return c.json(
+        {
+          ...fail(
+            error instanceof BotInProgressError
+              ? "bot_in_progress"
+              : "request_throttled",
+            error instanceof BotInProgressError
+              ? "Another bot search is already running for you."
+              : "Too many bot requests. Try again shortly.",
+          ),
+          retryAfterMs,
+        },
+        429,
+      );
+    }
     if (error instanceof TooManyAnalysesError) {
       return c.json(
         fail(
@@ -1836,7 +1910,10 @@ export function createApp(deps: AppDependencies) {
       // and a retry hint, never a generic 500 the client has to guess about.
       c.header("Retry-After", "10");
       return c.json(
-        fail("queue_full", "The engine is busy. Try again shortly."),
+        {
+          ...fail("queue_full", "The engine is busy. Try again shortly."),
+          retryAfterMs: 10_000,
+        },
         503,
       );
     }
@@ -1927,3 +2004,10 @@ export class TooManyAnalysesError extends Error {
 }
 
 export { otherSide };
+
+class BotInProgressError extends Error {}
+class RequestThrottledError extends Error {
+  constructor(readonly retryAfterMs: number) {
+    super("Bot request volume exceeded.");
+  }
+}

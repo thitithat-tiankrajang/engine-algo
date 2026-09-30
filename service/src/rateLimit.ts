@@ -14,7 +14,8 @@
 //
 // WHO each applies to is `app.ts`'s decision, not this file's. Today the
 // concurrency cap governs analysis — one in flight per account, queued or
-// running — while the budget governs bot turns, generously, because a bot move
+// running — while the budget governs legacy bot turns (Authur uses job concurrency
+// and request-volume admission instead), because a bot move
 // is a consequence of a game the user is legitimately playing and the turn
 // structure already paces it. Analysis is NOT budgeted unless
 // `ENGINE_ANALYSIS_BUDGETED` says so: serialising a player's requests is fair,
